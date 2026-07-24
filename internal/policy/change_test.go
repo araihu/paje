@@ -182,6 +182,31 @@ func TestChangePolicyDeduplicatesFindingsAndSafelyDeniesCancellation(t *testing.
 	}
 }
 
+func TestChangePolicyScansPhysicalTriplePlusAsHunkContent(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+++ DATABASE_SECRET=super-secret-value\n"
+	decision := evaluator.Evaluate(context.Background(), gitcapture.Result{Patch: []byte(patch), Changes: []artifact.Change{{Path: "x", Status: "A", NewMode: "100644"}}})
+	if decision.Allowed || !hasRule(decision, "secret-assignment") {
+		t.Fatalf("Evaluate() = %#v, want triple-plus content denied", decision)
+	}
+}
+
+func TestChangePolicyScansSecretAfterLongAddedPrefix(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	added := strings.Repeat("x", 17<<10) + " DATABASE_SECRET=super-secret-value"
+	patch := "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+" + added + "\n"
+	decision := evaluator.Evaluate(context.Background(), gitcapture.Result{Patch: []byte(patch), Changes: []artifact.Change{{Path: "x", Status: "A", NewMode: "100644"}}})
+	if decision.Allowed || !hasRule(decision, "secret-assignment") {
+		t.Fatalf("Evaluate() = %#v, want long-line secret denied", decision)
+	}
+}
+
 func hasRule(decision policy.Decision, ruleID string) bool {
 	for _, finding := range decision.Findings {
 		if finding.RuleID == ruleID {

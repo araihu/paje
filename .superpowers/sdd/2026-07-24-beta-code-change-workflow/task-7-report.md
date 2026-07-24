@@ -102,3 +102,26 @@ go test ./...
 All pass, including regressions for descendant cancellation, temporary
 directory cleanup, NUL-stream cross-validation, 41-character SHA rejection,
 and no-mutation Apply failures.
+
+## Fix Round 2
+
+### Implemented
+
+- Corrected unified-diff parsing so `+++ ` is a file header only before a
+  hunk. Inside a hunk every line beginning with `+` is scanned as added source
+  content, including physical `+++ ` lines.
+- Removed the per-line 16 KiB policy-search truncation. Patch capture is
+  already globally bounded, so secret patterns now scan the complete added
+  line without a scanner token limit.
+
+### RED and verification
+
+Both new policy regressions failed before the fix: a physical triple-plus
+added secret was treated as a header, and a secret after a 17 KiB added prefix
+was missed. They now pass with:
+
+```text
+go test ./internal/policy -v
+go test -race ./internal/artifact/gitcapture ./internal/policy
+go test ./...
+```

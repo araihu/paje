@@ -170,7 +170,7 @@ func (p *ChangePolicy) evaluatePatch(ctx context.Context, findings *[]Finding, p
 			state = binary
 			continue
 		}
-		if bytes.HasPrefix(line, []byte("+++ ")) {
+		if state != hunk && bytes.HasPrefix(line, []byte("+++ ")) {
 			if normalized, ok := p.patchPath(line[4:]); ok {
 				currentPath = normalized
 			}
@@ -183,7 +183,7 @@ func (p *ChangePolicy) evaluatePatch(ctx context.Context, findings *[]Finding, p
 		if state != hunk || len(line) < 2 || line[0] != '+' || !utf8.Valid(line[1:]) {
 			continue
 		}
-		text := string(boundLine(line[1:]))
+		text := string(line[1:])
 		for _, match := range []struct {
 			ruleID string
 			re     *regexp.Regexp
@@ -249,12 +249,4 @@ func (p *ChangePolicy) patchPath(value []byte) (string, bool) {
 	}
 	normalized, ok := containedPath(p.workspace, strings.TrimPrefix(text, "b/"))
 	return normalized, ok
-}
-
-func boundLine(line []byte) []byte {
-	const maxPolicyLineBytes = 16 << 10
-	if len(line) > maxPolicyLineBytes {
-		return line[:maxPolicyLineBytes]
-	}
-	return line
 }
