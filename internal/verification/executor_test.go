@@ -35,13 +35,13 @@ func TestVerificationHelper(t *testing.T) {
 	case "exit-7":
 		os.Exit(7)
 	case "exit-7-with-descendant":
-		writeDescendantPIDAndExit(t, args[separator+2], "hold-short", 7)
+		writeDescendantPIDAndExit(t, args[separator+2], "hold-until-parent-reaped", 7)
 	case "docker-rootless":
 		fmt.Fprintln(os.Stderr, "rootless Docker not found")
 		os.Exit(1)
 	case "docker-rootless-with-descendant":
 		fmt.Fprintln(os.Stderr, "rootless Docker not found")
-		writeDescendantPIDAndExit(t, args[separator+2], "hold-short", 1)
+		writeDescendantPIDAndExit(t, args[separator+2], "hold-until-parent-reaped", 1)
 	case "docker-daemon":
 		fmt.Fprintln(os.Stderr, "Cannot connect to the Docker daemon")
 		os.Exit(1)
@@ -56,7 +56,15 @@ func TestVerificationHelper(t *testing.T) {
 		time.Sleep(10 * time.Second)
 	case "hold":
 		time.Sleep(10 * time.Second)
-	case "hold-short":
+	case "hold-until-parent-reaped":
+		parentPID, err := strconv.Atoi(args[separator+2])
+		if err != nil {
+			os.Exit(4)
+		}
+		waitForParentReaped(parentPID)
+		if err := os.WriteFile(args[separator+3], []byte("ready"), 0o600); err != nil {
+			os.Exit(5)
+		}
 		time.Sleep(500 * time.Millisecond)
 	default:
 		os.Exit(2)
@@ -84,7 +92,7 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 	for _, testCase := range []struct {
 		name     string
 		context  func() (context.Context, func())
-		command  func(t *testing.T, workspace, pidFile string) verification.Command
+		command  func(t *testing.T, workspace, readyFile string) verification.Command
 		failure  string
 		exitCode int
 	}{
@@ -94,8 +102,8 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 				ctx, cancel := context.WithCancel(context.Background())
 				return ctx, cancel
 			},
-			command: func(_ *testing.T, workspace, pidFile string) verification.Command {
-				return helperCommand(workspace, "exit-7-with-descendant", pidFile)
+			command: func(_ *testing.T, workspace, readyFile string) verification.Command {
+				return helperCommand(workspace, "exit-7-with-descendant", readyFile)
 			},
 			failure:  "verification",
 			exitCode: 7,
@@ -106,8 +114,8 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 				ctx := newCompletionContext(context.DeadlineExceeded)
 				return ctx, ctx.complete
 			},
-			command: func(t *testing.T, workspace, pidFile string) verification.Command {
-				return dockerCommand(t, workspace, "docker-rootless-with-descendant", pidFile)
+			command: func(t *testing.T, workspace, readyFile string) verification.Command {
+				return dockerCommand(t, workspace, "docker-rootless-with-descendant", readyFile)
 			},
 			failure:  "environment",
 			exitCode: 1,
@@ -115,15 +123,15 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			workspace := t.TempDir()
-			pidFile := filepath.Join(workspace, "descendant.pid")
+			readyFile := filepath.Join(workspace, "parent-reaped")
 			ctx, complete := testCase.context()
 			executor := newExecutor(t, 1024)
-			command := testCase.command(t, workspace, pidFile)
+			command := testCase.command(t, workspace, readyFile)
 			results := make(chan verification.Result, 1)
 			go func() {
 				results <- executor.Run(ctx, command, helperEnvironment())
 			}()
-			waitForFile(t, pidFile)
+			waitForFile(t, readyFile)
 			complete()
 			result := <-results
 			if result.ExitCode != testCase.exitCode || result.FailureClass != testCase.failure || result.Passed {
@@ -311,19 +319,30 @@ func helperEnvironmentList() []string {
 	return []string{"GO_WANT_VERIFY_HELPER=1"}
 }
 
-func writeDescendantPIDAndExit(t *testing.T, pidFile, action string, exitCode int) {
+func writeDescendantPIDAndExit(t *testing.T, readyFile, action string, exitCode int) {
 	t.Helper()
-	child := exec.Command(os.Args[0], helperArgs(action)...)
+	child := exec.Command(os.Args[0], helperArgs(action, strconv.Itoa(os.Getpid()), readyFile)...)
 	child.Env = helperEnvironmentList()
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	if err := child.Start(); err != nil {
 		os.Exit(3)
 	}
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
-		os.Exit(3)
-	}
 	os.Exit(exitCode)
+}
+
+func waitForParentReaped(pid int) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if err == syscall.ESRCH {
+			return
+		}
+		if err != nil || time.Now().After(deadline) {
+			os.Exit(4)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func waitForFile(t *testing.T, path string) {
