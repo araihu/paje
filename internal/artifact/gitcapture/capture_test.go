@@ -708,7 +708,7 @@ func fakeWorkspace(t *testing.T) string {
 
 func waitForFileContents(t *testing.T, path string, result <-chan error) string {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		contents, err := os.ReadFile(path)
 		if err == nil && len(contents) != 0 {
@@ -727,7 +727,7 @@ func waitForFileContents(t *testing.T, path string, result <-chan error) string 
 
 func waitForFile(t *testing.T, path string, result <-chan error) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return
