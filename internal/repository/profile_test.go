@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -77,6 +78,13 @@ func TestGoProfileDiscoversModulesAndBuildsExactCommands(t *testing.T) {
 	}
 	if result.Facts["go_module:."] == "" || result.Facts["go_module:site"] == "" || result.Facts["go_module:tools"] == "" {
 		t.Fatalf("Facts does not record GOWORK=off module resolution: %#v", result.Facts)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), `"GOWORK"`) || strings.Contains(string(encoded), `"off"`) {
+		t.Fatalf("serialized profile result leaked command environment: %s", encoded)
 	}
 }
 

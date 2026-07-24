@@ -95,7 +95,7 @@ func (p *GenericProfile) Inspect(ctx context.Context, request ProfileRequest) (P
 		return ProfileResult{}, err
 	}
 	for _, command := range result.Commands {
-		result.Facts["tool:"+command.Executable] = toolAvailability(command.Executable, request.Environment)
+		result.Facts["tool:"+command.Executable] = toolAvailability(command, request.Environment)
 	}
 	return result, nil
 }
@@ -368,21 +368,9 @@ func copyEnvironment(values map[string]string) map[string]string {
 	return copy
 }
 
-func toolAvailability(executable string, environment map[string]string) string {
-	if strings.ContainsRune(executable, filepath.Separator) {
-		if info, err := os.Stat(executable); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			return "available"
-		}
-		return "unavailable"
-	}
-	for _, directory := range filepath.SplitList(environment["PATH"]) {
-		if directory == "" {
-			continue
-		}
-		candidate := filepath.Join(directory, executable)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			return "available"
-		}
+func toolAvailability(command verification.Command, environment map[string]string) string {
+	if _, err := verification.ResolveExecutable(command.Executable, command.Directory, environment); err == nil {
+		return "available"
 	}
 	return "unavailable"
 }

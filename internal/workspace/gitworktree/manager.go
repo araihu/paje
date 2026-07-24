@@ -27,6 +27,7 @@ var (
 type Manager struct {
 	mu            sync.Mutex
 	gitPath       string
+	root          string
 	repositories  string
 	worktreesRoot string
 }
@@ -47,15 +48,24 @@ func New(root string) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create git workspace manager: resolve root: %w", err)
 	}
-	repositories := filepath.Join(absoluteRoot, "repositories")
-	worktreesRoot := filepath.Join(absoluteRoot, "worktrees")
-	for _, directory := range []string{repositories, worktreesRoot} {
-		if err := os.MkdirAll(directory, 0o750); err != nil {
-			return nil, fmt.Errorf("create git workspace manager: create %q: %w", directory, err)
-		}
+	if err := os.MkdirAll(absoluteRoot, 0o750); err != nil {
+		return nil, fmt.Errorf("create git workspace manager: create root: %w", err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(absoluteRoot)
+	if err != nil {
+		return nil, fmt.Errorf("create git workspace manager: canonicalize root: %w", err)
+	}
+	repositories, err := createManagedDirectory(canonicalRoot, "repositories")
+	if err != nil {
+		return nil, err
+	}
+	worktreesRoot, err := createManagedDirectory(canonicalRoot, "worktrees")
+	if err != nil {
+		return nil, err
 	}
 	return &Manager{
 		gitPath:       gitPath,
+		root:          canonicalRoot,
 		repositories:  repositories,
 		worktreesRoot: worktreesRoot,
 	}, nil
@@ -81,8 +91,14 @@ func (m *Manager) Prepare(
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.validateRoots(); err != nil {
+		return nil, err
+	}
 
 	mirror := filepath.Join(m.repositories, repositoryKey(repoURI)+".git")
+	if err := m.validateMirror(mirror); err != nil {
+		return nil, err
+	}
 	if err := m.updateMirror(ctx, repoURI, mirror); err != nil {
 		return nil, err
 	}
@@ -93,6 +109,9 @@ func (m *Manager) Prepare(
 	}
 	if err := os.Remove(path); err != nil {
 		return nil, fmt.Errorf("prepare git workspace: release worktree path: %w", err)
+	}
+	if err := validateManagedPath(m.worktreesRoot, path, true); err != nil {
+		return nil, fmt.Errorf("prepare git workspace: validate worktree path: %w", err)
 	}
 
 	if err := m.runGit(
@@ -127,8 +146,14 @@ func (m *Manager) Resolve(ctx context.Context, repoURI, ref string) (repository.
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.validateRoots(); err != nil {
+		return repository.Revision{}, err
+	}
 
 	mirror := filepath.Join(m.repositories, repositoryKey(repoURI)+".git")
+	if err := m.validateMirror(mirror); err != nil {
+		return repository.Revision{}, err
+	}
 	if err := m.updateMirror(ctx, repoURI, mirror); err != nil {
 		return repository.Revision{}, err
 	}
@@ -148,7 +173,10 @@ func (m *Manager) Resolve(ctx context.Context, repoURI, ref string) (repository.
 }
 
 func (m *Manager) updateMirror(ctx context.Context, repoURI, mirror string) error {
-	info, err := os.Stat(mirror)
+	if err := m.validateMirror(mirror); err != nil {
+		return err
+	}
+	info, err := os.Lstat(mirror)
 	switch {
 	case err == nil:
 		if !info.IsDir() {
@@ -163,8 +191,80 @@ func (m *Manager) updateMirror(ctx context.Context, repoURI, mirror string) erro
 	}
 
 	if err := m.runGit(ctx, "clone", "--mirror", repoURI, mirror); err != nil {
-		_ = os.RemoveAll(mirror)
+		if validateErr := m.validateMirror(mirror); validateErr == nil {
+			_ = os.RemoveAll(mirror)
+		}
 		return fmt.Errorf("prepare git workspace: clone mirror: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) validateRoots() error {
+	if err := validateManagedDirectory(m.root, m.repositories); err != nil {
+		return fmt.Errorf("validate git workspace repositories root: %w", err)
+	}
+	if err := validateManagedDirectory(m.root, m.worktreesRoot); err != nil {
+		return fmt.Errorf("validate git workspace worktrees root: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) validateMirror(mirror string) error {
+	if err := validateManagedPath(m.repositories, mirror, true); err != nil {
+		return fmt.Errorf("validate git workspace mirror: %w", err)
+	}
+	return nil
+}
+
+func createManagedDirectory(root, name string) (string, error) {
+	directory := filepath.Join(root, name)
+	if err := os.Mkdir(directory, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", fmt.Errorf("create git workspace manager: create %q: %w", directory, err)
+	}
+	if err := validateManagedDirectory(root, directory); err != nil {
+		return "", fmt.Errorf("create git workspace manager: %w", err)
+	}
+	return filepath.EvalSymlinks(directory)
+}
+
+func validateManagedDirectory(root, directory string) error {
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("must be a non-symlink directory")
+	}
+	return validateManagedPath(root, directory, false)
+}
+
+func validateManagedPath(root, path string, allowMissing bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			parent := filepath.Dir(path)
+			resolvedParent, parentErr := filepath.EvalSymlinks(parent)
+			if parentErr != nil {
+				return parentErr
+			}
+			return pathWithin(root, resolvedParent)
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("must not be a symlink")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	return pathWithin(root, resolved)
+}
+
+func pathWithin(root, path string) error {
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path escapes workspace root")
 	}
 	return nil
 }
@@ -267,8 +367,17 @@ func (w *gitWorkspace) Cleanup(ctx context.Context) error {
 
 	w.manager.mu.Lock()
 	defer w.manager.mu.Unlock()
+	if err := w.manager.validateRoots(); err != nil {
+		return fmt.Errorf("cleanup git workspace: %w", err)
+	}
+	if err := w.manager.validateMirror(w.mirror); err != nil {
+		return fmt.Errorf("cleanup git workspace: %w", err)
+	}
+	if err := validateManagedPath(w.manager.worktreesRoot, w.path, true); err != nil {
+		return fmt.Errorf("cleanup git workspace: validate worktree path: %w", err)
+	}
 
-	if _, err := os.Stat(w.path); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(w.path); errors.Is(err, os.ErrNotExist) {
 		if pruneErr := w.manager.runGit(ctx, "--git-dir", w.mirror, "worktree", "prune"); pruneErr != nil {
 			return fmt.Errorf("cleanup git workspace: prune missing worktree: %w", pruneErr)
 		}

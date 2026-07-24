@@ -43,7 +43,7 @@ type Command struct {
 	// Environment contains command-specific exact-environment overrides.
 	// It is intentionally separate from Args so callers never need shell syntax
 	// for values such as GOWORK=off.
-	Environment map[string]string
+	Environment map[string]string `json:"-"`
 	Timeout     time.Duration
 	Required    bool
 }

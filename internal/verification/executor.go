@@ -55,7 +55,7 @@ func NewExecutor(limits Limits) (*Executor, error) {
 
 // Run executes one precompiled shell-free command in an exact environment.
 func (e *Executor) Run(ctx context.Context, command Command, values map[string]string) Result {
-	result := Result{Command: copyCommand(command)}
+	result := Result{Command: resultCommand(command)}
 	if err := ctx.Err(); err != nil {
 		return failedResult(result, failureCanceled, "caller_canceled", command.Required)
 	}
@@ -73,7 +73,7 @@ func (e *Executor) Run(ctx context.Context, command Command, values map[string]s
 
 	childCtx, cancel := context.WithTimeout(ctx, command.Timeout)
 	defer cancel()
-	executable, err := resolveExecutable(command.Executable, values, command.Environment)
+	executable, err := ResolveExecutable(command.Executable, command.Directory, mergeEnvironment(values, command.Environment))
 	if err != nil {
 		return failedResult(result, failureEnvironment, "start", command.Required)
 	}
@@ -165,6 +165,9 @@ func (e *Executor) validateCommand(command Command) error {
 	if command.Timeout < time.Second || command.Timeout > e.limits.MaxTimeout {
 		return fmt.Errorf("timeout is outside executor limits")
 	}
+	if err := validateEnvironmentOverrides(command.Environment); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -223,15 +226,19 @@ func exactEnvironment(values map[string]string) ([]string, error) {
 	return environment, nil
 }
 
-func copyCommand(command Command) Command {
+func resultCommand(command Command) Command {
 	command.Args = append([]string(nil), command.Args...)
-	if command.Environment != nil {
-		command.Environment = make(map[string]string, len(command.Environment))
-		for key, value := range command.Environment {
-			command.Environment[key] = value
+	command.Environment = nil
+	return command
+}
+
+func validateEnvironmentOverrides(overrides map[string]string) error {
+	for key, value := range overrides {
+		if key != "GOWORK" || value != "off" {
+			return fmt.Errorf("environment overrides only permit GOWORK=off")
 		}
 	}
-	return command
+	return nil
 }
 
 func mergeEnvironment(base, overrides map[string]string) map[string]string {
@@ -245,24 +252,38 @@ func mergeEnvironment(base, overrides map[string]string) map[string]string {
 	return values
 }
 
-func resolveExecutable(executable string, values, overrides map[string]string) (string, error) {
+// ResolveExecutable resolves an executable using only the supplied PATH. Empty
+// and relative PATH entries are evaluated from directory, matching child-process
+// lookup instead of the worker's current directory.
+func ResolveExecutable(executable, directory string, environment map[string]string) (string, error) {
 	if strings.ContainsRune(executable, filepath.Separator) {
-		return executable, nil
+		if !filepath.IsAbs(executable) {
+			executable = filepath.Join(directory, executable)
+		}
+		if isExecutable(executable) {
+			return executable, nil
+		}
+		return "", exec.ErrNotFound
 	}
-	environment := mergeEnvironment(values, overrides)
 	path, ok := environment["PATH"]
 	if !ok {
 		return "", exec.ErrNotFound
 	}
-	for _, directory := range filepath.SplitList(path) {
-		if directory == "" {
-			continue
+	for _, pathDirectory := range filepath.SplitList(path) {
+		if pathDirectory == "" {
+			pathDirectory = directory
+		} else if !filepath.IsAbs(pathDirectory) {
+			pathDirectory = filepath.Join(directory, pathDirectory)
 		}
-		candidate := filepath.Join(directory, executable)
-		info, err := os.Stat(candidate)
-		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+		candidate := filepath.Join(pathDirectory, executable)
+		if isExecutable(candidate) {
 			return candidate, nil
 		}
 	}
 	return "", exec.ErrNotFound
+}
+
+func isExecutable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }

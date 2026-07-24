@@ -2,6 +2,8 @@ package gitworktree_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -165,6 +167,78 @@ func TestManagerResolveRejectsUnsafeInputsBeforeGitArguments(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsSymlinkedManagedRootsAndMirrorBeforeGitOperations(t *testing.T) {
+	requireGit(t)
+	source := newRepository(t)
+	root := filepath.Join(t.TempDir(), "paje-workspaces")
+	manager, err := gitworktree.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	for _, directory := range []string{"repositories", "worktrees"} {
+		managed := filepath.Join(root, directory)
+		if err := os.Remove(managed); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, managed); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.Resolve(context.Background(), source, "HEAD"); err == nil {
+			t.Fatalf("Resolve() accepted symlinked %s root", directory)
+		}
+		if err := os.Remove(managed); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(managed, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	key := repositoryKeyForTest(source)
+	mirror := filepath.Join(root, "repositories", key+".git")
+	if err := os.Symlink(outside, mirror); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Resolve(context.Background(), source, "HEAD"); err == nil {
+		t.Fatal("Resolve() accepted a symlinked mirror")
+	}
+}
+
+func TestWorkspaceCleanupRejectsSymlinkEscapingManagedRoot(t *testing.T) {
+	requireGit(t)
+	source := newRepository(t)
+	manager, err := gitworktree.New(filepath.Join(t.TempDir(), "paje-workspaces"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := manager.Resolve(context.Background(), source, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := manager.Prepare(context.Background(), source, revision.SHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	marker := filepath.Join(outside, "must-remain")
+	if err := os.WriteFile(marker, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(prepared.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, prepared.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Cleanup(context.Background()); err == nil {
+		t.Fatal("Cleanup() accepted a symlinked worktree path")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cleanup touched outside root: %v", err)
+	}
+}
+
 func requireGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -216,4 +290,9 @@ func assertFileContent(t *testing.T, path, want string) {
 	if string(content) != want {
 		t.Errorf("ReadFile(%q) = %q, want %q", path, content, want)
 	}
+}
+
+func repositoryKeyForTest(repoURI string) string {
+	sum := sha256.Sum256([]byte(repoURI))
+	return hex.EncodeToString(sum[:])
 }

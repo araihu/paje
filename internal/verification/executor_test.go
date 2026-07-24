@@ -2,6 +2,7 @@ package verification_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -48,6 +49,10 @@ func TestVerificationHelper(t *testing.T) {
 		os.Exit(1)
 	case "output":
 		fmt.Fprint(os.Stdout, args[separator+2])
+	case "write-marker":
+		if err := os.WriteFile(args[separator+2], []byte("started"), 0o600); err != nil {
+			os.Exit(3)
+		}
 	case "descendant":
 		pidFile := args[separator+2]
 		child := mustStartHelper(t, "hold")
@@ -290,6 +295,84 @@ func TestExecutorBoundsCombinedOutputExactly(t *testing.T) {
 	}, helperEnvironment())
 	if !result.Passed || result.Truncated != true || result.Output != "abcd" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestExecutorDoesNotReturnOrSerializeCommandEnvironmentValues(t *testing.T) {
+	workspace := t.TempDir()
+	secret := "top-secret-override"
+	result := newExecutor(t, 1024).Run(context.Background(), verification.Command{
+		Name: "redact override", Directory: workspace, Executable: os.Args[0],
+		Args: helperArgs("output", "ok"), Timeout: time.Second, Required: true,
+		Environment: map[string]string{"GOWORK": secret},
+	}, helperEnvironment())
+	if result.Command.Environment != nil {
+		t.Fatalf("Result.Command retained override values: %#v", result.Command.Environment)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("serialized result leaked override value: %s", encoded)
+	}
+}
+
+func TestExecutorRejectsUnsafeCommandEnvironmentOverridesBeforeStart(t *testing.T) {
+	workspace := t.TempDir()
+	for key, value := range map[string]string{
+		"PATH":         "/tmp/override",
+		"HOME":         "/tmp/override",
+		"GITHUB_TOKEN": "secret",
+		"GOWORK":       "auto",
+	} {
+		t.Run(key, func(t *testing.T) {
+			marker := filepath.Join(workspace, key)
+			override := map[string]string{key: value}
+			result := newExecutor(t, 1024).Run(context.Background(), verification.Command{
+				Name: "unsafe override", Directory: workspace, Executable: os.Args[0],
+				Args: helperArgs("write-marker", marker), Timeout: time.Second, Required: true,
+				Environment: override,
+			}, helperEnvironment())
+			if result.FailureClass != "internal" || result.CauseCode != "invalid_command" {
+				t.Fatalf("result = %#v", result)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("command started despite rejected override: %v", err)
+			}
+			if len(override) != 1 || override[key] != value {
+				t.Fatalf("Run mutated caller override map: %#v", override)
+			}
+		})
+	}
+}
+
+func TestExecutorResolvesEmptyAndRelativePATHEntriesFromCommandDirectory(t *testing.T) {
+	workspace := t.TempDir()
+	for _, testCase := range []struct {
+		name string
+		path string
+		dir  string
+	}{
+		{name: "empty entry", path: string(os.PathListSeparator), dir: workspace},
+		{name: "relative entry", path: "tools", dir: filepath.Join(workspace, "tools")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := os.MkdirAll(testCase.dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			helper := filepath.Join(testCase.dir, "verify-helper")
+			if err := os.Symlink(os.Args[0], helper); err != nil {
+				t.Fatal(err)
+			}
+			result := newExecutor(t, 1024).Run(context.Background(), verification.Command{
+				Name: "path lookup", Directory: workspace, Executable: "verify-helper",
+				Args: helperArgs("output", "ok"), Timeout: 5 * time.Second, Required: true,
+			}, map[string]string{"PATH": testCase.path, "GO_WANT_VERIFY_HELPER": "1"})
+			if !result.Passed || result.Output != "ok" {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
 }
 
