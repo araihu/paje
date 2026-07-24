@@ -2,6 +2,7 @@ package verification_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,13 +36,13 @@ func TestVerificationHelper(t *testing.T) {
 	case "exit-7":
 		os.Exit(7)
 	case "exit-7-with-descendant":
-		writeDescendantPIDAndExit(t, args[separator+2], "hold-until-parent-reaped", 7)
+		writeDescendantPIDAndExit(t, args[separator+2], args[separator+3], "hold-until-parent-reaped", 7)
 	case "docker-rootless":
 		fmt.Fprintln(os.Stderr, "rootless Docker not found")
 		os.Exit(1)
 	case "docker-rootless-with-descendant":
 		fmt.Fprintln(os.Stderr, "rootless Docker not found")
-		writeDescendantPIDAndExit(t, args[separator+2], "hold-until-parent-reaped", 1)
+		writeDescendantPIDAndExit(t, args[separator+2], args[separator+3], "hold-until-parent-reaped", 1)
 	case "docker-daemon":
 		fmt.Fprintln(os.Stderr, "Cannot connect to the Docker daemon")
 		os.Exit(1)
@@ -62,10 +63,10 @@ func TestVerificationHelper(t *testing.T) {
 			os.Exit(4)
 		}
 		waitForParentReaped(parentPID)
-		if err := os.WriteFile(args[separator+3], []byte("ready"), 0o600); err != nil {
+		if err := os.WriteFile(args[separator+3], []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 			os.Exit(5)
 		}
-		time.Sleep(500 * time.Millisecond)
+		waitForRelease(args[separator+4])
 	default:
 		os.Exit(2)
 	}
@@ -92,7 +93,7 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 	for _, testCase := range []struct {
 		name     string
 		context  func() (context.Context, func())
-		command  func(t *testing.T, workspace, readyFile string) verification.Command
+		command  func(t *testing.T, workspace, readyFile, releaseFIFO string) verification.Command
 		failure  string
 		exitCode int
 	}{
@@ -102,8 +103,8 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 				ctx, cancel := context.WithCancel(context.Background())
 				return ctx, cancel
 			},
-			command: func(_ *testing.T, workspace, readyFile string) verification.Command {
-				return helperCommand(workspace, "exit-7-with-descendant", readyFile)
+			command: func(_ *testing.T, workspace, readyFile, releaseFIFO string) verification.Command {
+				return helperCommand(workspace, "exit-7-with-descendant", readyFile, releaseFIFO)
 			},
 			failure:  "verification",
 			exitCode: 7,
@@ -114,8 +115,8 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 				ctx := newCompletionContext(context.DeadlineExceeded)
 				return ctx, ctx.complete
 			},
-			command: func(t *testing.T, workspace, readyFile string) verification.Command {
-				return dockerCommand(t, workspace, "docker-rootless-with-descendant", readyFile)
+			command: func(t *testing.T, workspace, readyFile, releaseFIFO string) verification.Command {
+				return dockerCommand(t, workspace, "docker-rootless-with-descendant", readyFile, releaseFIFO)
 			},
 			failure:  "environment",
 			exitCode: 1,
@@ -124,15 +125,35 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 		t.Run(testCase.name, func(t *testing.T) {
 			workspace := t.TempDir()
 			readyFile := filepath.Join(workspace, "parent-reaped")
+			releaseFIFO := filepath.Join(workspace, "release")
+			if err := syscall.Mkfifo(releaseFIFO, 0o600); err != nil {
+				t.Fatalf("Mkfifo() error = %v", err)
+			}
 			ctx, complete := testCase.context()
 			executor := newExecutor(t, 1024)
-			command := testCase.command(t, workspace, readyFile)
+			command := testCase.command(t, workspace, readyFile, releaseFIFO)
 			results := make(chan verification.Result, 1)
 			go func() {
 				results <- executor.Run(ctx, command, helperEnvironment())
 			}()
 			waitForFile(t, readyFile)
+			descendantPID := readPID(t, readyFile)
+			t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
+			releaseFD := openReleaseWriter(t, releaseFIFO)
+			releaseClosed := false
+			t.Cleanup(func() {
+				if !releaseClosed {
+					_ = syscall.Close(releaseFD)
+				}
+			})
 			complete()
+			if _, err := syscall.Write(releaseFD, []byte{1}); err != nil && !errors.Is(err, syscall.EPIPE) {
+				t.Fatalf("Write(release FIFO) error = %v", err)
+			}
+			if err := syscall.Close(releaseFD); err != nil {
+				t.Fatalf("Close(release FIFO) error = %v", err)
+			}
+			releaseClosed = true
 			result := <-results
 			if result.ExitCode != testCase.exitCode || result.FailureClass != testCase.failure || result.Passed {
 				t.Fatalf("result = %#v", result)
@@ -319,9 +340,9 @@ func helperEnvironmentList() []string {
 	return []string{"GO_WANT_VERIFY_HELPER=1"}
 }
 
-func writeDescendantPIDAndExit(t *testing.T, readyFile, action string, exitCode int) {
+func writeDescendantPIDAndExit(t *testing.T, readyFile, releaseFIFO, action string, exitCode int) {
 	t.Helper()
-	child := exec.Command(os.Args[0], helperArgs(action, strconv.Itoa(os.Getpid()), readyFile)...)
+	child := exec.Command(os.Args[0], helperArgs(action, strconv.Itoa(os.Getpid()), readyFile, releaseFIFO)...)
 	child.Env = helperEnvironmentList()
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
@@ -345,6 +366,18 @@ func waitForParentReaped(pid int) {
 	}
 }
 
+func waitForRelease(releaseFIFO string) {
+	release, err := os.Open(releaseFIFO)
+	if err != nil {
+		os.Exit(6)
+	}
+	defer release.Close()
+	var byteValue [1]byte
+	if _, err := release.Read(byteValue[:]); err != nil {
+		os.Exit(7)
+	}
+}
+
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -354,6 +387,37 @@ func waitForFile(t *testing.T, path string) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %q", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(contents)))
+	if err != nil {
+		t.Fatalf("Atoi(%q) error = %v", contents, err)
+	}
+	return pid
+}
+
+func openReleaseWriter(t *testing.T, releaseFIFO string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fd, err := syscall.Open(releaseFIFO, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			return fd
+		}
+		if !errors.Is(err, syscall.ENXIO) {
+			t.Fatalf("Open(release FIFO) error = %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for descendant to block on release FIFO")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
