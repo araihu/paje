@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -162,10 +160,12 @@ func TestReferenceForCanonicalizesRawJSONAndSemanticallyUnorderedValues(t *testi
 	right := testBundle()
 	left.ExecutionMetadata = json.RawMessage(`{"exit_code":0,"duration":2.5,"started":true,"completed":true,"truncated":false}`)
 	right.ExecutionMetadata = append(json.RawMessage(nil), left.ExecutionMetadata...)
-	right.Manifest.MemoryIDs = []string{"memory-z", "memory-a"}
-	right.Warnings = []string{"z warning", "a warning"}
 	left.Manifest.Changes = []artifact.Change{{Path: "z.go", Status: "modified"}, {Path: "a.go", Status: "added"}}
+	left.Manifest.MemoryIDs = []string{"memory-z", "memory-a"}
+	left.Warnings = []string{"z warning", "a warning"}
 	right.Manifest.Changes = []artifact.Change{{Path: "a.go", Status: "added"}, {Path: "z.go", Status: "modified"}}
+	right.Manifest.MemoryIDs = []string{"memory-a", "memory-z"}
+	right.Warnings = []string{"a warning", "z warning"}
 	leftRef, err := artifact.ReferenceFor(left)
 	if err != nil {
 		t.Fatal(err)
@@ -288,6 +288,99 @@ func TestStoreRejectsSymlinkedComponentsAndHardLinkedArtifacts(t *testing.T) {
 	}
 }
 
+func TestNewRejectsSymlinkedRootWithoutChangingOutsideDirectory(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Chmod(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(parent, "artifact-root")
+	if err := os.Symlink(outside, root); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := filesystem.New(root, 1<<20); err == nil {
+		t.Fatal("New accepted a symlinked root")
+	}
+	info, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("outside directory mode = %o, want 755", got)
+	}
+}
+
+func TestStoreDoesNotFollowReplacedTemporaryOrPrefixNames(t *testing.T) {
+	t.Parallel()
+	t.Run("temporary directory", func(t *testing.T) {
+		root := t.TempDir()
+		store := newStore(t, root, 1<<20)
+		outside := t.TempDir()
+		sentinel := filepath.Join(outside, "sentinel")
+		if err := os.WriteFile(sentinel, []byte("outside"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(root, "tmp")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(root, "tmp")); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := store.Save(context.Background(), testBundle()); err == nil {
+			t.Fatal("Save followed a replaced temporary-directory name")
+		}
+		assertOnlyOutsideSentinel(t, outside, sentinel)
+	})
+
+	t.Run("digest prefix", func(t *testing.T) {
+		root := t.TempDir()
+		store := newStore(t, root, 1<<20)
+		bundle := testBundle()
+		ref, err := store.Save(context.Background(), bundle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefix := filepath.Join(root, "sha256", ref.Digest[:2])
+		if err := os.Rename(prefix, prefix+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		outside := t.TempDir()
+		sentinel := filepath.Join(outside, "sentinel")
+		if err := os.WriteFile(sentinel, []byte("outside"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, prefix); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := store.Load(context.Background(), ref); err == nil {
+			t.Fatal("Load followed a replaced digest-prefix name")
+		}
+		assertOnlyOutsideSentinel(t, outside, sentinel)
+	})
+}
+
+func assertOnlyOutsideSentinel(t *testing.T, outside, sentinel string) {
+	t.Helper()
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(sentinel) {
+		t.Fatalf("outside directory was modified: %#v", entries)
+	}
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "outside" {
+		t.Fatalf("outside sentinel = %q, want outside", data)
+	}
+}
+
 func TestStoreConcurrentSavesDoNotOverwriteWinner(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -321,6 +414,11 @@ func newStore(t *testing.T, root string, limit int64) *filesystem.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
 	return store
 }
 
@@ -351,15 +449,15 @@ func TestMemberDigestsAreVerified(t *testing.T) {
 	if len(loaded.Manifest.Members) != 6 {
 		t.Fatalf("members = %#v", loaded.Manifest.Members)
 	}
-	want := map[string][]byte{"changes.patch": loaded.ChangesPatch, "agent-output.txt": loaded.AgentOutput, "execution.json": loaded.ExecutionMetadata}
-	for _, member := range loaded.Manifest.Members {
-		data, ok := want[member.Name]
-		if !ok {
-			continue
-		}
-		sum := sha256.Sum256(data)
-		if member.Size != int64(len(data)) || member.SHA256 != fmt.Sprintf("%x", sum) {
-			t.Fatalf("member = %#v, want exact digest/size", member)
-		}
+	want := []artifact.Member{
+		{Name: "changes.patch", SHA256: "37ccc013b5e1b4412daf98cc7d0a2449d56ec4de799cd0408bb5b0429599e207", Size: 31},
+		{Name: "agent-output.txt", SHA256: "39d8ba2ada2b71567f9e0c8e3cf54e857a990a4a83aa9a03a102b9c44aba1bf7", Size: 12},
+		{Name: "execution.json", SHA256: "cd7500269fbe5eda26d71cc8a500fd0e560e210256f73bc303feb271291be2e2", Size: 80},
+		{Name: "verification.json", SHA256: "fc510c02ee052e21115aee395c8487ff258ae791635313b3f5ad37a021d4a0fb", Size: 235},
+		{Name: "preflight.json", SHA256: "dbe343b13cce473846c0c82448552f060fe6d6d3a404a52fe1a529d9adbafe46", Size: 72},
+		{Name: "warnings.json", SHA256: "2cb92aff025886ffc3c3e9f5222a0bb23976430250379e5d0a11e2e035a5c807", Size: 25},
+	}
+	if !reflect.DeepEqual(loaded.Manifest.Members, want) {
+		t.Fatalf("members = %#v, want %#v", loaded.Manifest.Members, want)
 	}
 }

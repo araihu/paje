@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -37,10 +36,7 @@ func New(root string, max int64) (*Store, error) {
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(abs, 0o700); err != nil {
-		return nil, err
-	}
-	rootFile, _, err := openDirAt(unix.AT_FDCWD, abs, false)
+	rootFile, err := openRoot(abs)
 	if err != nil {
 		return nil, fmt.Errorf("open artifact root: %w", err)
 	}
@@ -79,6 +75,7 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 	if err != nil {
 		return artifact.Reference{}, err
 	}
+	defer temp.Close()
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -87,18 +84,15 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 		}
 	}()
 	if err := writeGzip(ctx, temp, tarBytes, s.maxCompressed); err != nil {
-		temp.Close()
 		return artifact.Reference{}, err
 	}
 	if err := temp.Sync(); err != nil {
-		temp.Close()
 		return artifact.Reference{}, err
 	}
 	if err := checkFile(temp); err != nil {
-		temp.Close()
 		return artifact.Reference{}, err
 	}
-	if err := temp.Close(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return artifact.Reference{}, err
 	}
 	prefix, created, err := s.prefix(ref.Digest[:2])
@@ -120,11 +114,11 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 		return artifact.Reference{}, err
 	}
 	final := ref.Digest + ".tar.gz"
-	err = unix.Linkat(int(s.tmp.Fd()), name, int(prefix.Fd()), final, 0)
-	if err != nil && !errors.Is(err, unix.EEXIST) {
-		return artifact.Reference{}, fmt.Errorf("publish artifact: %w", err)
+	published, err := linkTemp(s.tmp, name, temp, prefix, final)
+	if err != nil {
+		return artifact.Reference{}, err
 	}
-	if err == nil {
+	if published {
 		if err := prefix.Sync(); err != nil {
 			return artifact.Reference{}, err
 		}
@@ -137,6 +131,10 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 		cleanup = false
 	}
 	if err := s.verifyFinal(ctx, prefix, final, tarBytes, ref); err != nil {
+		if published {
+			_ = unix.Unlinkat(int(prefix.Fd()), final, 0)
+			_ = prefix.Sync()
+		}
 		return artifact.Reference{}, err
 	}
 	if cleanup {
@@ -152,6 +150,9 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 }
 
 func (s *Store) Load(ctx context.Context, ref artifact.Reference) (artifact.Bundle, error) {
+	if err := ctx.Err(); err != nil {
+		return artifact.Bundle{}, err
+	}
 	if err := validRef(ref); err != nil {
 		return artifact.Bundle{}, err
 	}
@@ -193,7 +194,7 @@ func (s *Store) createTemp() (string, *os.File, error) {
 		if err != nil {
 			return "", nil, err
 		}
-		fd, err := unix.Openat(int(s.tmp.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0o600)
+		fd, err := unix.Openat(int(s.tmp.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 		if errors.Is(err, unix.EEXIST) {
 			continue
 		}
@@ -214,6 +215,32 @@ func validRef(ref artifact.Reference) error {
 	return nil
 }
 
+func openRoot(name string) (*os.File, error) {
+	fd, err := unix.Openat(unix.AT_FDCWD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || int(stat.Uid) != os.Geteuid() {
+		file.Close()
+		return nil, fmt.Errorf("unsafe artifact root")
+	}
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err := checkDir(file); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
 func openDirAt(parent int, name string, create bool) (*os.File, bool, error) {
 	created := false
 	if create {
@@ -223,7 +250,7 @@ func openDirAt(parent int, name string, create bool) (*os.File, bool, error) {
 			return nil, false, err
 		}
 	}
-	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -235,7 +262,7 @@ func openDirAt(parent int, name string, create bool) (*os.File, bool, error) {
 	return file, created, nil
 }
 func openFileAt(parent int, name string) (*os.File, error) {
-	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -267,30 +294,72 @@ func checkFile(file *os.File) error {
 	return nil
 }
 func lock(ctx context.Context, prefix *os.File) (func(), error) {
-	fd, err := unix.Openat(int(prefix.Fd()), ".lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW, 0o600)
+	fd, err := unix.Openat(int(prefix.Fd()), ".lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), ".lock")
+	if err := checkFile(file); err != nil {
+		file.Close()
 		return nil, err
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			unix.Close(fd)
+			file.Close()
 			return nil, err
 		}
 		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
-			return func() { _ = unix.Flock(fd, unix.LOCK_UN); _ = unix.Close(fd) }, nil
+			return func() { _ = unix.Flock(fd, unix.LOCK_UN); _ = file.Close() }, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
-			unix.Close(fd)
+			file.Close()
 			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			unix.Close(fd)
+			file.Close()
 			return nil, ctx.Err()
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+func linkTemp(tmp *os.File, name string, temp *os.File, prefix *os.File, final string) (bool, error) {
+	if err := unix.Linkat(int(tmp.Fd()), name, int(prefix.Fd()), final, 0); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			return false, nil
+		}
+		return false, fmt.Errorf("publish artifact: %w", err)
+	}
+
+	var expected unix.Stat_t
+	if err := unix.Fstat(int(temp.Fd()), &expected); err != nil {
+		return false, rollbackPublication(prefix, final, err)
+	}
+	fd, err := unix.Openat(int(prefix.Fd()), final, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, rollbackPublication(prefix, final, err)
+	}
+	var actual unix.Stat_t
+	statErr := unix.Fstat(fd, &actual)
+	closeErr := unix.Close(fd)
+	if statErr != nil {
+		return false, rollbackPublication(prefix, final, statErr)
+	}
+	if closeErr != nil {
+		return false, rollbackPublication(prefix, final, closeErr)
+	}
+	if expected.Dev != actual.Dev || expected.Ino != actual.Ino {
+		return false, rollbackPublication(prefix, final, artifact.ErrDigestMismatch)
+	}
+	return true, nil
+}
+
+func rollbackPublication(prefix *os.File, final string, cause error) error {
+	unlinkErr := unix.Unlinkat(int(prefix.Fd()), final, 0)
+	syncErr := prefix.Sync()
+	return errors.Join(cause, unlinkErr, syncErr)
 }
 
 func (s *Store) verifyFinal(ctx context.Context, prefix *os.File, name string, expected []byte, ref artifact.Reference) error {
@@ -405,5 +474,3 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	w.written += int64(n)
 	return n, e
 }
-
-var _ = fs.ErrExist
