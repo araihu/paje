@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/araihu/paje/internal/runner"
 	"github.com/araihu/paje/internal/template"
@@ -145,15 +146,22 @@ func CanonicalizeLimited(ctx context.Context, bundle Bundle, maxTarBytes int64) 
 	if err := preflightBundleSize(ctx, bundle, maxTarBytes); err != nil {
 		return Bundle{}, nil, Reference{}, err
 	}
-	normalized, err := normalizeBundle(bundle)
+	normalized, err := normalizeBundleContext(ctx, bundle)
 	if err != nil {
 		return Bundle{}, nil, Reference{}, err
 	}
-	payloads, err := encodePayloads(normalized)
+	payloads, err := encodePayloadsContext(ctx, normalized)
 	if err != nil {
 		return Bundle{}, nil, Reference{}, err
 	}
-	normalized.Manifest.Members = membersFor(payloads)
+	members, err := membersForContext(ctx, payloads)
+	if err != nil {
+		return Bundle{}, nil, Reference{}, err
+	}
+	normalized.Manifest.Members = members
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, nil, Reference{}, err
+	}
 	manifest, err := stableJSON(normalized.Manifest)
 	if err != nil {
 		return Bundle{}, nil, Reference{}, fmt.Errorf("%w: encode manifest: %v", ErrInvalidBundle, err)
@@ -166,62 +174,142 @@ func CanonicalizeLimited(ctx context.Context, bundle Bundle, maxTarBytes int64) 
 	if err != nil {
 		return Bundle{}, nil, Reference{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, nil, Reference{}, err
+	}
 	return normalized, tarBytes, Reference{RunID: normalized.Manifest.RunID, Digest: DigestTar(tarBytes), Size: int64(len(tarBytes))}, nil
 }
 
 // preflightBundleSize rejects hostile payloads before CloneBundle duplicates
 // their byte slices. The exact tar framing bound is enforced by writeTar.
 func preflightBundleSize(ctx context.Context, bundle Bundle, limit int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if limit <= 0 {
 		return nil
 	}
 	remaining := limit
-	consume := func(size int) error {
-		if size < 0 || int64(size) > remaining {
-			return ErrTooLarge
-		}
-		remaining -= int64(size)
-		return nil
-	}
-	for _, data := range [][]byte{bundle.ChangesPatch, bundle.AgentOutput, bundle.ExecutionMetadata} {
+	consume := func(size int64) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := consume(len(data)); err != nil {
+		if size < 0 || size > remaining {
+			return ErrTooLarge
+		}
+		remaining -= size
+		return nil
+	}
+	consumeCount := func(count int, elementSize uintptr) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		size := int64(elementSize)
+		if count < 0 || size <= 0 || int64(count) > remaining/size {
+			return ErrTooLarge
+		}
+		remaining -= int64(count) * size
+		return nil
+	}
+	consumeString := func(value string) error {
+		const maxJSONExpansion = 6
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		length := int64(len(value))
+		if length > remaining/maxJSONExpansion {
+			return ErrTooLarge
+		}
+		return consume(length * maxJSONExpansion)
+	}
+	consumeStrings := func(values ...string) error {
+		for _, value := range values {
+			if err := consumeString(value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	const minimumCanonicalTarBytes = 10 * 1024
+	if err := consume(minimumCanonicalTarBytes); err != nil {
+		return err
+	}
+	for _, data := range [][]byte{bundle.ChangesPatch, bundle.AgentOutput, bundle.ExecutionMetadata} {
+		if err := consume(int64(len(data))); err != nil {
+			return err
+		}
+	}
+	if err := consumeStrings(
+		bundle.Manifest.RunID,
+		bundle.Manifest.Template.Name,
+		bundle.Manifest.Repository,
+		bundle.Manifest.BaseSHA,
+		bundle.Manifest.TreeSHA,
+	); err != nil {
+		return err
+	}
+	if err := consumeCount(len(bundle.Manifest.Changes), unsafe.Sizeof(Change{})); err != nil {
+		return err
+	}
+	for _, change := range bundle.Manifest.Changes {
+		if err := consumeStrings(change.Path, change.OldPath, change.Status, change.OldMode, change.NewMode); err != nil {
+			return err
+		}
+	}
+	if err := consumeCount(len(bundle.Manifest.Members), unsafe.Sizeof(Member{})); err != nil {
+		return err
+	}
+	for _, member := range bundle.Manifest.Members {
+		if err := consumeStrings(member.Name, member.SHA256); err != nil {
 			return err
 		}
 	}
 	for _, values := range [][]string{bundle.Manifest.MemoryIDs, bundle.Warnings} {
+		if err := consumeCount(len(values), unsafe.Sizeof("")); err != nil {
+			return err
+		}
 		for _, value := range values {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := consume(len(value)); err != nil {
+			if err := consumeString(value); err != nil {
 				return err
 			}
 		}
 	}
+	if err := consumeCount(len(bundle.Verification), unsafe.Sizeof(verification.Result{})); err != nil {
+		return err
+	}
 	for _, result := range bundle.Verification {
-		if err := ctx.Err(); err != nil {
+		if err := consumeStrings(
+			result.Command.Name,
+			result.Command.Directory,
+			result.Command.Executable,
+			result.Output,
+			result.FailureClass,
+			result.CauseCode,
+		); err != nil {
 			return err
 		}
-		if err := consume(len(result.Output)); err != nil {
+		if err := consumeCount(len(result.Command.Args), unsafe.Sizeof("")); err != nil {
 			return err
 		}
 		for _, arg := range result.Command.Args {
-			if err := consume(len(arg)); err != nil {
+			if err := consumeString(arg); err != nil {
+				return err
+			}
+		}
+		if err := consumeCount(len(result.Command.Environment), 64); err != nil {
+			return err
+		}
+		for key, value := range result.Command.Environment {
+			if err := consumeStrings(key, value); err != nil {
 				return err
 			}
 		}
 	}
+	if err := consumeCount(len(bundle.Preflight), 64); err != nil {
+		return err
+	}
 	for key, value := range bundle.Preflight {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := consume(len(key)); err != nil {
-			return err
-		}
-		if err := consume(len(value)); err != nil {
+		if err := consumeStrings(key, value); err != nil {
 			return err
 		}
 	}
@@ -294,7 +382,17 @@ func DecodeCanonicalTar(canonicalTar []byte) (Bundle, error) {
 }
 
 func normalizeBundle(bundle Bundle) (Bundle, error) {
+	return normalizeBundleContext(context.Background(), bundle)
+}
+
+func normalizeBundleContext(ctx context.Context, bundle Bundle) (Bundle, error) {
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
+	}
 	bundle = CloneBundle(bundle)
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
+	}
 	bundle.Manifest.Changes = nonNil(bundle.Manifest.Changes)
 	bundle.Manifest.MemoryIDs = nonNil(bundle.Manifest.MemoryIDs)
 	bundle.Verification = nonNil(bundle.Verification)
@@ -312,11 +410,23 @@ func normalizeBundle(bundle Bundle) (Bundle, error) {
 	if err := sortUniqueStrings(bundle.Manifest.MemoryIDs); err != nil {
 		return Bundle{}, fmt.Errorf("%w: memory IDs: %v", ErrInvalidBundle, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
+	}
 	sort.Slice(bundle.Manifest.Changes, func(i, j int) bool {
 		return changeKey(bundle.Manifest.Changes[i]) < changeKey(bundle.Manifest.Changes[j])
 	})
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
+	}
 	sort.Strings(bundle.Warnings)
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
+	}
 	for index := range bundle.Verification {
+		if err := ctx.Err(); err != nil {
+			return Bundle{}, err
+		}
 		// Task 5 permits an execution-only override, never serializable evidence.
 		bundle.Verification[index].Command.Environment = nil
 		bundle.Verification[index].Command.Args = nonNil(bundle.Verification[index].Command.Args)
@@ -330,41 +440,66 @@ func normalizeBundle(bundle Bundle) (Bundle, error) {
 		}
 		bundle.ExecutionMetadata = canonical
 	}
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
+	}
 	bundle.Manifest.Members = nil
 	return bundle, nil
 }
 
-func encodePayloads(bundle Bundle) (map[string][]byte, error) {
+func encodePayloadsContext(ctx context.Context, bundle Bundle) (map[string][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	verificationData, err := stableJSON(bundle.Verification)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	preflightData, err := stableJSON(sortedPreflight(bundle.Preflight))
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	warningsData, err := stableJSON(bundle.Warnings)
 	if err != nil {
 		return nil, err
 	}
-	return map[string][]byte{
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	payloads := map[string][]byte{
 		"changes.patch":     append([]byte(nil), bundle.ChangesPatch...),
 		"agent-output.txt":  append([]byte(nil), bundle.AgentOutput...),
 		"execution.json":    append([]byte(nil), bundle.ExecutionMetadata...),
 		"verification.json": verificationData,
 		"preflight.json":    preflightData,
 		"warnings.json":     warningsData,
-	}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return payloads, nil
 }
 
-func membersFor(payloads map[string][]byte) []Member {
+func membersForContext(ctx context.Context, payloads map[string][]byte) ([]Member, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	members := make([]Member, 0, len(memberNames)-1)
 	for _, name := range memberNames[1:] {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		data := payloads[name]
 		sum := sha256.Sum256(data)
 		members = append(members, Member{Name: name, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))})
 	}
-	return members
+	return members, nil
 }
 
 func writeTar(ctx context.Context, payloads map[string][]byte, limit int64) ([]byte, error) {
@@ -636,8 +771,12 @@ type boundedBuffer struct {
 }
 
 func (b *boundedBuffer) Write(data []byte) (int, error) {
-	if b.limit > 0 && int64(b.Len()+len(data)) > b.limit {
+	if b.limit > 0 && !withinLimit(int64(b.Len()), int64(len(data)), b.limit) {
 		return 0, ErrTooLarge
 	}
 	return b.Buffer.Write(data)
+}
+
+func withinLimit(used, added, limit int64) bool {
+	return used >= 0 && added >= 0 && limit >= 0 && used <= limit && added <= limit-used
 }

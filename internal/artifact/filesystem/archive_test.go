@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 package filesystem_test
 
 import (
@@ -5,6 +7,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -231,6 +235,54 @@ func TestStoreRejectsMemberAndManifestTampering(t *testing.T) {
 	}
 }
 
+func TestStoreLoadPreservesTooLargeFromUncompressedRead(t *testing.T) {
+	t.Parallel()
+	bundle := testBundle()
+	bundle.AgentOutput = bytes.Repeat([]byte("highly compressible artifact evidence\n"), 8192)
+	_, tarBytes, _, err := artifact.Canonicalize(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := gzipArchive(t, tarBytes, 6)
+	if int64(len(tarBytes)) <= 16*int64(len(compressed)) {
+		t.Fatalf("fixture is not compressible enough: tar=%d gzip=%d", len(tarBytes), len(compressed))
+	}
+
+	root := t.TempDir()
+	store := newStore(t, root, int64(len(compressed)))
+	ref := writeStoredCompressedArchive(t, root, tarBytes, compressed, bundle.Manifest.RunID)
+	if _, err := store.Load(context.Background(), ref); !errors.Is(err, artifact.ErrTooLarge) {
+		t.Fatalf("Load() error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestStoreLoadPreservesTooLargeFromCanonicalReencoding(t *testing.T) {
+	t.Parallel()
+	var plain bytes.Buffer
+	for index := range 4096 {
+		var seed [8]byte
+		binary.LittleEndian.PutUint64(seed[:], uint64(index))
+		sum := sha256.Sum256(seed[:])
+		plain.Write(sum[:16])
+		plain.WriteString(" repeated artifact record framing ")
+	}
+	levelSix := gzipArchive(t, plain.Bytes(), 6)
+	levelNine := gzipArchive(t, plain.Bytes(), 9)
+	if len(levelNine) >= len(levelSix) {
+		t.Fatalf("fixture does not distinguish gzip levels: level6=%d level9=%d", len(levelSix), len(levelNine))
+	}
+	if int64(plain.Len()) > 16*int64(len(levelNine)) {
+		t.Fatalf("fixture exceeds uncompressed bound before re-encoding: plain=%d gzip=%d", plain.Len(), len(levelNine))
+	}
+
+	root := t.TempDir()
+	store := newStore(t, root, int64(len(levelNine)))
+	ref := writeStoredCompressedArchive(t, root, plain.Bytes(), levelNine, "run-123")
+	if _, err := store.Load(context.Background(), ref); !errors.Is(err, artifact.ErrTooLarge) {
+		t.Fatalf("Load() error = %v, want ErrTooLarge", err)
+	}
+}
+
 func readArchiveEntries(t *testing.T, data []byte) []archiveEntry {
 	t.Helper()
 	reader := tar.NewReader(bytes.NewReader(data))
@@ -303,27 +355,37 @@ func encodeManifest(t *testing.T, manifest artifact.Manifest) []byte {
 
 func writeStoredArchive(t *testing.T, root string, tarBytes []byte, runID string) artifact.Reference {
 	t.Helper()
+	return writeStoredCompressedArchive(t, root, tarBytes, gzipArchive(t, tarBytes, 6), runID)
+}
+
+func writeStoredCompressedArchive(t *testing.T, root string, tarBytes, compressed []byte, runID string) artifact.Reference {
+	t.Helper()
 	digest := artifact.DigestTar(tarBytes)
 	prefix := filepath.Join(root, "sha256", digest[:2])
 	if err := os.MkdirAll(prefix, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	path := filepath.Join(prefix, digest+".tar.gz")
+	if err := os.WriteFile(path, compressed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return artifact.Reference{RunID: runID, Digest: digest, Size: int64(len(tarBytes))}
+}
+
+func gzipArchive(t *testing.T, data []byte, level int) []byte {
+	t.Helper()
 	var compressed bytes.Buffer
-	writer, err := gzip.NewWriterLevel(&compressed, 6)
+	writer, err := gzip.NewWriterLevel(&compressed, level)
 	if err != nil {
 		t.Fatal(err)
 	}
 	writer.Header.ModTime = time.Unix(0, 0).UTC()
 	writer.Header.OS = 255
-	if _, err := writer.Write(tarBytes); err != nil {
+	if _, err := writer.Write(data); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(prefix, digest+".tar.gz")
-	if err := os.WriteFile(path, compressed.Bytes(), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return artifact.Reference{RunID: runID, Digest: digest, Size: int64(len(tarBytes))}
+	return compressed.Bytes()
 }

@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 // Package filesystem persists canonical bundles using descriptor-anchored Unix operations.
 package filesystem
 
@@ -95,45 +97,39 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 	if err := ctx.Err(); err != nil {
 		return artifact.Reference{}, err
 	}
-	prefix, created, err := s.prefix(ref.Digest[:2])
+	prefix, _, err := s.prefix(ref.Digest[:2])
 	if err != nil {
 		return artifact.Reference{}, err
 	}
 	defer prefix.Close()
-	if created {
-		if err := s.sha.Sync(); err != nil {
-			return artifact.Reference{}, err
-		}
-	}
 	unlock, err := lock(ctx, prefix)
 	if err != nil {
 		return artifact.Reference{}, err
 	}
 	defer unlock()
+	if err := checkDirReachable(s.sha, ref.Digest[:2], prefix); err != nil {
+		return artifact.Reference{}, err
+	}
 	if err := ctx.Err(); err != nil {
 		return artifact.Reference{}, err
 	}
 	final := ref.Digest + ".tar.gz"
-	published, err := linkTemp(s.tmp, name, temp, prefix, final)
+	published, err := publishTemp(s.tmp, name, temp, prefix, final)
 	if err != nil {
 		return artifact.Reference{}, err
 	}
 	if published {
+		cleanup = false
 		if err := prefix.Sync(); err != nil {
-			return artifact.Reference{}, err
-		}
-		if err := unix.Unlinkat(int(s.tmp.Fd()), name, 0); err != nil {
-			return artifact.Reference{}, err
+			return artifact.Reference{}, rollbackRenamedPublication(s.tmp, prefix, final, err)
 		}
 		if err := s.tmp.Sync(); err != nil {
-			return artifact.Reference{}, err
+			return artifact.Reference{}, rollbackPublication(prefix, final, err)
 		}
-		cleanup = false
 	}
 	if err := s.verifyFinal(ctx, prefix, final, tarBytes, ref); err != nil {
 		if published {
-			_ = unix.Unlinkat(int(prefix.Fd()), final, 0)
-			_ = prefix.Sync()
+			return artifact.Reference{}, rollbackPublication(prefix, final, err)
 		}
 		return artifact.Reference{}, err
 	}
@@ -145,6 +141,12 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 			return artifact.Reference{}, err
 		}
 		cleanup = false
+	}
+	if err := checkDirReachable(s.sha, ref.Digest[:2], prefix); err != nil {
+		if published {
+			return artifact.Reference{}, rollbackPublication(prefix, final, err)
+		}
+		return artifact.Reference{}, err
 	}
 	return ref, nil
 }
@@ -166,6 +168,9 @@ func (s *Store) Load(ctx context.Context, ref artifact.Reference) (artifact.Bund
 		return artifact.Bundle{}, err
 	}
 	defer unlock()
+	if err := checkDirReachable(s.sha, ref.Digest[:2], prefix); err != nil {
+		return artifact.Bundle{}, err
+	}
 	file, err := openFileAt(int(prefix.Fd()), ref.Digest+".tar.gz")
 	if err != nil {
 		return artifact.Bundle{}, err
@@ -182,8 +187,14 @@ func (s *Store) Load(ctx context.Context, ref artifact.Reference) (artifact.Bund
 	if err != nil {
 		return artifact.Bundle{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return artifact.Bundle{}, err
+	}
 	if bundle.Manifest.RunID != ref.RunID {
 		return artifact.Bundle{}, artifact.ErrDigestMismatch
+	}
+	if err := checkDirReachable(s.sha, ref.Digest[:2], prefix); err != nil {
+		return artifact.Bundle{}, err
 	}
 	return artifact.CloneBundle(bundle), nil
 }
@@ -206,7 +217,7 @@ func (s *Store) createTemp() (string, *os.File, error) {
 	return "", nil, fmt.Errorf("create unique artifact temp")
 }
 func (s *Store) prefix(name string) (*os.File, bool, error) {
-	return openDirAt(int(s.sha.Fd()), name, true)
+	return openPrefixAt(s.sha, name, s.sha.Sync)
 }
 func validRef(ref artifact.Reference) error {
 	if ref.RunID == "" || ref.Size < 0 || !artifact.ValidDigest(ref.Digest) {
@@ -261,6 +272,17 @@ func openDirAt(parent int, name string, create bool) (*os.File, bool, error) {
 	}
 	return file, created, nil
 }
+func openPrefixAt(sha *os.File, name string, syncParent func() error) (*os.File, bool, error) {
+	prefix, created, err := openDirAt(int(sha.Fd()), name, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syncParent(); err != nil {
+		prefix.Close()
+		return nil, false, err
+	}
+	return prefix, created, nil
+}
 func openFileAt(parent int, name string) (*os.File, error) {
 	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -283,6 +305,19 @@ func checkDir(file *os.File) error {
 	}
 	return nil
 }
+func checkDirReachable(parent *os.File, name string, held *os.File) error {
+	var expected, actual unix.Stat_t
+	if err := unix.Fstat(int(held.Fd()), &expected); err != nil {
+		return errors.Join(artifact.ErrDigestMismatch, err)
+	}
+	if err := unix.Fstatat(int(parent.Fd()), name, &actual, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return errors.Join(artifact.ErrDigestMismatch, err)
+	}
+	if actual.Mode&unix.S_IFMT != unix.S_IFDIR || actual.Mode&0o077 != 0 || int(actual.Uid) != os.Geteuid() || expected.Dev != actual.Dev || expected.Ino != actual.Ino {
+		return artifact.ErrDigestMismatch
+	}
+	return nil
+}
 func checkFile(file *os.File) error {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &st); err != nil {
@@ -294,39 +329,28 @@ func checkFile(file *os.File) error {
 	return nil
 }
 func lock(ctx context.Context, prefix *os.File) (func(), error) {
-	fd, err := unix.Openat(int(prefix.Fd()), ".lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	file := os.NewFile(uintptr(fd), ".lock")
-	if err := checkFile(file); err != nil {
-		file.Close()
-		return nil, err
-	}
+	fd := int(prefix.Fd())
 	for {
 		if err := ctx.Err(); err != nil {
-			file.Close()
 			return nil, err
 		}
-		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
-			return func() { _ = unix.Flock(fd, unix.LOCK_UN); _ = file.Close() }, nil
+			return func() { _ = unix.Flock(fd, unix.LOCK_UN) }, nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
-			file.Close()
 			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			file.Close()
 			return nil, ctx.Err()
 		case <-time.After(time.Millisecond):
 		}
 	}
 }
 
-func linkTemp(tmp *os.File, name string, temp *os.File, prefix *os.File, final string) (bool, error) {
-	if err := unix.Linkat(int(tmp.Fd()), name, int(prefix.Fd()), final, 0); err != nil {
+func publishTemp(tmp *os.File, name string, temp *os.File, prefix *os.File, final string) (bool, error) {
+	if err := renameNoReplace(int(tmp.Fd()), name, int(prefix.Fd()), final); err != nil {
 		if errors.Is(err, unix.EEXIST) {
 			return false, nil
 		}
@@ -335,30 +359,40 @@ func linkTemp(tmp *os.File, name string, temp *os.File, prefix *os.File, final s
 
 	var expected unix.Stat_t
 	if err := unix.Fstat(int(temp.Fd()), &expected); err != nil {
-		return false, rollbackPublication(prefix, final, err)
+		return false, rollbackRenamedPublication(tmp, prefix, final, err)
 	}
 	fd, err := unix.Openat(int(prefix.Fd()), final, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return false, rollbackPublication(prefix, final, err)
+		return false, rollbackRenamedPublication(tmp, prefix, final, err)
 	}
 	var actual unix.Stat_t
 	statErr := unix.Fstat(fd, &actual)
 	closeErr := unix.Close(fd)
 	if statErr != nil {
-		return false, rollbackPublication(prefix, final, statErr)
+		return false, rollbackRenamedPublication(tmp, prefix, final, statErr)
 	}
 	if closeErr != nil {
-		return false, rollbackPublication(prefix, final, closeErr)
+		return false, rollbackRenamedPublication(tmp, prefix, final, closeErr)
 	}
 	if expected.Dev != actual.Dev || expected.Ino != actual.Ino {
-		return false, rollbackPublication(prefix, final, artifact.ErrDigestMismatch)
+		return false, rollbackRenamedPublication(tmp, prefix, final, artifact.ErrDigestMismatch)
 	}
 	return true, nil
 }
 
+func rollbackRenamedPublication(tmp, prefix *os.File, final string, cause error) error {
+	return errors.Join(rollbackPublication(prefix, final, cause), tmp.Sync())
+}
+
 func rollbackPublication(prefix *os.File, final string, cause error) error {
-	unlinkErr := unix.Unlinkat(int(prefix.Fd()), final, 0)
-	syncErr := prefix.Sync()
+	return rollbackPublicationWith(prefix, final, cause, unix.Unlinkat, func(file *os.File) error {
+		return file.Sync()
+	})
+}
+
+func rollbackPublicationWith(prefix *os.File, final string, cause error, unlink func(int, string, int) error, syncDir func(*os.File) error) error {
+	unlinkErr := unlink(int(prefix.Fd()), final, 0)
+	syncErr := syncDir(prefix)
 	return errors.Join(cause, unlinkErr, syncErr)
 }
 
@@ -400,8 +434,8 @@ func writeGzip(ctx context.Context, file io.Writer, data []byte, max int64) erro
 	}
 	return writer.Close()
 }
-func readAndDecompress(ctx context.Context, file *os.File, maxC, maxU int64) ([]byte, error) {
-	compressed, err := readBounded(ctx, file, maxC)
+func readAndDecompress(ctx context.Context, input io.Reader, maxC, maxU int64) ([]byte, error) {
+	compressed, err := readBounded(ctx, input, maxC)
 	if err != nil {
 		return nil, err
 	}
@@ -417,11 +451,23 @@ func readAndDecompress(ctx context.Context, file *os.File, maxC, maxU int64) ([]
 	r.Multistream(false)
 	plain, err := readBounded(ctx, r, maxU)
 	closeErr := r.Close()
-	if err != nil || closeErr != nil || source.Len() != 0 {
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil || source.Len() != 0 {
 		return nil, artifact.ErrDigestMismatch
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	re, err := gzipBytes(ctx, plain, maxC)
-	if err != nil || !bytes.Equal(re, compressed) {
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, artifact.ErrTooLarge) {
+			return nil, err
+		}
+		return nil, artifact.ErrDigestMismatch
+	}
+	if !bytes.Equal(re, compressed) {
 		return nil, artifact.ErrDigestMismatch
 	}
 	return plain, nil
@@ -439,6 +485,9 @@ func readBounded(ctx context.Context, r io.Reader, limit int64) ([]byte, error) 
 			return nil, err
 		}
 		n, err := r.Read(buf)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		if n > 0 {
 			if int64(n) > limit-int64(b.Len()) {
 				return nil, artifact.ErrTooLarge
