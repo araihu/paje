@@ -19,8 +19,8 @@ Pajé uses ports and adapters:
   Mem0 Platform v3 adapter.
 - `internal/workspace`: workspace contract, mock, and isolated Git worktree
   manager.
-- `internal/runner`: black-box execution contract, mock, and local
-  `os/exec` runner.
+- `internal/runner`: black-box execution contract, mock, local `os/exec`
+  runner, and deterministic Codex CLI adapter.
 - `internal/approval`: human approval contract and mock. Approval is not yet
   part of the first pipeline.
 - `internal/workflow`: service-free orchestration plus the Hatchet task binding.
@@ -74,7 +74,7 @@ export HATCHET_CLIENT_TLS_STRATEGY="none"
 | `HATCHET_CLIENT_TOKEN` | required | Hatchet worker authentication |
 | `PAJE_MEMORY_ADAPTER` | `mock` | `mock` or `mem0` |
 | `PAJE_WORKSPACE_ADAPTER` | `mock` | `mock` or `git` |
-| `PAJE_RUNNER_ADAPTER` | `mock` | `mock` or `local` |
+| `PAJE_RUNNER_ADAPTER` | `mock` | `mock`, `local`, or `codex` |
 | `PAJE_WORKSPACE_ROOT` | OS temp directory | Mirror and worktree storage |
 | `PAJE_RUNNER_COMMAND` | `codex` | Local agent executable |
 | `PAJE_RUNNER_ARGS` | `["exec"]` | JSON array inserted before the task prompt |
@@ -82,7 +82,10 @@ export HATCHET_CLIENT_TLS_STRATEGY="none"
 | `MEM0_BASE_URL` | `https://api.mem0.ai` | Optional Mem0 API origin |
 
 The local runner executes the configured binary directly; it does not invoke a
-shell. The task description is appended as the final argument.
+shell. The task description is appended as the final argument. The Codex
+runner invokes `codex exec --json --ephemeral --ignore-user-config --sandbox
+workspace-write`, preserves its JSONL transcript, and exposes the final
+completed agent message as the workflow output.
 
 Mem0 operations require at least one entity tag in each workflow input:
 `user_id`, `agent_id`, `app_id`, or `run_id`. Other tags are persisted and
@@ -95,10 +98,9 @@ This example enables Mem0, Git worktrees, and Codex:
 ```bash
 export PAJE_MEMORY_ADAPTER="mem0"
 export PAJE_WORKSPACE_ADAPTER="git"
-export PAJE_RUNNER_ADAPTER="local"
+export PAJE_RUNNER_ADAPTER="codex"
 export MEM0_API_KEY="<mem0-api-key>"
 export PAJE_RUNNER_COMMAND="codex"
-export PAJE_RUNNER_ARGS='["exec"]'
 go run ./cmd/paje
 ```
 
@@ -146,7 +148,7 @@ helm upgrade --install paje charts/paje \
 ```
 
 Use a derived worker image containing the selected agent executable when
-`adapters.runner=local`.
+`adapters.runner=local` or `adapters.runner=codex`.
 
 ## Current scope
 

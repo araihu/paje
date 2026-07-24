@@ -7,6 +7,7 @@ import (
 	"github.com/araihu/paje/internal/config"
 	"github.com/araihu/paje/internal/memory/mem0"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
+	"github.com/araihu/paje/internal/runner/codex"
 	"github.com/araihu/paje/internal/runner/local"
 	runnermock "github.com/araihu/paje/internal/runner/mock"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
@@ -67,6 +68,24 @@ func TestBuildDependenciesUsesConfiguredRealAdapters(t *testing.T) {
 	}
 }
 
+func TestBuildDependenciesUsesCodexRunner(t *testing.T) {
+	t.Parallel()
+
+	dependencies, err := buildDependencies(config.Config{
+		MemoryAdapter:    "mock",
+		WorkspaceAdapter: "mock",
+		RunnerAdapter:    "codex",
+		WorkspaceRoot:    t.TempDir(),
+		RunnerCommand:    os.Args[0],
+	})
+	if err != nil {
+		t.Fatalf("buildDependencies() error = %v", err)
+	}
+	if _, ok := dependencies.runner.(*codex.Runner); !ok {
+		t.Errorf("runner dependency = %T, want *runner/codex.Runner", dependencies.runner)
+	}
+}
+
 func TestBuildDependenciesRejectsUnknownSelection(t *testing.T) {
 	t.Parallel()
 
@@ -74,6 +93,19 @@ func TestBuildDependenciesRejectsUnknownSelection(t *testing.T) {
 		MemoryAdapter:    "unknown",
 		WorkspaceAdapter: "mock",
 		RunnerAdapter:    "mock",
+		WorkspaceRoot:    t.TempDir(),
+	}); err == nil {
+		t.Fatal("buildDependencies() error = nil, want unknown adapter error")
+	}
+}
+
+func TestBuildDependenciesRejectsUnknownRunnerSelection(t *testing.T) {
+	t.Parallel()
+
+	if _, err := buildDependencies(config.Config{
+		MemoryAdapter:    "mock",
+		WorkspaceAdapter: "mock",
+		RunnerAdapter:    "unknown",
 		WorkspaceRoot:    t.TempDir(),
 	}); err == nil {
 		t.Fatal("buildDependencies() error = nil, want unknown adapter error")

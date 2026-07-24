@@ -67,7 +67,7 @@ func Load(getenv func(string) string) (Config, error) {
 	if err := validateAdapter("workspace", config.WorkspaceAdapter, "mock", "git"); err != nil {
 		return Config{}, err
 	}
-	if err := validateAdapter("runner", config.RunnerAdapter, "mock", "local"); err != nil {
+	if err := validateAdapter("runner", config.RunnerAdapter, "mock", "local", "codex"); err != nil {
 		return Config{}, err
 	}
 

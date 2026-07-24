@@ -70,6 +70,21 @@ func TestLoadParsesExplicitRealAdapters(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsCodexRunnerAdapter(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.Load(environment(map[string]string{
+		"HATCHET_CLIENT_TOKEN": "hatchet-token",
+		"PAJE_RUNNER_ADAPTER":  "CODEX",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.RunnerAdapter != "codex" {
+		t.Errorf("RunnerAdapter = %q, want codex", cfg.RunnerAdapter)
+	}
+}
+
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	t.Parallel()
 

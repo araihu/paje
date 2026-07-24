@@ -18,6 +18,7 @@ import (
 	"github.com/araihu/paje/internal/memory/mem0"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
 	"github.com/araihu/paje/internal/runner"
+	codexrunner "github.com/araihu/paje/internal/runner/codex"
 	"github.com/araihu/paje/internal/runner/local"
 	runnermock "github.com/araihu/paje/internal/runner/mock"
 	"github.com/araihu/paje/internal/workflow"
@@ -139,6 +140,12 @@ func buildDependencies(cfg config.Config) (runtimeDependencies, error) {
 		dependencies.runner = runnermock.NewRunner(runner.ExecutionResult{}, nil)
 	case "local":
 		executor, err := local.New(cfg.RunnerCommand, cfg.RunnerArgs...)
+		if err != nil {
+			return runtimeDependencies{}, fmt.Errorf("build runner adapter: %w", err)
+		}
+		dependencies.runner = executor
+	case "codex":
+		executor, err := codexrunner.New(cfg.RunnerCommand)
 		if err != nil {
 			return runtimeDependencies{}, fmt.Errorf("build runner adapter: %w", err)
 		}
