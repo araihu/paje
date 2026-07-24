@@ -58,6 +58,12 @@ func (Definition) Validate(raw json.RawMessage) error {
 
 // Decode strictly decodes and validates code-change@v1 input.
 func Decode(raw json.RawMessage) (Input, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return Input{}, fmt.Errorf("decode code-change@v1 input: %w", err)
+	}
+	_, memoryLimitSet := fields["memory_limit"]
+
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var input Input
@@ -67,7 +73,7 @@ func Decode(raw json.RawMessage) (Input, error) {
 	if err := requireJSONEOF(decoder); err != nil {
 		return Input{}, err
 	}
-	return normalizeAndValidate(input)
+	return normalizeAndValidate(input, memoryLimitSet)
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {
@@ -81,7 +87,7 @@ func requireJSONEOF(decoder *json.Decoder) error {
 	return nil
 }
 
-func normalizeAndValidate(input Input) (Input, error) {
+func normalizeAndValidate(input Input, memoryLimitSet bool) (Input, error) {
 	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
 	input.TaskDescription = strings.TrimSpace(input.TaskDescription)
 	input.RepositoryURI = strings.TrimSpace(input.RepositoryURI)
@@ -99,7 +105,7 @@ func normalizeAndValidate(input Input) (Input, error) {
 	if input.MemoryLimit < 0 || input.MemoryLimit > 1000 {
 		return Input{}, fmt.Errorf("decode code-change@v1 input: memory limit must be between 0 and 1000")
 	}
-	if input.MemoryLimit == 0 {
+	if !memoryLimitSet {
 		input.MemoryLimit = defaultMemoryLimit
 	}
 	if err := normalizeTags(input.Tags); err != nil {

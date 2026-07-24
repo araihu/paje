@@ -77,8 +77,12 @@ func Compile(spec CommandSpec, workspace string, limits Limits) (Command, error)
 	if containsNUL(spec.Name) || strings.TrimSpace(spec.Name) == "" {
 		return Command{}, fmt.Errorf("compile verification command: name is required")
 	}
+	spec.Directory = strings.TrimSpace(spec.Directory)
 	if containsNUL(spec.Directory) || filepath.IsAbs(spec.Directory) {
 		return Command{}, fmt.Errorf("compile verification command %q: directory must be a relative path", spec.Name)
+	}
+	if containsParentDirectory(spec.Directory) {
+		return Command{}, fmt.Errorf("compile verification command %q: directory must not contain ..", spec.Name)
 	}
 	directory := spec.Directory
 	if directory == "" {
@@ -134,6 +138,16 @@ func validateLimits(limits Limits) error {
 }
 
 func containsNUL(value string) bool { return strings.IndexByte(value, 0) >= 0 }
+
+func containsParentDirectory(path string) bool {
+	path = filepath.FromSlash(path)
+	for _, component := range strings.Split(path, string(filepath.Separator)) {
+		if component == ".." {
+			return true
+		}
+	}
+	return false
+}
 
 func isShell(executable string) bool {
 	switch strings.ToLower(filepath.Base(executable)) {

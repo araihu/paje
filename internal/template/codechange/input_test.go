@@ -48,6 +48,23 @@ func TestDecodeDefaultsAndRejectsExtraJSON(t *testing.T) {
 	}
 }
 
+func TestDecodePreservesExplicitZeroMemoryLimit(t *testing.T) {
+	input, err := codechange.Decode(json.RawMessage(`{
+  "task_description": "update the parser",
+  "repository_uri": "https://github.com/araihu/paje.git",
+  "base_ref": "main",
+  "tags": {"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+  "profile": "go",
+  "memory_limit": 0
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input.MemoryLimit != 0 {
+		t.Fatalf("Decode() MemoryLimit = %d, want 0", input.MemoryLimit)
+	}
+}
+
 func TestDecodeRejectsInvalidInput(t *testing.T) {
 	valid := map[string]any{
 		"task_description": "update the parser",
@@ -81,6 +98,12 @@ func TestDecodeRejectsInvalidInput(t *testing.T) {
 		}},
 		{name: "large timeout", mutate: func(v map[string]any) {
 			v["checks"] = []any{map[string]any{"name": "go", "executable": "go", "timeout": "31m"}}
+		}},
+		{name: "padded absolute directory", mutate: func(v map[string]any) {
+			v["checks"] = []any{map[string]any{"name": "go", "directory": " /tmp", "executable": "go", "timeout": "1m"}}
+		}},
+		{name: "padded escaping directory", mutate: func(v map[string]any) {
+			v["checks"] = []any{map[string]any{"name": "go", "directory": " ../outside ", "executable": "go", "timeout": "1m"}}
 		}},
 		{name: "generic without check", mutate: func(v map[string]any) { v["profile"] = "generic"; delete(v, "checks") }},
 		{name: "duplicate exclusion", mutate: func(v map[string]any) {
