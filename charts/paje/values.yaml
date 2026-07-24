@@ -1,0 +1,72 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/araihu/paje
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+
+adapters:
+  memory: mock
+  workspace: mock
+  runner: mock
+
+workspace:
+  root: /workspace
+  sizeLimit: 10Gi
+
+runner:
+  command: codex
+  args:
+    - exec
+
+mem0:
+  baseURL: ""
+
+hatchet:
+  hostPort: ""
+  serverURL: ""
+  namespace: ""
+  tlsStrategy: ""
+  logLevel: info
+
+secrets:
+  existingSecret: ""
+  hatchetClientToken: ""
+  mem0ApiKey: ""
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+terminationGracePeriodSeconds: 60
+
+extraEnv: []

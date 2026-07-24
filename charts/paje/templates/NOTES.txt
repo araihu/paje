@@ -1,0 +1,11 @@
+Pajé worker {{ include "paje.fullname" . }} has been installed.
+
+The worker connects outbound to Hatchet and does not expose a Kubernetes Service.
+Inspect it with:
+
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "paje.fullname" . }} --follow
+
+Configured adapters:
+  memory:    {{ .Values.adapters.memory }}
+  workspace: {{ .Values.adapters.workspace }}
+  runner:    {{ .Values.adapters.runner }}

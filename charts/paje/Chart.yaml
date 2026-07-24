@@ -1,0 +1,10 @@
+apiVersion: v2
+name: paje
+description: Go-native Hatchet worker for orchestrating parallel AI agents
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/araihu/paje
+sources:
+  - https://github.com/araihu/paje
