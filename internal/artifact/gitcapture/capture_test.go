@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +29,10 @@ func TestCaptureAndApplyReproduceEveryGitChangeWithoutMutatingSourceIndex(t *tes
 	writeFile(t, filepath.Join(repo, "rename.txt"), []byte("rename me\n"), 0o644)
 	writeFile(t, filepath.Join(repo, "script.sh"), []byte("#!/bin/sh\necho before\n"), 0o644)
 	writeFile(t, filepath.Join(repo, "binary.bin"), []byte{0, 1, 2, 3}, 0o644)
+	writeFile(t, filepath.Join(repo, "unchanged-source.txt"), []byte("copy-only-content\n"), 0o644)
+	oddOld := "odd\tcafé\nold.txt"
+	oddNew := "odd\tcafé\nnew.txt"
+	writeFile(t, filepath.Join(repo, oddOld), []byte("odd path\n"), 0o644)
 	git(t, repo, "add", "-A")
 	git(t, repo, "commit", "-m", "base")
 	base := git(t, repo, "rev-parse", "HEAD")
@@ -48,6 +53,10 @@ func TestCaptureAndApplyReproduceEveryGitChangeWithoutMutatingSourceIndex(t *tes
 	if err := os.Rename(filepath.Join(source, "rename.txt"), filepath.Join(source, "renamed.txt")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Rename(filepath.Join(source, oddOld), filepath.Join(source, oddNew)); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(source, "copied-unchanged.txt"), []byte("copy-only-content\n"), 0o644)
 	writeFile(t, filepath.Join(source, "new.txt"), []byte("untracked\n"), 0o644)
 	if err := os.Chmod(filepath.Join(source, "script.sh"), 0o755); err != nil {
 		t.Fatal(err)
@@ -73,6 +82,23 @@ func TestCaptureAndApplyReproduceEveryGitChangeWithoutMutatingSourceIndex(t *tes
 	}
 	if len(result.Patch) == 0 || result.TreeSHA == "" {
 		t.Fatalf("Capture() returned incomplete result: %#v", result)
+	}
+	wantChanges := []artifact.Change{
+		{Path: "binary.bin", Status: "M", OldMode: "100644", NewMode: "100644"},
+		{Path: "copied-unchanged.txt", OldPath: "unchanged-source.txt", Status: "C", OldMode: "100644", NewMode: "100644"},
+		{Path: "delete.txt", Status: "D", OldMode: "100644", NewMode: "000000"},
+		{Path: "new.txt", Status: "A", OldMode: "000000", NewMode: "100644"},
+		{Path: oddNew, OldPath: oddOld, Status: "R", OldMode: "100644", NewMode: "100644"},
+		{Path: "relative-link", Status: "A", OldMode: "000000", NewMode: "120000"},
+		{Path: "renamed.txt", OldPath: "rename.txt", Status: "R", OldMode: "100644", NewMode: "100644"},
+		{Path: "script.sh", Status: "M", OldMode: "100644", NewMode: "100755"},
+		{Path: "text.txt", Status: "M", OldMode: "100644", NewMode: "100644"},
+	}
+	if !reflect.DeepEqual(result.Changes, wantChanges) {
+		t.Fatalf("Capture() changes = %#v, want %#v", result.Changes, wantChanges)
+	}
+	if !bytes.Contains(result.Patch, []byte("copy from unchanged-source.txt\ncopy to copied-unchanged.txt\n")) {
+		t.Fatalf("Capture() patch does not retain unchanged-source copy metadata:\n%s", result.Patch)
 	}
 	if got := readIndex(t, source); !bytes.Equal(got, sourceIndex) {
 		t.Fatal("Capture() mutated the source worktree index")
@@ -210,6 +236,179 @@ func TestApplyTreeMismatchLeavesWorktreeAndIndexUnchanged(t *testing.T) {
 	}
 }
 
+func TestApplyCancellationAfterRealApplyRestoresPristineTarget(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	git(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+	beforeStages := gitBytes(t, target, nil, "ls-files", "--stage", "-z")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := t.TempDir()
+	applied := filepath.Join(control, "applied")
+	release := filepath.Join(control, "release")
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = apply ] && [ \"$2\" = --index ]; then\n" +
+		"  " + shellQuote(realGit) + " \"$@\"\n" +
+		"  status=$?\n" +
+		"  : > " + shellQuote(applied) + "\n" +
+		"  while [ ! -f " + shellQuote(release) + " ]; do /bin/sleep 0.01; done\n" +
+		"  exit $status\n" +
+		"fi\n" +
+		"exec " + shellQuote(realGit) + " \"$@\"\n"
+	writeFile(t, fake, []byte(script), 0o755)
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err = gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	applyResult := make(chan error, 1)
+	go func() {
+		applyResult <- capturer.Apply(ctx, gitcapture.ApplyRequest{
+			Workspace:       target,
+			BaseSHA:         base,
+			Patch:           result.Patch,
+			ExpectedTreeSHA: result.TreeSHA,
+		})
+	}()
+	waitForFile(t, applied, applyResult)
+	contents, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "changed\n" {
+		t.Fatalf("barrier fired before real apply mutation: text.txt = %q", contents)
+	}
+	cancel()
+	writeFile(t, release, nil, 0o600)
+	err = <-applyResult
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Apply() error = %v, want context.Canceled joined after rollback", err)
+	}
+	contents, err = os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "base\n" {
+		t.Fatalf("canceled Apply left target mutation: text.txt = %q", contents)
+	}
+	if status := git(t, target, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+		t.Fatalf("canceled Apply left dirty target: %q", status)
+	}
+	if stages := gitBytes(t, target, nil, "ls-files", "--stage", "-z"); !bytes.Equal(stages, beforeStages) {
+		t.Fatalf("canceled Apply left different index\nbefore: %q\nafter:  %q", beforeStages, stages)
+	}
+	index := git(t, target, "rev-parse", "--git-path", "index")
+	if !filepath.IsAbs(index) {
+		index = filepath.Join(target, index)
+	}
+	if _, err := os.Stat(index + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled Apply left index lock: %v", err)
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(resolvedTarget), ".paje-git-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("canceled Apply left private temp trees: %v, %v", matches, err)
+	}
+}
+
+func TestApplyRestoresTargetAfterApplyOrPostVerifyFailure(t *testing.T) {
+	for _, failurePoint := range []string{"apply", "post-verify"} {
+		t.Run(failurePoint, func(t *testing.T) {
+			repo := initializedRepository(t)
+			base := git(t, repo, "rev-parse", "HEAD")
+			writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+			capturer, err := gitcapture.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(t.TempDir(), "target")
+			git(t, repo, "worktree", "add", "--detach", target, base)
+			t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+			beforeStages := gitBytes(t, target, nil, "ls-files", "--stage", "-z")
+
+			realGit, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			control := t.TempDir()
+			mutated := filepath.Join(control, "mutated")
+			failed := filepath.Join(control, "failed")
+			fake := filepath.Join(t.TempDir(), "git")
+			script := "#!/bin/sh\n" +
+				"if [ \"$1\" = apply ] && [ \"$2\" = --index ]; then\n" +
+				"  " + shellQuote(realGit) + " \"$@\"\n" +
+				"  status=$?\n" +
+				"  : > " + shellQuote(mutated) + "\n"
+			if failurePoint == "apply" {
+				script += "  exit 85\n"
+			} else {
+				script += "  exit $status\n"
+			}
+			if failurePoint == "post-verify" {
+				script += "fi\n" +
+					"if [ \"$1\" = write-tree ] && [ -f " + shellQuote(mutated) + " ] && [ ! -f " + shellQuote(failed) + " ]; then\n" +
+					"  : > " + shellQuote(failed) + "\n" +
+					"  exit 86\n"
+			}
+			script += "fi\nexec " + shellQuote(realGit) + " \"$@\"\n"
+			writeFile(t, fake, []byte(script), 0o755)
+			t.Setenv("PATH", filepath.Dir(fake))
+			capturer, err = gitcapture.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{
+				Workspace:       target,
+				BaseSHA:         base,
+				Patch:           result.Patch,
+				ExpectedTreeSHA: result.TreeSHA,
+			})
+			if err == nil {
+				t.Fatal("Apply() error = nil, want injected failure")
+			}
+			if _, err := os.Stat(mutated); err != nil {
+				t.Fatalf("failure occurred before real apply mutation: %v", err)
+			}
+			contents, err := os.ReadFile(filepath.Join(target, "text.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contents) != "base\n" {
+				t.Fatalf("failed Apply left target mutation: text.txt = %q", contents)
+			}
+			if status := git(t, target, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+				t.Fatalf("failed Apply left dirty target: %q", status)
+			}
+			if stages := gitBytes(t, target, nil, "ls-files", "--stage", "-z"); !bytes.Equal(stages, beforeStages) {
+				t.Fatalf("failed Apply left different index\nbefore: %q\nafter:  %q", beforeStages, stages)
+			}
+		})
+	}
+}
+
 func TestCaptureRejectsGitAndIndexSymlinks(t *testing.T) {
 	for _, kind := range []string{"git", "index"} {
 		t.Run(kind, func(t *testing.T) {
@@ -299,6 +498,33 @@ func TestApplyRejectsExactFortyOneCharacterSHAWithoutMutation(t *testing.T) {
 	}
 	if !bytes.Equal(beforeIndex, readIndex(t, repo)) || !bytes.Equal(beforeText, afterText) {
 		t.Fatal("invalid 41-character SHA mutated worktree or index")
+	}
+}
+
+func TestApplyValidatesEveryPatchPathBeforeInvokingGit(t *testing.T) {
+	workspace := fakeWorkspace(t)
+	invoked := filepath.Join(t.TempDir(), "git-invoked")
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n: > " + shellQuote(invoked) + "\nexit 97\n"
+	writeFile(t, fake, []byte(script), 0o755)
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	patch := []byte("diff --git a/safe b/new\nrename from ../escape\nrename to new\n")
+	err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{
+		Workspace:       workspace,
+		BaseSHA:         base,
+		Patch:           patch,
+		ExpectedTreeSHA: base,
+	})
+	if !errors.Is(err, gitcapture.ErrInvalidRequest) {
+		t.Fatalf("Apply() error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Git was invoked before patch validation: %v", err)
 	}
 }
 
@@ -405,6 +631,71 @@ func TestCaptureUsesTempOutsideWorkspaceAndCleansIt(t *testing.T) {
 	}
 }
 
+func TestCaptureTempTreeIsAnObservablePrivateSiblingAndIsRemoved(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := t.TempDir()
+	observed := filepath.Join(control, "index-path")
+	release := filepath.Join(control, "release")
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n" +
+		"case \"$GIT_INDEX_FILE\" in\n" +
+		"*/.paje-git-*/index)\n" +
+		"  if [ ! -f " + shellQuote(release) + " ]; then\n" +
+		"    printf '%s' \"$GIT_INDEX_FILE\" > " + shellQuote(observed) + "\n" +
+		"    while [ ! -f " + shellQuote(release) + " ]; do /bin/sleep 0.01; done\n" +
+		"  fi\n" +
+		"  ;;\n" +
+		"esac\n" +
+		"exec " + shellQuote(realGit) + " \"$@\"\n"
+	writeFile(t, fake, []byte(script), 0o755)
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+		result <- err
+	}()
+	indexPath := waitForFileContents(t, observed, result)
+	tempTree := filepath.Dir(indexPath)
+	resolvedRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(tempTree) != filepath.Dir(resolvedRepo) || tempTree == resolvedRepo {
+		t.Fatalf("temporary tree = %q, want sibling of %q", tempTree, repo)
+	}
+	info, err := os.Stat(tempTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("temporary tree mode = %o, want 0700", info.Mode().Perm())
+	}
+	indexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indexInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("temporary index mode = %o, want 0600", indexInfo.Mode().Perm())
+	}
+	writeFile(t, release, nil, 0o600)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tempTree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary sibling remains after Capture: %v", err)
+	}
+}
+
 func fakeWorkspace(t *testing.T) string {
 	t.Helper()
 	workspace := t.TempDir()
@@ -413,6 +704,46 @@ func fakeWorkspace(t *testing.T) string {
 	}
 	writeFile(t, filepath.Join(workspace, ".git", "index"), nil, 0o600)
 	return workspace
+}
+
+func waitForFileContents(t *testing.T, path string, result <-chan error) string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		contents, err := os.ReadFile(path)
+		if err == nil && len(contents) != 0 {
+			return string(contents)
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("operation returned before observation: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+	return ""
+}
+
+func waitForFile(t *testing.T, path string, result <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("operation returned before barrier: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func initializedRepository(t *testing.T) string {
