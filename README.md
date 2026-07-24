@@ -141,7 +141,7 @@ helm upgrade --install paje charts/paje \
   --set secrets.existingSecret=paje-worker \
   --set adapters.memory=mem0 \
   --set adapters.workspace=git \
-  --set adapters.runner=local \
+  --set adapters.runner=codex \
   --set hatchet.hostPort=hatchet-engine.hatchet.svc.cluster.local:7070 \
   --set hatchet.serverURL=http://hatchet-api.hatchet.svc.cluster.local:8080 \
   --set hatchet.tlsStrategy=none

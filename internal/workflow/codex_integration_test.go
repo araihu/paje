@@ -74,11 +74,22 @@ func TestCodexOrchestrationIntegration(t *testing.T) {
 	}
 }
 
+func TestCodexIntegrationEnvironmentExcludesServiceCredentials(t *testing.T) {
+	t.Setenv("PATH", "test-path")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_API_KEY", "must-not-reach-codex")
+
+	environment := codexIntegrationEnvironment(t)
+	if _, found := environment["CODEX_API_KEY"]; found {
+		t.Fatal("Codex integration environment contains CODEX_API_KEY")
+	}
+}
+
 func codexIntegrationEnvironment(t *testing.T) map[string]string {
 	t.Helper()
 
 	environment := make(map[string]string)
-	for _, key := range []string{"PATH", "HOME", "CODEX_HOME", "CODEX_API_KEY"} {
+	for _, key := range []string{"PATH", "HOME", "CODEX_HOME"} {
 		if value := os.Getenv(key); value != "" {
 			environment[key] = value
 		}
