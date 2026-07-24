@@ -157,6 +157,7 @@ type Record struct {
     RepositoryURI   string
     BaseRef         string
     BaseSHA         string
+    MemorySnapshot  []memory.Memory
     Artifact        *artifact.Reference
     Approval        *approval.Result
     Publication     *publisher.Result
@@ -169,6 +170,11 @@ type Record struct {
 `run.Store` persists records with compare-and-swap versioning so retries cannot
 move a run backward. The beta adapter stores JSON atomically on a persistent
 filesystem; the mock adapter supports deterministic tests.
+
+The resolved memory snapshot is persisted in the access-controlled run record
+so Execute retries use identical context and Hatchet passes only the run ID
+between phases. Artifact manifests record the memory count and IDs, but omit
+memory content.
 
 ### Artifact Store
 
@@ -443,21 +449,22 @@ ephemeral worktree.
 2. Allocate or resume the idempotent run ID.
 3. Resolve `BaseRef` to an immutable SHA.
 4. Apply the environment policy and check required capabilities.
-5. Run profile preflight and dependency discovery.
+5. Validate the requested repository profile and worker capabilities.
 6. Retrieve scoped memory.
 7. Persist the resolved run record.
 
 ### Execute Phase
 
 1. Prepare a fresh worktree at `BaseSHA`.
-2. Build the agent task from the user task, memory, preflight facts, and explicit
+2. Run repository profile preflight and dependency discovery.
+3. Build the agent task from the user task, memory, preflight facts, and explicit
    constraints.
-3. Execute Codex in the filtered environment.
-4. Run required and optional verification commands.
-5. Classify failures and warnings.
-6. Capture, digest, and persist the artifact bundle.
-7. Persist the stage result.
-8. Clean the worktree with a non-canceled bounded context.
+4. Execute Codex in the filtered environment.
+5. Run required and optional verification commands.
+6. Classify failures and warnings.
+7. Capture, digest, and persist the artifact bundle.
+8. Persist the stage result.
+9. Clean the worktree with a non-canceled bounded context.
 
 All workspace-bound operations stay in this phase. A retry starts from a new
 worktree and either produces the same digest or records a new attempt; it never
