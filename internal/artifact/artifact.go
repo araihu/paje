@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -103,13 +104,27 @@ func ReferenceForTar(canonicalTar []byte) (Reference, error) {
 	if err != nil {
 		return Reference{}, err
 	}
+	return Reference{RunID: bundle.Manifest.RunID, Digest: DigestTar(canonicalTar), Size: int64(len(canonicalTar))}, nil
+}
+
+// DigestTar returns the SHA-256 identity of an uncompressed canonical tar stream.
+func DigestTar(canonicalTar []byte) string {
 	sum := sha256.Sum256(canonicalTar)
-	return Reference{RunID: bundle.Manifest.RunID, Digest: hex.EncodeToString(sum[:]), Size: int64(len(canonicalTar))}, nil
+	return hex.EncodeToString(sum[:])
 }
 
 // Canonicalize returns the normalized bundle, its canonical tar stream, and
 // its logical reference. It is shared by all artifact stores.
 func Canonicalize(bundle Bundle) (Bundle, []byte, Reference, error) {
+	return CanonicalizeLimited(context.Background(), bundle, 0)
+}
+
+// CanonicalizeLimited canonicalizes bundle while respecting ctx and maxTarBytes.
+// A non-positive limit leaves the canonical stream unbounded.
+func CanonicalizeLimited(ctx context.Context, bundle Bundle, maxTarBytes int64) (Bundle, []byte, Reference, error) {
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, nil, Reference{}, err
+	}
 	normalized, err := normalizeBundle(bundle)
 	if err != nil {
 		return Bundle{}, nil, Reference{}, err
@@ -124,12 +139,14 @@ func Canonicalize(bundle Bundle) (Bundle, []byte, Reference, error) {
 		return Bundle{}, nil, Reference{}, fmt.Errorf("%w: encode manifest: %v", ErrInvalidBundle, err)
 	}
 	payloads["manifest.json"] = manifest
-	tarBytes, err := writeTar(payloads)
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, nil, Reference{}, err
+	}
+	tarBytes, err := writeTar(ctx, payloads, maxTarBytes)
 	if err != nil {
 		return Bundle{}, nil, Reference{}, err
 	}
-	sum := sha256.Sum256(tarBytes)
-	return normalized, tarBytes, Reference{RunID: normalized.Manifest.RunID, Digest: hex.EncodeToString(sum[:]), Size: int64(len(tarBytes))}, nil
+	return normalized, tarBytes, Reference{RunID: normalized.Manifest.RunID, Digest: DigestTar(tarBytes), Size: int64(len(tarBytes))}, nil
 }
 
 // DecodeCanonicalTar verifies the fixed member set and reconstructs a bundle.
@@ -199,6 +216,10 @@ func DecodeCanonicalTar(canonicalTar []byte) (Bundle, error) {
 
 func normalizeBundle(bundle Bundle) (Bundle, error) {
 	bundle = CloneBundle(bundle)
+	bundle.Manifest.Changes = nonNil(bundle.Manifest.Changes)
+	bundle.Manifest.MemoryIDs = nonNil(bundle.Manifest.MemoryIDs)
+	bundle.Verification = nonNil(bundle.Verification)
+	bundle.Warnings = nonNil(bundle.Warnings)
 	if strings.TrimSpace(bundle.Manifest.RunID) == "" || strings.TrimSpace(bundle.Manifest.Template.Name) == "" || bundle.Manifest.Template.Version <= 0 || strings.TrimSpace(bundle.Manifest.Repository) == "" || strings.TrimSpace(bundle.Manifest.BaseSHA) == "" || strings.TrimSpace(bundle.Manifest.TreeSHA) == "" {
 		return Bundle{}, fmt.Errorf("%w: manifest identity fields are required", ErrInvalidBundle)
 	}
@@ -219,11 +240,12 @@ func normalizeBundle(bundle Bundle) (Bundle, error) {
 	for index := range bundle.Verification {
 		// Task 5 permits an execution-only override, never serializable evidence.
 		bundle.Verification[index].Command.Environment = nil
+		bundle.Verification[index].Command.Args = nonNil(bundle.Verification[index].Command.Args)
 	}
 	if len(bundle.ExecutionMetadata) == 0 {
-		bundle.ExecutionMetadata = json.RawMessage("null")
+		return Bundle{}, fmt.Errorf("%w: execution metadata is required", ErrInvalidBundle)
 	} else {
-		canonical, err := canonicalJSON(bundle.ExecutionMetadata)
+		canonical, err := canonicalExecutionMetadata(bundle.ExecutionMetadata)
 		if err != nil {
 			return Bundle{}, fmt.Errorf("%w: execution metadata: %v", ErrInvalidBundle, err)
 		}
@@ -266,26 +288,55 @@ func membersFor(payloads map[string][]byte) []Member {
 	return members
 }
 
-func writeTar(payloads map[string][]byte) ([]byte, error) {
-	var out bytes.Buffer
-	writer := tar.NewWriter(&out)
+func writeTar(ctx context.Context, payloads map[string][]byte, limit int64) ([]byte, error) {
+	out := &boundedBuffer{limit: limit}
+	writer := tar.NewWriter(out)
 	for _, name := range memberNames {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		data, ok := payloads[name]
 		if !ok {
 			return nil, fmt.Errorf("%w: missing generated member %q", ErrInvalidBundle, name)
 		}
 		header := &tar.Header{Name: name, Mode: 0o600, Size: int64(len(data)), Typeflag: tar.TypeReg, ModTime: time.Unix(0, 0).UTC(), Format: tar.FormatUSTAR}
 		if err := writer.WriteHeader(header); err != nil {
+			if errors.Is(err, ErrTooLarge) {
+				return nil, ErrTooLarge
+			}
 			return nil, fmt.Errorf("%w: write tar header: %v", ErrInvalidBundle, err)
 		}
-		if _, err := writer.Write(data); err != nil {
-			return nil, fmt.Errorf("%w: write tar member: %v", ErrInvalidBundle, err)
+		if err := writeTarData(ctx, writer, data); err != nil {
+			return nil, err
 		}
 	}
 	if err := writer.Close(); err != nil {
+		if errors.Is(err, ErrTooLarge) {
+			return nil, ErrTooLarge
+		}
 		return nil, fmt.Errorf("%w: close tar: %v", ErrInvalidBundle, err)
 	}
 	return out.Bytes(), nil
+}
+
+func writeTarData(ctx context.Context, writer *tar.Writer, data []byte) error {
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		size := len(data)
+		if size > 32*1024 {
+			size = 32 * 1024
+		}
+		if _, err := writer.Write(data[:size]); err != nil {
+			if errors.Is(err, ErrTooLarge) {
+				return ErrTooLarge
+			}
+			return fmt.Errorf("%w: write tar member: %v", ErrInvalidBundle, err)
+		}
+		data = data[size:]
+	}
+	return nil
 }
 
 func validateDecoded(bundle Bundle, members map[string][]byte) error {
@@ -340,9 +391,64 @@ func canonicalJSON(raw []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+var canonicalNumber = regexp.MustCompile(`^(0|[1-9][0-9]*|-[1-9][0-9]*)(\.[0-9]*[1-9])?$`)
+
+func canonicalExecutionMetadata(raw []byte) ([]byte, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("multiple JSON values")
+	}
+	if err := validateExecutionObject(value); err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := writeJSON(&out, value); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func validateExecutionObject(value map[string]any) error {
+	if len(value) == 0 {
+		return fmt.Errorf("execution metadata is empty")
+	}
+	allowed := map[string]struct{}{"exit_code": {}, "duration": {}, "started": {}, "completed": {}, "truncated": {}, "status": {}, "failure_class": {}, "cause_code": {}}
+	for key, item := range value {
+		if _, ok := allowed[key]; !ok || strings.Contains(strings.ToLower(key), "env") || strings.Contains(strings.ToLower(key), "secret") || strings.Contains(strings.ToLower(key), "token") || strings.Contains(strings.ToLower(key), "credential") || strings.Contains(strings.ToLower(key), "password") {
+			return fmt.Errorf("unsafe execution metadata key %q", key)
+		}
+		switch key {
+		case "started", "completed", "truncated":
+			if _, ok := item.(bool); !ok {
+				return fmt.Errorf("invalid execution metadata value for %q", key)
+			}
+		case "exit_code", "duration":
+			number, ok := item.(json.Number)
+			if !ok || !canonicalNumber.MatchString(number.String()) || (key == "exit_code" && strings.Contains(number.String(), ".")) {
+				return fmt.Errorf("non-canonical execution number for %q", key)
+			}
+		default:
+			text, ok := item.(string)
+			if !ok || len(text) > 128 {
+				return fmt.Errorf("invalid execution metadata value for %q", key)
+			}
+		}
+	}
+	return nil
+}
+
 func writeJSON(out *bytes.Buffer, value any) error {
 	switch typed := value.(type) {
 	case nil, bool, string, json.Number:
+		if number, ok := typed.(json.Number); ok && !canonicalNumber.MatchString(number.String()) {
+			return fmt.Errorf("non-canonical number %q", number)
+		}
 		data, err := json.Marshal(typed)
 		if err != nil {
 			return err
@@ -460,4 +566,23 @@ func cloneStringMap(values map[string]string) map[string]string {
 		clone[key] = value
 	}
 	return clone
+}
+
+func nonNil[T any](values []T) []T {
+	if values == nil {
+		return []T{}
+	}
+	return values
+}
+
+type boundedBuffer struct {
+	bytes.Buffer
+	limit int64
+}
+
+func (b *boundedBuffer) Write(data []byte) (int, error) {
+	if b.limit > 0 && int64(b.Len()+len(data)) > b.limit {
+		return 0, ErrTooLarge
+	}
+	return b.Buffer.Write(data)
 }

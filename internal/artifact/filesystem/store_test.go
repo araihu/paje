@@ -1,14 +1,18 @@
 package filesystem_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,6 +109,24 @@ func TestStoreLimitsAndCleansTemporaryFiles(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsUncompressedBundlesLoadWouldReject(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store := newStore(t, root, 512) // Load permits only 8 KiB uncompressed.
+	bundle := testBundle()
+	bundle.AgentOutput = bytes.Repeat([]byte("compressible evidence\n"), 1024)
+	if _, err := store.Save(context.Background(), bundle); !errors.Is(err, artifact.ErrTooLarge) {
+		t.Fatalf("Save() error = %v, want uncompressed ErrTooLarge", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary files remain: %#v", entries)
+	}
+}
+
 func TestStoreReturnsDefensiveCopiesAndHonorsCanceledContext(t *testing.T) {
 	t.Parallel()
 	store := newStore(t, t.TempDir(), 1<<20)
@@ -137,8 +159,8 @@ func TestReferenceForCanonicalizesRawJSONAndSemanticallyUnorderedValues(t *testi
 	t.Parallel()
 	left := testBundle()
 	right := testBundle()
-	left.ExecutionMetadata = json.RawMessage(`{"z": [3, 2], "a": {"beta": true, "alpha": false}}`)
-	right.ExecutionMetadata = json.RawMessage(` { "a" : { "alpha" : false, "beta" : true }, "z" : [3,2] } `)
+	left.ExecutionMetadata = json.RawMessage(`{"completed":true,"duration":2.5,"exit_code":0}`)
+	right.ExecutionMetadata = json.RawMessage(` { "exit_code" : 0, "duration" : 2.5, "completed" : true } `)
 	right.Manifest.MemoryIDs = []string{"memory-z", "memory-a"}
 	right.Warnings = []string{"z warning", "a warning"}
 	leftRef, err := artifact.ReferenceFor(left)
@@ -151,6 +173,125 @@ func TestReferenceForCanonicalizesRawJSONAndSemanticallyUnorderedValues(t *testi
 	}
 	if leftRef.Digest != rightRef.Digest {
 		t.Fatalf("canonical references differ: %s != %s", leftRef.Digest, rightRef.Digest)
+	}
+}
+
+func TestReferenceForNormalizesNilEmptyAndRejectsUnsafeMetadataAndNumbers(t *testing.T) {
+	t.Parallel()
+	nilBundle := testBundle()
+	nilBundle.Manifest.Changes = nil
+	nilBundle.Manifest.MemoryIDs = nil
+	nilBundle.Manifest.MemoryCount = 0
+	nilBundle.Verification = nil
+	nilBundle.Warnings = nil
+	emptyBundle := nilBundle
+	emptyBundle.Manifest.Changes = []artifact.Change{}
+	emptyBundle.Manifest.MemoryIDs = []string{}
+	emptyBundle.Verification = []verification.Result{}
+	emptyBundle.Warnings = []string{}
+	nilRef, err := artifact.ReferenceFor(nilBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyRef, err := artifact.ReferenceFor(emptyBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nilRef != emptyRef {
+		t.Fatalf("nil and empty references differ: %#v %#v", nilRef, emptyRef)
+	}
+
+	unsafe := testBundle()
+	unsafe.ExecutionMetadata = json.RawMessage(`{"completed":true,"environment":{"TOKEN":"secret"}}`)
+	if _, err := artifact.ReferenceFor(unsafe); !errors.Is(err, artifact.ErrInvalidBundle) {
+		t.Fatalf("unsafe metadata error = %v", err)
+	}
+	numeric := testBundle()
+	numeric.ExecutionMetadata = json.RawMessage(`{"completed":true,"duration":1.0}`)
+	if _, err := artifact.ReferenceFor(numeric); !errors.Is(err, artifact.ErrInvalidBundle) {
+		t.Fatalf("noncanonical number error = %v", err)
+	}
+}
+
+func TestStoreRejectsAppendedGzipMember(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store := newStore(t, root, 1<<20)
+	ref, err := store.Save(context.Background(), testBundle())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "sha256", ref.Digest[:2], ref.Digest+".tar.gz")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := gzip.NewWriter(file)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(context.Background(), ref); !errors.Is(err, artifact.ErrDigestMismatch) {
+		t.Fatalf("Load() error = %v, want mismatch", err)
+	}
+}
+
+func TestStoreRejectsSymlinkedComponentsAndHardLinkedArtifacts(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store := newStore(t, root, 1<<20)
+	if err := os.RemoveAll(filepath.Join(root, "sha256")); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "sha256")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Save(context.Background(), testBundle()); err == nil {
+		t.Fatal("Save accepted a symlinked sha256 component")
+	}
+
+	root = t.TempDir()
+	store = newStore(t, root, 1<<20)
+	ref, err := store.Save(context.Background(), testBundle())
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(root, "sha256", ref.Digest[:2], ref.Digest+".tar.gz")
+	if err := os.Link(final, final+".extra"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(context.Background(), ref); !errors.Is(err, artifact.ErrDigestMismatch) {
+		t.Fatalf("Load hard-linked artifact error = %v", err)
+	}
+}
+
+func TestStoreConcurrentSavesDoNotOverwriteWinner(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	first := newStore(t, root, 1<<20)
+	second := newStore(t, root, 1<<20)
+	var refs [2]artifact.Reference
+	var errs [2]error
+	var wait sync.WaitGroup
+	for index, store := range []*filesystem.Store{first, second} {
+		wait.Add(1)
+		go func(index int, store *filesystem.Store) {
+			defer wait.Done()
+			refs[index], errs[index] = store.Save(context.Background(), testBundle())
+		}(index, store)
+	}
+	wait.Wait()
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatalf("concurrent Save errors: %v, %v", errs[0], errs[1])
+	}
+	if refs[0] != refs[1] {
+		t.Fatalf("concurrent references differ: %#v %#v", refs[0], refs[1])
+	}
+	if _, err := first.Load(context.Background(), refs[0]); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -168,7 +309,7 @@ func testBundle() artifact.Bundle {
 		Manifest:          artifact.Manifest{RunID: "run-123", Template: template.ID{Name: "code-change", Version: 1}, Repository: "https://example.test/repo.git", BaseSHA: strings.Repeat("a", 40), TreeSHA: strings.Repeat("b", 40), Changes: []artifact.Change{{Path: "main.go", Status: "modified", OldMode: "100644", NewMode: "100755"}}, MemoryIDs: []string{"memory-z", "memory-a"}, MemoryCount: 2},
 		ChangesPatch:      []byte("diff --git a/main.go b/main.go\n"),
 		AgentOutput:       []byte("agent output"),
-		ExecutionMetadata: json.RawMessage(`{"run":{"status":"completed"},"environment":{"PATH":"[redacted]","TOKEN":"[redacted]"}}`),
+		ExecutionMetadata: json.RawMessage(`{"completed":true,"duration":2.5,"exit_code":0,"started":true,"truncated":false}`),
 		Verification:      []verification.Result{{Command: verification.Command{Name: "go test", Directory: "/workspace", Executable: "go", Args: []string{"test", "./..."}, Environment: map[string]string{"GOWORK": "off"}, Timeout: time.Minute, Required: true}, ExitCode: 0, Duration: 2 * time.Second, Output: "ok", Passed: true}},
 		Preflight:         map[string]string{"tool:go": "available", "base_sha": "abc"},
 		Warnings:          []string{"z warning", "a warning"},
@@ -190,13 +331,15 @@ func TestMemberDigestsAreVerified(t *testing.T) {
 	if len(loaded.Manifest.Members) != 6 {
 		t.Fatalf("members = %#v", loaded.Manifest.Members)
 	}
+	want := map[string][]byte{"changes.patch": loaded.ChangesPatch, "agent-output.txt": loaded.AgentOutput, "execution.json": loaded.ExecutionMetadata}
 	for _, member := range loaded.Manifest.Members {
-		if member.Size < 0 || len(member.SHA256) != 64 {
-			t.Fatalf("invalid member: %#v", member)
+		data, ok := want[member.Name]
+		if !ok {
+			continue
 		}
-	}
-	got := sha256.Sum256(loaded.AgentOutput)
-	if loaded.Manifest.Members[1].SHA256 == "" || got == ([32]byte{}) {
-		t.Fatal("missing member digest")
+		sum := sha256.Sum256(data)
+		if member.Size != int64(len(data)) || member.SHA256 != fmt.Sprintf("%x", sum) {
+			t.Fatalf("member = %#v, want exact digest/size", member)
+		}
 	}
 }

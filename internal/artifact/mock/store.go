@@ -50,6 +50,9 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return artifact.Reference{}, err
+	}
 	if s.saveErr != nil {
 		return artifact.Reference{}, s.saveErr
 	}
@@ -67,6 +70,9 @@ func (s *Store) Load(ctx context.Context, ref artifact.Reference) (artifact.Bund
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return artifact.Bundle{}, err
+	}
 	if s.loadErr != nil {
 		return artifact.Bundle{}, s.loadErr
 	}
