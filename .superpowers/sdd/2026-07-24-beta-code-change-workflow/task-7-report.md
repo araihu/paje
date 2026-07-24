@@ -54,3 +54,51 @@ receive no inherited environment, every Git argument is validated before use,
 and captured diagnostics are bounded to 4096 bytes. The policy only returns
 metadata-safe findings; durable artifact persistence remains downstream of the
 policy gate in the workflow task.
+
+## Fix Round 1
+
+### Regressions and fixes
+
+- Replaced prefix-only patch scanning with a unified-diff state machine. It
+  enters hunk state only at `@@`, scans every real added line (including source
+  content that itself starts with `+`), and never scans binary sections.
+  Private-key detection is bounded and matches headers embedded in quoted or
+  indented added text.
+- Git path association decodes quoted patch paths, mode findings use `OldPath`
+  for renames, all finding paths are safe/non-empty, findings are sorted and
+  deduplicated, and cancellation returns a deterministic policy denial.
+- Workspace handling now rejects `.git` and index symlinks, validates linked
+  worktree back-links, confirms Git's toplevel, snapshots the Git executable
+  environment at construction, and configures subprocess process groups so
+  cancellation kills descendants.
+- Operation-private `0700` directories are created alongside, but outside, the
+  workspace; indexes and patch files inside remain `0600`. Cleanup runs with a
+  non-canceled bounded context and its error is joined into the operation
+  result.
+- Capture preserves gitlinks for the policy layer, enables rename/copy
+  discovery, parses and cross-validates raw/name-status/stage NUL streams, and
+  accepts only exact 40- or 64-character lowercase object IDs.
+- Apply rejects any porcelain state, validates patch paths, proves the patch in
+  a temporary index and expected tree before it can touch the real worktree,
+  then retains independent post-apply verification.
+
+### RED evidence
+
+Before the fixes, focused regressions failed for plus-prefixed added secrets,
+indented PEM headers, quoted paths, rename old-mode findings, duplicate
+findings, untracked Apply mutation, expected-tree mismatch mutation, `.git` /
+index symlinks, and gitlink capture. The policy command reported each expected
+failure directly; the Git command returned the pre-fix tree-mismatch and
+unsafe-mode behavior.
+
+### Verification
+
+```text
+go test ./internal/artifact/gitcapture ./internal/policy -v
+go test -race ./internal/artifact/gitcapture ./internal/policy
+go test ./...
+```
+
+All pass, including regressions for descendant cancellation, temporary
+directory cleanup, NUL-stream cross-validation, 41-character SHA rejection,
+and no-mutation Apply failures.

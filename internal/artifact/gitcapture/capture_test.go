@@ -7,9 +7,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
+	"github.com/araihu/paje/internal/policy"
 )
 
 func TestCaptureAndApplyReproduceEveryGitChangeWithoutMutatingSourceIndex(t *testing.T) {
@@ -135,6 +141,278 @@ func TestApplyRejectsTreeOtherThanCapturedTree(t *testing.T) {
 	if !errors.Is(err, gitcapture.ErrTreeMismatch) {
 		t.Fatalf("Apply() error = %v, want ErrTreeMismatch", err)
 	}
+}
+
+func TestApplyRejectsUntrackedTargetWithoutMutatingIt(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	git(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+	writeFile(t, filepath.Join(target, "untracked.txt"), []byte("must block apply\n"), 0o644)
+	beforeIndex := readIndex(t, target)
+	beforeText, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{Workspace: target, BaseSHA: base, Patch: result.Patch, ExpectedTreeSHA: result.TreeSHA})
+	if !errors.Is(err, gitcapture.ErrDirtyIndex) {
+		t.Fatalf("Apply() error = %v, want ErrDirtyIndex", err)
+	}
+	afterText, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readIndex(t, target), beforeIndex) || !bytes.Equal(afterText, beforeText) {
+		t.Fatal("Apply() mutated a target rejected for untracked state")
+	}
+}
+
+func TestApplyTreeMismatchLeavesWorktreeAndIndexUnchanged(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	git(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+	beforeIndex := readIndex(t, target)
+	beforeText, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{Workspace: target, BaseSHA: base, Patch: result.Patch, ExpectedTreeSHA: "0000000000000000000000000000000000000000"})
+	if !errors.Is(err, gitcapture.ErrTreeMismatch) {
+		t.Fatalf("Apply() error = %v, want ErrTreeMismatch", err)
+	}
+	afterText, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readIndex(t, target), beforeIndex) || !bytes.Equal(afterText, beforeText) {
+		t.Fatal("tree mismatch mutated target before proof completed")
+	}
+}
+
+func TestCaptureRejectsGitAndIndexSymlinks(t *testing.T) {
+	for _, kind := range []string{"git", "index"} {
+		t.Run(kind, func(t *testing.T) {
+			repo := initializedRepository(t)
+			base := git(t, repo, "rev-parse", "HEAD")
+			if kind == "git" {
+				if err := os.Rename(filepath.Join(repo, ".git"), filepath.Join(repo, "git-data")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("git-data", filepath.Join(repo, ".git")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				index := filepath.Join(repo, ".git", "index")
+				if err := os.Rename(index, index+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("index.real", index); err != nil {
+					t.Fatal(err)
+				}
+			}
+			capturer, err := gitcapture.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+			if !errors.Is(err, gitcapture.ErrInvalidRequest) {
+				t.Fatalf("Capture() error = %v, want ErrInvalidRequest for malicious %s link", err, kind)
+			}
+		})
+	}
+}
+
+func TestCapturePreservesGitlinkForPolicyDenial(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	module := filepath.Join(repo, "module")
+	if err := os.Mkdir(module, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(t, module, "init")
+	git(t, module, "config", "user.name", "Paje Test")
+	git(t, module, "config", "user.email", "paje@example.test")
+	writeFile(t, filepath.Join(module, "module.txt"), []byte("module\n"), 0o644)
+	git(t, module, "add", "-A")
+	git(t, module, "commit", "-m", "module")
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 1 || result.Changes[0] != (artifact.Change{Path: "module", Status: "A", OldMode: "000000", NewMode: "160000"}) {
+		t.Fatalf("Capture() changes = %#v, want preserved gitlink", result.Changes)
+	}
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := evaluator.Evaluate(context.Background(), result)
+	if decision.Allowed || len(decision.Findings) != 1 || decision.Findings[0].RuleID != "mode-gitlink" || decision.Findings[0].Path != "module" {
+		t.Fatalf("policy decision = %#v, want gitlink denial", decision)
+	}
+}
+
+func TestApplyRejectsExactFortyOneCharacterSHAWithoutMutation(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	beforeIndex := readIndex(t, repo)
+	beforeText, err := os.ReadFile(filepath.Join(repo, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{Workspace: repo, BaseSHA: base + "0", Patch: []byte("diff --git a/text.txt b/text.txt\n"), ExpectedTreeSHA: base})
+	if !errors.Is(err, gitcapture.ErrInvalidRequest) {
+		t.Fatalf("Apply() error = %v, want pre-mutation SHA validation error", err)
+	}
+	afterText, err := os.ReadFile(filepath.Join(repo, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeIndex, readIndex(t, repo)) || !bytes.Equal(beforeText, afterText) {
+		t.Fatal("invalid 41-character SHA mutated worktree or index")
+	}
+}
+
+func TestCaptureRejectsNameStatusAndStageCrossValidationMismatch(t *testing.T) {
+	workspace := fakeWorkspace(t)
+	base := strings.Repeat("a", 40)
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"*--show-toplevel*) printf '%s\\n' '" + workspace + "' ;;\n" +
+		"*'rev-parse HEAD'*) printf '%s\\n' '" + base + "' ;;\n" +
+		"*--verify*) printf '%s\\n' '" + base + "' ;;\n" +
+		"*'diff --quiet'*) exit 0 ;;\n" +
+		"*'diff --cached --binary'*) printf 'diff --git a/a b/a\\n' ;;\n" +
+		"*'diff --cached --raw'*) printf ':000000 100644 0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 A\\000a\\000' ;;\n" +
+		"*'diff --cached --name-status'*) printf 'A\\000b\\000' ;;\n" +
+		"*'ls-files --stage'*) printf '100644 1111111111111111111111111111111111111111 0\\ta\\000' ;;\n" +
+		"*write-tree*) printf '%s\\n' '" + base + "' ;;\n" +
+		"*) : > \"$GIT_INDEX_FILE\" ;;\n" +
+		"esac\n"
+	writeFile(t, fake, []byte(script), 0o755)
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = capturer.Capture(context.Background(), gitcapture.Request{Workspace: workspace, BaseSHA: base, MaxBytes: 1 << 20})
+	if !errors.Is(err, gitcapture.ErrInvalidRequest) {
+		t.Fatalf("Capture() error = %v, want cross-validation rejection", err)
+	}
+}
+
+func TestCaptureCancelsGitDescendants(t *testing.T) {
+	workspace := fakeWorkspace(t)
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n/bin/sleep 30 &\necho $! > '" + pidFile + "'\nwait\n"
+	writeFile(t, fake, []byte(script), 0o755)
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := capturer.Capture(ctx, gitcapture.Request{Workspace: workspace, BaseSHA: strings.Repeat("a", 40), MaxBytes: 1 << 20})
+		result <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, statErr := os.Stat(pidFile); statErr == nil {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("Capture() returned before starting its descendant: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			err := <-result
+			t.Fatalf("fake Git did not start its descendant; Capture() error = %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	err = <-result
+	if err == nil {
+		t.Fatal("Capture() error = nil, want canceled process")
+	}
+	pidData, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for syscall.Kill(pid, 0) == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("Git descendant %d survived cancellation", pid)
+	}
+}
+
+func TestCaptureUsesTempOutsideWorkspaceAndCleansIt(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	t.Setenv("TMPDIR", repo)
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(repo, ".paje-git-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("temporary Git directories remain in workspace: %v, %v", matches, err)
+	}
+}
+
+func fakeWorkspace(t *testing.T) string {
+	t.Helper()
+	workspace := t.TempDir()
+	if err := os.Mkdir(filepath.Join(workspace, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(workspace, ".git", "index"), nil, 0o600)
+	return workspace
 }
 
 func initializedRepository(t *testing.T) string {

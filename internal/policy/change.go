@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -21,10 +22,12 @@ const (
 	rulePrivateKey       = "secret-private-key"
 	ruleGitHubToken      = "secret-github-token"
 	ruleSecretAssignment = "secret-assignment"
+	ruleCanceled         = "evaluation-canceled"
+	policyPath           = ".paje-policy/unknown"
 )
 
 var (
-	privateKeyPattern  = regexp.MustCompile(`(?i)^-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----\s*$`)
+	privateKeyPattern  = regexp.MustCompile(`(?i)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`)
 	githubTokenPattern = regexp.MustCompile(`(?i)\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`)
 	assignmentPattern  = regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9_]*_(?:SECRET|TOKEN|PASSWORD|API_KEY)\s*=\s*[^\s#]+`)
 )
@@ -78,18 +81,28 @@ func NewChangePolicy(config Config) (*ChangePolicy, error) {
 // patch lines. Findings deliberately contain no secret values.
 func (p *ChangePolicy) Evaluate(ctx context.Context, result gitcapture.Result) Decision {
 	findings := make([]Finding, 0)
+	if ctx.Err() != nil {
+		return canceledDecision()
+	}
 	for _, change := range result.Changes {
-		if ctx.Err() != nil {
-			break
-		}
 		p.evaluatePath(&findings, change.Path)
 		if change.OldPath != "" {
 			p.evaluatePath(&findings, change.OldPath)
 		}
-		p.evaluateMode(&findings, change.Path, change.OldMode)
+		oldPath := change.Path
+		if change.OldPath != "" {
+			oldPath = change.OldPath
+		}
+		p.evaluateMode(&findings, oldPath, change.OldMode)
 		p.evaluateMode(&findings, change.Path, change.NewMode)
+		if ctx.Err() != nil {
+			return canceledDecision()
+		}
 	}
 	p.evaluatePatch(ctx, &findings, result.Patch)
+	if ctx.Err() != nil {
+		return canceledDecision()
+	}
 	sort.Slice(findings, func(i, j int) bool {
 		if findings[i].Path != findings[j].Path {
 			return findings[i].Path < findings[j].Path
@@ -99,13 +112,14 @@ func (p *ChangePolicy) Evaluate(ctx context.Context, result gitcapture.Result) D
 		}
 		return findings[i].Line < findings[j].Line
 	})
-	return Decision{Allowed: len(findings) == 0 && ctx.Err() == nil, Findings: findings}
+	findings = deduplicate(findings)
+	return Decision{Allowed: len(findings) == 0, Findings: findings}
 }
 
 func (p *ChangePolicy) evaluatePath(findings *[]Finding, value string) {
 	normalized, ok := containedPath(p.workspace, value)
 	if !ok {
-		*findings = append(*findings, Finding{RuleID: ruleUnsafePath, Path: displayPath(value)})
+		*findings = append(*findings, Finding{RuleID: ruleUnsafePath, Path: policyPath})
 		return
 	}
 	if sensitivePath(normalized) {
@@ -131,31 +145,45 @@ func (p *ChangePolicy) evaluateMode(findings *[]Finding, value, mode string) {
 }
 
 func (p *ChangePolicy) evaluatePatch(ctx context.Context, findings *[]Finding, patch []byte) {
-	currentPath := ""
-	binary := false
+	type patchState uint8
+	const (
+		outside patchState = iota
+		fileHeader
+		hunk
+		binary
+	)
+	state := outside
+	currentPath := policyPath
 	for lineNumber, line := range bytes.Split(patch, []byte("\n")) {
 		if ctx.Err() != nil {
 			return
 		}
 		if bytes.HasPrefix(line, []byte("diff --git ")) {
-			currentPath = ""
-			binary = false
+			currentPath = policyPath
+			state = fileHeader
+			continue
+		}
+		if state == outside {
 			continue
 		}
 		if bytes.Equal(line, []byte("GIT binary patch")) || bytes.HasPrefix(line, []byte("Binary files ")) {
-			binary = true
+			state = binary
 			continue
 		}
 		if bytes.HasPrefix(line, []byte("+++ ")) {
-			if normalized, ok := patchPath(line[4:]); ok {
+			if normalized, ok := p.patchPath(line[4:]); ok {
 				currentPath = normalized
 			}
 			continue
 		}
-		if binary || len(line) < 2 || line[0] != '+' || line[1] == '+' || !utf8.Valid(line[1:]) {
+		if bytes.HasPrefix(line, []byte("@@ ")) {
+			state = hunk
 			continue
 		}
-		text := string(line[1:])
+		if state != hunk || len(line) < 2 || line[0] != '+' || !utf8.Valid(line[1:]) {
+			continue
+		}
+		text := string(boundLine(line[1:]))
 		for _, match := range []struct {
 			ruleID string
 			re     *regexp.Regexp
@@ -171,6 +199,25 @@ func (p *ChangePolicy) evaluatePatch(ctx context.Context, findings *[]Finding, p
 	}
 }
 
+func canceledDecision() Decision {
+	return Decision{Allowed: false, Findings: []Finding{{RuleID: ruleCanceled, Path: policyPath}}}
+}
+
+func deduplicate(findings []Finding) []Finding {
+	if len(findings) < 2 {
+		return findings
+	}
+	write := 1
+	for read := 1; read < len(findings); read++ {
+		if findings[read] == findings[write-1] {
+			continue
+		}
+		findings[write] = findings[read]
+		write++
+	}
+	return findings[:write]
+}
+
 func containedPath(workspace, value string) (string, bool) {
 	if value == "" || !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') || strings.Contains(value, "\\") || filepath.IsAbs(value) {
 		return "", false
@@ -183,21 +230,31 @@ func containedPath(workspace, value string) (string, bool) {
 	return filepath.ToSlash(relative), true
 }
 
-func displayPath(value string) string {
-	value = strings.ReplaceAll(value, "\\", "/")
-	return strings.TrimPrefix(value, "./")
-}
-
 func sensitivePath(value string) bool {
 	base := strings.ToLower(filepath.Base(value))
 	return base == ".env" || strings.HasPrefix(base, ".env.") || base == "id_rsa" || strings.HasSuffix(base, ".pem") || base == "credentials.json" || base == ".npmrc"
 }
 
-func patchPath(value []byte) (string, bool) {
+func (p *ChangePolicy) patchPath(value []byte) (string, bool) {
 	text := string(value)
+	if strings.HasPrefix(text, `"`) {
+		decoded, err := strconv.Unquote(text)
+		if err != nil {
+			return "", false
+		}
+		text = decoded
+	}
 	if text == "/dev/null" || !strings.HasPrefix(text, "b/") {
 		return "", false
 	}
-	normalized, ok := containedPath(".", strings.TrimPrefix(text, "b/"))
+	normalized, ok := containedPath(p.workspace, strings.TrimPrefix(text, "b/"))
 	return normalized, ok
+}
+
+func boundLine(line []byte) []byte {
+	const maxPolicyLineBytes = 16 << 10
+	if len(line) > maxPolicyLineBytes {
+		return line[:maxPolicyLineBytes]
+	}
+	return line
 }

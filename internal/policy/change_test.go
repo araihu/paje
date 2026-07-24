@@ -37,8 +37,12 @@ func TestChangePolicyDeniesUnsafePathsModesAndCredentialFiles(t *testing.T) {
 			if decision.Allowed || !hasRule(decision, tc.ruleID) {
 				t.Fatalf("Evaluate() = %#v, want denial with %q", decision, tc.ruleID)
 			}
-			if len(decision.Findings) == 0 || decision.Findings[0].Path != normalize(tc.change.Path) {
-				t.Fatalf("finding paths = %#v, want normalized %q", decision.Findings, normalize(tc.change.Path))
+			wantPath := normalize(tc.change.Path)
+			if tc.ruleID == "path-unsafe" {
+				wantPath = ".paje-policy/unknown"
+			}
+			if len(decision.Findings) == 0 || decision.Findings[0].Path != wantPath {
+				t.Fatalf("finding paths = %#v, want safe normalized %q", decision.Findings, wantPath)
 			}
 		})
 	}
@@ -109,6 +113,72 @@ func TestChangePolicyFindingsAreSorted(t *testing.T) {
 		return left.Line < right.Line
 	}) {
 		t.Fatalf("findings = %#v, want sorted denial", decision.Findings)
+	}
+}
+
+func TestChangePolicyScansAddedContentThatBeginsWithPlus(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := "diff --git a/src/config.go b/src/config.go\n--- a/src/config.go\n+++ b/src/config.go\n@@ -0,0 +1 @@\n++DATABASE_SECRET=super-secret-value\n"
+	decision := evaluator.Evaluate(context.Background(), gitcapture.Result{Patch: []byte(patch), Changes: []artifact.Change{{Path: "src/config.go", Status: "A", NewMode: "100644"}}})
+	if decision.Allowed || !hasRule(decision, "secret-assignment") {
+		t.Fatalf("Evaluate() = %#v, want added plus-prefixed secret denied", decision)
+	}
+}
+
+func TestChangePolicyFindsIndentedPrivateKeyHeader(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := "diff --git a/src/config.go b/src/config.go\n--- a/src/config.go\n+++ b/src/config.go\n@@ -0,0 +1 @@\n+  key: \"-----BEGIN PRIVATE KEY-----\"\n"
+	decision := evaluator.Evaluate(context.Background(), gitcapture.Result{Patch: []byte(patch), Changes: []artifact.Change{{Path: "src/config.go", Status: "A", NewMode: "100644"}}})
+	if decision.Allowed || !hasRule(decision, "secret-private-key") {
+		t.Fatalf("Evaluate() = %#v, want indented private key denied", decision)
+	}
+}
+
+func TestChangePolicyDecodesQuotedPatchPath(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oddPath := "src/odd\tname.go"
+	patch := "diff --git \"a/src/odd\\tname.go\" \"b/src/odd\\tname.go\"\n--- \"a/src/odd\\tname.go\"\n+++ \"b/src/odd\\tname.go\"\n@@ -0,0 +1 @@\n+DATABASE_SECRET=super-secret-value\n"
+	decision := evaluator.Evaluate(context.Background(), gitcapture.Result{Patch: []byte(patch), Changes: []artifact.Change{{Path: oddPath, Status: "A", NewMode: "100644"}}})
+	if decision.Allowed || len(decision.Findings) != 1 || decision.Findings[0].Path != oddPath {
+		t.Fatalf("Evaluate() = %#v, want quoted path %q", decision, oddPath)
+	}
+}
+
+func TestChangePolicyUsesOldPathForRenameOldMode(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := evaluator.Evaluate(context.Background(), gitcapture.Result{Changes: []artifact.Change{{Path: "new-module", OldPath: "old-module", Status: "R", OldMode: "160000", NewMode: "100644"}}})
+	if decision.Allowed || len(decision.Findings) != 1 || decision.Findings[0] != (policy.Finding{RuleID: "mode-gitlink", Path: "old-module"}) {
+		t.Fatalf("Evaluate() = %#v, want old rename path in mode finding", decision)
+	}
+}
+
+func TestChangePolicyDeduplicatesFindingsAndSafelyDeniesCancellation(t *testing.T) {
+	evaluator, err := policy.NewChangePolicy(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := gitcapture.Result{Changes: []artifact.Change{{Path: ".env", Status: "A", NewMode: "100644"}, {Path: ".env", Status: "A", NewMode: "100644"}}}
+	decision := evaluator.Evaluate(context.Background(), result)
+	if decision.Allowed || len(decision.Findings) != 1 || decision.Findings[0].RuleID != "path-sensitive" {
+		t.Fatalf("Evaluate() = %#v, want one deterministic finding", decision)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	decision = evaluator.Evaluate(ctx, gitcapture.Result{})
+	if decision.Allowed || len(decision.Findings) != 1 || decision.Findings[0].RuleID != "evaluation-canceled" || decision.Findings[0].Path == "" {
+		t.Fatalf("Evaluate(canceled) = %#v, want safe policy denial", decision)
 	}
 }
 
