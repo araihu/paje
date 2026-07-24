@@ -5,19 +5,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/araihu/paje/internal/executil"
 	"github.com/araihu/paje/internal/runner"
 )
 
+const defaultOutputLimit int64 = 1 << 20
+
 // Runner executes one configured command without invoking a shell.
 type Runner struct {
-	command string
-	args    []string
+	command     string
+	args        []string
+	outputLimit int64
 }
 
 var _ runner.Runner = (*Runner)(nil)
@@ -25,13 +28,22 @@ var _ runner.Runner = (*Runner)(nil)
 // New constructs a local process runner. The task description is appended to
 // args for each execution.
 func New(command string, args ...string) (*Runner, error) {
+	return NewConfigured(command, args, defaultOutputLimit)
+}
+
+// NewConfigured constructs a local process runner with a bounded transcript.
+func NewConfigured(command string, args []string, outputLimit int64) (*Runner, error) {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return nil, fmt.Errorf("create local runner: command is required")
 	}
+	if outputLimit <= 0 {
+		return nil, fmt.Errorf("create local runner: output limit must be positive")
+	}
 	return &Runner{
-		command: command,
-		args:    append([]string(nil), args...),
+		command:     command,
+		args:        append([]string(nil), args...),
+		outputLimit: outputLimit,
 	}, nil
 }
 
@@ -48,37 +60,59 @@ func (r *Runner) Run(ctx context.Context, req runner.RunRequest) (runner.Executi
 	args = append(args, r.args...)
 	args = append(args, req.TaskDescription)
 
-	command := exec.CommandContext(ctx, r.command, args...)
-	command.Dir = req.WorkspacePath
-	environment, err := mergedEnvironment(req.Env)
+	environment, err := exactEnvironment(req.Env)
 	if err != nil {
 		return runner.ExecutionResult{}, err
 	}
+	output, err := executil.NewLimitedBuffer(r.outputLimit)
+	if err != nil {
+		return runner.ExecutionResult{}, fmt.Errorf("run local agent: create output buffer: %w", err)
+	}
+
+	command := exec.CommandContext(ctx, r.command, args...)
+	command.Dir = req.WorkspacePath
 	command.Env = environment
+	command.Stdout = output
+	command.Stderr = output
+	executil.Configure(command)
 
 	started := time.Now()
-	output, runErr := command.CombinedOutput()
+	startErr := command.Start()
 	result := runner.ExecutionResult{
-		Output:   string(output),
-		ExitCode: 0,
-		Duration: time.Since(started).Seconds(),
+		Started:   startErr == nil,
+		Truncated: output.Truncated(),
 	}
-	if runErr == nil {
-		return result, nil
+	if startErr != nil {
+		result.Duration = time.Since(started).Seconds()
+		return withOutput(result, output), fmt.Errorf("run local agent: %w", startErr)
 	}
 
+	waitErr := command.Wait()
+	result.Duration = time.Since(started).Seconds()
 	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
+	if errors.As(waitErr, &exitErr) {
 		result.ExitCode = exitErr.ExitCode()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return result, fmt.Errorf("run local agent: %w", ctxErr)
-		}
-		return result, nil
 	}
+	if ctx.Err() == nil {
+		result.Completed = waitErr == nil || errors.As(waitErr, &exitErr)
+	}
+	result = withOutput(result, output)
+
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return result, fmt.Errorf("run local agent: %w", ctxErr)
 	}
-	return result, fmt.Errorf("run local agent: %w", runErr)
+	if waitErr != nil && !errors.As(waitErr, &exitErr) {
+		return result, fmt.Errorf("run local agent: %w", waitErr)
+	}
+	return result, nil
+}
+
+func withOutput(result runner.ExecutionResult, output *executil.LimitedBuffer) runner.ExecutionResult {
+	transcript := string(output.Bytes())
+	result.Transcript = transcript
+	result.Output = transcript
+	result.Truncated = output.Truncated()
+	return result
 }
 
 func validateRequest(req runner.RunRequest) error {
@@ -91,29 +125,18 @@ func validateRequest(req runner.RunRequest) error {
 	return nil
 }
 
-func mergedEnvironment(overrides map[string]string) ([]string, error) {
-	values := make(map[string]string, len(os.Environ())+len(overrides))
-	for _, entry := range os.Environ() {
-		key, value, found := strings.Cut(entry, "=")
-		if found {
-			values[key] = value
-		}
-	}
-	for key, value := range overrides {
+func exactEnvironment(values map[string]string) ([]string, error) {
+	keys := make([]string, 0, len(values))
+	for key := range values {
 		if key == "" || strings.ContainsRune(key, '=') {
 			return nil, fmt.Errorf("run local agent: invalid environment key %q", key)
 		}
-		values[key] = value
-	}
-
-	keys := make([]string, 0, len(values))
-	for key := range values {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	environment := make([]string, 0, len(keys))
+	result := make([]string, 0, len(keys))
 	for _, key := range keys {
-		environment = append(environment, key+"="+values[key])
+		result = append(result, key+"="+values[key])
 	}
-	return environment, nil
+	return result, nil
 }

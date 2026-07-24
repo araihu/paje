@@ -11,9 +11,13 @@ type RunRequest struct {
 
 // ExecutionResult captures the observable result of an agent process.
 type ExecutionResult struct {
-	Output   string
-	ExitCode int
-	Duration float64
+	Transcript string
+	Output     string
+	ExitCode   int
+	Duration   float64
+	Started    bool
+	Completed  bool
+	Truncated  bool
 }
 
 // Runner executes an agent as a black box.
