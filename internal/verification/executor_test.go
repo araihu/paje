@@ -63,7 +63,7 @@ func TestVerificationHelper(t *testing.T) {
 			os.Exit(4)
 		}
 		waitForParentReaped(parentPID)
-		if err := os.WriteFile(args[separator+3], []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		if err := os.WriteFile(args[separator+3], []byte(fmt.Sprintf("%d %d", os.Getpid(), parentPID)), 0o600); err != nil {
 			os.Exit(5)
 		}
 		waitForRelease(args[separator+4])
@@ -137,24 +137,39 @@ func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *t
 				results <- executor.Run(ctx, command, helperEnvironment())
 			}()
 			waitForFile(t, readyFile)
-			descendantPID := readPID(t, readyFile)
-			t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
-			releaseFD := openReleaseWriter(t, releaseFIFO)
-			releaseClosed := false
+			descendantPID, executorProcessGroupID := readBoundaryPIDs(t, readyFile)
+			releaseFD := -1
+			cleanupActive := true
 			t.Cleanup(func() {
-				if !releaseClosed {
-					_ = syscall.Close(releaseFD)
+				if cleanupActive {
+					_ = syscall.Kill(descendantPID, syscall.SIGKILL)
+					if releaseFD >= 0 {
+						_ = syscall.Close(releaseFD)
+					}
 				}
 			})
+			descendantProcessGroupID, err := syscall.Getpgid(descendantPID)
+			if err != nil {
+				t.Fatalf("Getpgid(%d) error = %v", descendantPID, err)
+			}
+			if descendantProcessGroupID == executorProcessGroupID {
+				t.Fatalf("pipe-holding descendant process group = executor process group %d", executorProcessGroupID)
+			}
+			releaseFD = openReleaseWriter(t, releaseFIFO)
 			complete()
-			if _, err := syscall.Write(releaseFD, []byte{1}); err != nil && !errors.Is(err, syscall.EPIPE) {
+			select {
+			case result := <-results:
+				t.Fatalf("Run returned before explicit descendant release: %#v", result)
+			default:
+			}
+			if _, err := syscall.Write(releaseFD, []byte{1}); err != nil {
 				t.Fatalf("Write(release FIFO) error = %v", err)
 			}
 			if err := syscall.Close(releaseFD); err != nil {
 				t.Fatalf("Close(release FIFO) error = %v", err)
 			}
-			releaseClosed = true
 			result := <-results
+			cleanupActive = false
 			if result.ExitCode != testCase.exitCode || result.FailureClass != testCase.failure || result.Passed {
 				t.Fatalf("result = %#v", result)
 			}
@@ -342,8 +357,14 @@ func helperEnvironmentList() []string {
 
 func writeDescendantPIDAndExit(t *testing.T, readyFile, releaseFIFO, action string, exitCode int) {
 	t.Helper()
-	child := exec.Command(os.Args[0], helperArgs(action, strconv.Itoa(os.Getpid()), readyFile, releaseFIFO)...)
+	child := exec.Command(os.Args[0], helperArgs(
+		action,
+		strconv.Itoa(os.Getpid()),
+		readyFile,
+		releaseFIFO,
+	)...)
 	child.Env = helperEnvironmentList()
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	if err := child.Start(); err != nil {
@@ -392,17 +413,25 @@ func waitForFile(t *testing.T, path string) {
 	}
 }
 
-func readPID(t *testing.T, path string) int {
+func readBoundaryPIDs(t *testing.T, path string) (int, int) {
 	t.Helper()
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(%q) error = %v", path, err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(contents)))
-	if err != nil {
-		t.Fatalf("Atoi(%q) error = %v", contents, err)
+	fields := strings.Fields(string(contents))
+	if len(fields) != 2 {
+		t.Fatalf("boundary PIDs = %q, want descendant and executor process group", contents)
 	}
-	return pid
+	descendantPID, err := strconv.Atoi(fields[0])
+	if err != nil {
+		t.Fatalf("Atoi(descendant %q) error = %v", fields[0], err)
+	}
+	executorProcessGroupID, err := strconv.Atoi(fields[1])
+	if err != nil {
+		t.Fatalf("Atoi(executor process group %q) error = %v", fields[1], err)
+	}
+	return descendantPID, executorProcessGroupID
 }
 
 func openReleaseWriter(t *testing.T, releaseFIFO string) int {
