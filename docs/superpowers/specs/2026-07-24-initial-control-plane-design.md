@@ -134,12 +134,16 @@ The initial daemon reads:
 - Hatchet's existing SDK environment variables for self-hosted endpoint and TLS
   behavior.
 - `PAJE_RUNNER_COMMAND`, defaulting to `codex`.
+- `PAJE_RUNNER_ARGS`, a JSON string array defaulting to `["exec"]`.
 - `PAJE_WORKSPACE_ROOT`, defaulting to the operating system temporary directory.
 - `MEM0_API_KEY` and optional `MEM0_BASE_URL` when the Mem0 adapter is selected.
 - `PAJE_MEMORY_ADAPTER`, supporting `mock` by default and `mem0` explicitly.
+- `PAJE_WORKSPACE_ADAPTER`, supporting `mock` by default and `git` explicitly.
+- `PAJE_RUNNER_ADAPTER`, supporting `mock` by default and `local` explicitly.
 
-The default mock memory adapter lets a newly built worker start with only a
-Hatchet token while the Mem0 adapter remains production-ready.
+The default mock adapters let a newly built worker start with only a Hatchet
+token, matching the initial scaffold requirement, while explicit configuration
+enables the production-ready Mem0, Git worktree, and local process adapters.
 
 ## Deployment
 
@@ -147,8 +151,8 @@ The repository includes:
 
 - A multi-stage, non-root Docker image containing the Pajé binary and Git.
 - A Helm chart for one worker Deployment, ConfigMap-driven non-secret settings,
-  Secret-driven Hatchet and Mem0 tokens, service account, probes, resource
-  settings, and optional PostgreSQL/Hatchet endpoint values.
+  Secret-driven Hatchet and Mem0 tokens, service account, resource settings, and
+  optional PostgreSQL/Hatchet endpoint values.
 - No bundled Hatchet Server or PostgreSQL chart dependency. Pajé connects to a
   separately managed self-hosted Hatchet installation, which keeps this chart's
   ownership focused on the worker daemon.
