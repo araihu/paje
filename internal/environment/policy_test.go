@@ -110,6 +110,50 @@ func TestPolicyBuildRejectsDeniedAndUnknownRequestedKeys(t *testing.T) {
 	}
 }
 
+func TestPolicyHardDeniesWorkerCredentialsEvenWhenAllowed(t *testing.T) {
+	credentials := []string{
+		"HATCHET_CLIENT_TOKEN",
+		"HATCHET_WORKER_TOKEN",
+		"MEM0_API_KEY",
+		"MEM0_SERVICE_TOKEN",
+	}
+	source := map[string]string{"PATH": "/tools"}
+	for _, key := range credentials {
+		source[key] = "secret"
+	}
+	policy, err := environment.NewPolicy(environment.Config{
+		RuntimeRoot: t.TempDir(),
+		Source:      source,
+		Allowed:     credentials,
+		CodexHome:   "/auth/codex",
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+
+	for _, stage := range []environment.Stage{environment.StageAgent, environment.StageVerification} {
+		t.Run(string(stage), func(t *testing.T) {
+			if _, err := policy.Build(context.Background(), environment.Request{
+				RunID:         "run-123",
+				Stage:         stage,
+				RequestedKeys: credentials,
+			}); err == nil {
+				t.Fatal("Build() error = nil, want hard credential denial")
+			}
+
+			result, err := policy.Build(context.Background(), environment.Request{RunID: "run-123", Stage: stage})
+			if err != nil {
+				t.Fatalf("Build(without credentials) error = %v", err)
+			}
+			for _, key := range credentials {
+				if _, found := result.Values[key]; found {
+					t.Errorf("Values unexpectedly contains hard-denied key %q", key)
+				}
+			}
+		})
+	}
+}
+
 func TestPolicyStagesKeepServiceCredentialsIsolated(t *testing.T) {
 	policy, err := environment.NewPolicy(environment.Config{
 		RuntimeRoot: t.TempDir(),
@@ -119,21 +163,40 @@ func TestPolicyStagesKeepServiceCredentialsIsolated(t *testing.T) {
 			"GITHUB_TOKEN": "github-secret",
 			"GH_TOKEN":     "gh-secret",
 		},
+		Allowed:   []string{"CODEX_HOME", "GITHUB_TOKEN", "GH_TOKEN"},
 		CodexHome: "/auth/codex",
 	})
 	if err != nil {
 		t.Fatalf("NewPolicy() error = %v", err)
 	}
 
-	for _, stage := range []environment.Stage{environment.StageVerification, environment.StagePublisher} {
+	for _, request := range []struct {
+		stage environment.Stage
+		key   string
+	}{
+		{stage: environment.StageAgent, key: "GITHUB_TOKEN"},
+		{stage: environment.StageVerification, key: "CODEX_HOME"},
+		{stage: environment.StageVerification, key: "GH_TOKEN"},
+		{stage: environment.StagePublisher, key: "CODEX_HOME"},
+	} {
+		if _, err := policy.Build(context.Background(), environment.Request{
+			RunID:         "run-123",
+			Stage:         request.stage,
+			RequestedKeys: []string{request.key},
+		}); err == nil {
+			t.Errorf("Build(%q, requested %q) error = nil, want stage-managed denial", request.stage, request.key)
+		}
+	}
+
+	for _, stage := range []environment.Stage{environment.StageAgent, environment.StageVerification, environment.StagePublisher} {
 		result, buildErr := policy.Build(context.Background(), environment.Request{RunID: "run-123", Stage: stage})
 		if buildErr != nil {
 			t.Fatalf("Build(%q) error = %v", stage, buildErr)
 		}
 		_, hasCodex := result.Values["CODEX_HOME"]
 		_, hasGitHub := result.Values["GITHUB_TOKEN"]
-		if hasCodex {
-			t.Errorf("Build(%q) unexpectedly contains CODEX_HOME", stage)
+		if got, want := hasCodex, stage == environment.StageAgent; got != want {
+			t.Errorf("Build(%q) CODEX_HOME present = %t, want %t", stage, got, want)
 		}
 		if got, want := hasGitHub, stage == environment.StagePublisher; got != want {
 			t.Errorf("Build(%q) GITHUB_TOKEN present = %t, want %t", stage, got, want)

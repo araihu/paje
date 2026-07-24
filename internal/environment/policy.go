@@ -43,6 +43,11 @@ var publisherCredentialKeys = []string{
 	"GITHUB_APP_PRIVATE_KEY",
 }
 
+var hardDeniedWorkerCredentialPrefixes = []string{
+	"HATCHET_",
+	"MEM0_",
+}
+
 // Stage identifies a bounded workflow execution stage.
 type Stage string
 
@@ -207,7 +212,10 @@ func (p *Policy) validateRequestedKeys(request Request) ([]string, error) {
 		if _, ok := p.allowed[key]; !ok {
 			return nil, fmt.Errorf("build environment: requested key %q is not allowed", key)
 		}
-		if isStageCredential(key) {
+		if isHardDeniedWorkerCredential(key) {
+			return nil, fmt.Errorf("build environment: requested key %q is a worker credential", key)
+		}
+		if isStageManagedKey(key) {
 			return nil, fmt.Errorf("build environment: requested key %q is stage-managed", key)
 		}
 		requested[key] = struct{}{}
@@ -235,16 +243,24 @@ func isBaselineKey(key string) bool {
 	return ok
 }
 
-func isStageCredential(key string) bool {
-	if key == "CODEX_HOME" || key == "HOME" || key == "TMPDIR" || key == "TMP" || key == "TEMP" {
-		return true
-	}
-	for _, credential := range publisherCredentialKeys {
-		if key == credential {
+func isHardDeniedWorkerCredential(key string) bool {
+	for _, prefix := range hardDeniedWorkerCredentialPrefixes {
+		if strings.HasPrefix(key, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+func isStageManagedKey(key string) bool {
+	if key == "CODEX_HOME" || key == "HOME" || key == "TMPDIR" || key == "TMP" || key == "TEMP" {
+		return true
+	}
+	return isGitHubCredential(key)
+}
+
+func isGitHubCredential(key string) bool {
+	return key == "GH_TOKEN" || strings.HasPrefix(key, "GITHUB_")
 }
 
 func sortedKeys(values map[string]string) []string {

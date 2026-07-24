@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/araihu/paje/internal/executil"
@@ -73,6 +74,15 @@ func (e *Executor) Run(ctx context.Context, command Command, values map[string]s
 	defer cancel()
 	cmd := exec.CommandContext(childCtx, command.Executable, command.Args...)
 	executil.Configure(cmd)
+	configuredCancel := cmd.Cancel
+	var cancellationTerminated atomic.Bool
+	cmd.Cancel = func() error {
+		err := configuredCancel()
+		if err == nil {
+			cancellationTerminated.Store(true)
+		}
+		return err
+	}
 	cmd.Dir = command.Directory
 	cmd.Env = environment
 	cmd.Stdout = output
@@ -93,23 +103,40 @@ func (e *Executor) Run(ctx context.Context, command Command, values map[string]s
 	if errors.As(waitErr, &exitErr) {
 		result.ExitCode = exitErr.ExitCode()
 	}
-	if err := ctx.Err(); err != nil {
-		return failedResult(result, failureCanceled, "caller_canceled", command.Required)
-	}
-	if errors.Is(childCtx.Err(), context.DeadlineExceeded) {
-		return failedResult(result, failureEnvironment, "timeout", command.Required)
-	}
 	if waitErr == nil {
 		result.Passed = true
 		return result
 	}
 	if errors.As(waitErr, &exitErr) {
-		if isDockerEnvironmentFailure(command.Executable, result.Output) {
-			return failedResult(result, failureEnvironment, "docker_unavailable", command.Required)
+		if exitErr.ExitCode() >= 0 {
+			return classifyExitFailure(result, command)
+		}
+		if cancellationTerminated.Load() || ctx.Err() != nil || errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+			return classifyCancellation(result, ctx, childCtx, command.Required)
 		}
 		return failedResult(result, failureVerification, "nonzero_exit", command.Required)
 	}
+	if cancellationTerminated.Load() || ctx.Err() != nil || errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+		return classifyCancellation(result, ctx, childCtx, command.Required)
+	}
 	return failedResult(result, failureInternal, "wait", command.Required)
+}
+
+func classifyCancellation(result Result, ctx, childCtx context.Context, required bool) Result {
+	if err := ctx.Err(); err != nil {
+		return failedResult(result, failureCanceled, "caller_canceled", required)
+	}
+	if errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+		return failedResult(result, failureEnvironment, "timeout", required)
+	}
+	return failedResult(result, failureInternal, "cancellation", required)
+}
+
+func classifyExitFailure(result Result, command Command) Result {
+	if isDockerEnvironmentFailure(command.Executable, result.Output) {
+		return failedResult(result, failureEnvironment, "docker_unavailable", command.Required)
+	}
+	return failedResult(result, failureVerification, "nonzero_exit", command.Required)
 }
 
 func (e *Executor) validateCommand(command Command) error {

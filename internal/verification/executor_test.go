@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,9 +34,14 @@ func TestVerificationHelper(t *testing.T) {
 	switch args[separator+1] {
 	case "exit-7":
 		os.Exit(7)
+	case "exit-7-with-descendant":
+		writeDescendantPIDAndExit(t, args[separator+2], "hold-short", 7)
 	case "docker-rootless":
 		fmt.Fprintln(os.Stderr, "rootless Docker not found")
 		os.Exit(1)
+	case "docker-rootless-with-descendant":
+		fmt.Fprintln(os.Stderr, "rootless Docker not found")
+		writeDescendantPIDAndExit(t, args[separator+2], "hold-short", 1)
 	case "docker-daemon":
 		fmt.Fprintln(os.Stderr, "Cannot connect to the Docker daemon")
 		os.Exit(1)
@@ -50,6 +56,8 @@ func TestVerificationHelper(t *testing.T) {
 		time.Sleep(10 * time.Second)
 	case "hold":
 		time.Sleep(10 * time.Second)
+	case "hold-short":
+		time.Sleep(500 * time.Millisecond)
 	default:
 		os.Exit(2)
 	}
@@ -69,6 +77,59 @@ func TestExecutorClassifiesCompletedNonzeroExit(t *testing.T) {
 	}, helperEnvironment())
 	if result.ExitCode != 7 || result.FailureClass != "verification" || result.Passed || result.Warning {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestExecutorPreservesCompletedExitClassificationAfterContextCompletion(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		context  func() (context.Context, func())
+		command  func(t *testing.T, workspace, pidFile string) verification.Command
+		failure  string
+		exitCode int
+	}{
+		{
+			name: "caller cancellation after exit seven",
+			context: func() (context.Context, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				return ctx, cancel
+			},
+			command: func(_ *testing.T, workspace, pidFile string) verification.Command {
+				return helperCommand(workspace, "exit-7-with-descendant", pidFile)
+			},
+			failure:  "verification",
+			exitCode: 7,
+		},
+		{
+			name: "caller deadline after docker diagnostic",
+			context: func() (context.Context, func()) {
+				ctx := newCompletionContext(context.DeadlineExceeded)
+				return ctx, ctx.complete
+			},
+			command: func(t *testing.T, workspace, pidFile string) verification.Command {
+				return dockerCommand(t, workspace, "docker-rootless-with-descendant", pidFile)
+			},
+			failure:  "environment",
+			exitCode: 1,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			pidFile := filepath.Join(workspace, "descendant.pid")
+			ctx, complete := testCase.context()
+			executor := newExecutor(t, 1024)
+			command := testCase.command(t, workspace, pidFile)
+			results := make(chan verification.Result, 1)
+			go func() {
+				results <- executor.Run(ctx, command, helperEnvironment())
+			}()
+			waitForFile(t, pidFile)
+			complete()
+			result := <-results
+			if result.ExitCode != testCase.exitCode || result.FailureClass != testCase.failure || result.Passed {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
 }
 
@@ -209,7 +270,7 @@ func helperEnvironment() map[string]string {
 	return map[string]string{"GO_WANT_VERIFY_HELPER": "1"}
 }
 
-func dockerCommand(t *testing.T, workspace, action string) verification.Command {
+func dockerCommand(t *testing.T, workspace, action string, args ...string) verification.Command {
 	t.Helper()
 	docker := filepath.Join(t.TempDir(), "docker")
 	if err := os.Symlink(os.Args[0], docker); err != nil {
@@ -219,8 +280,19 @@ func dockerCommand(t *testing.T, workspace, action string) verification.Command 
 		Name:       action,
 		Directory:  workspace,
 		Executable: docker,
-		Args:       helperArgs(action),
+		Args:       helperArgs(action, args...),
 		Timeout:    time.Second,
+	}
+}
+
+func helperCommand(workspace, action string, args ...string) verification.Command {
+	return verification.Command{
+		Name:       action,
+		Directory:  workspace,
+		Executable: os.Args[0],
+		Args:       helperArgs(action, args...),
+		Timeout:    5 * time.Second,
+		Required:   true,
 	}
 }
 
@@ -238,3 +310,54 @@ func mustStartHelper(t *testing.T, action string) *os.Process {
 func helperEnvironmentList() []string {
 	return []string{"GO_WANT_VERIFY_HELPER=1"}
 }
+
+func writeDescendantPIDAndExit(t *testing.T, pidFile, action string, exitCode int) {
+	t.Helper()
+	child := exec.Command(os.Args[0], helperArgs(action)...)
+	child.Env = helperEnvironmentList()
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		os.Exit(3)
+	}
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		os.Exit(3)
+	}
+	os.Exit(exitCode)
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %q", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type completionContext struct {
+	done chan struct{}
+	err  error
+}
+
+func newCompletionContext(err error) *completionContext {
+	return &completionContext{done: make(chan struct{}), err: err}
+}
+
+func (c *completionContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *completionContext) Done() <-chan struct{}       { return c.done }
+func (c *completionContext) Err() error {
+	select {
+	case <-c.done:
+		return c.err
+	default:
+		return nil
+	}
+}
+func (c *completionContext) Value(any) any { return nil }
+func (c *completionContext) complete()     { close(c.done) }
