@@ -18,6 +18,7 @@ import (
 
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/artifact/filesystem"
+	"github.com/araihu/paje/internal/runner"
 	"github.com/araihu/paje/internal/template"
 	"github.com/araihu/paje/internal/verification"
 )
@@ -159,10 +160,12 @@ func TestReferenceForCanonicalizesRawJSONAndSemanticallyUnorderedValues(t *testi
 	t.Parallel()
 	left := testBundle()
 	right := testBundle()
-	left.ExecutionMetadata = json.RawMessage(`{"completed":true,"duration":2.5,"exit_code":0}`)
-	right.ExecutionMetadata = json.RawMessage(` { "exit_code" : 0, "duration" : 2.5, "completed" : true } `)
+	left.ExecutionMetadata = json.RawMessage(`{"exit_code":0,"duration":2.5,"started":true,"completed":true,"truncated":false}`)
+	right.ExecutionMetadata = append(json.RawMessage(nil), left.ExecutionMetadata...)
 	right.Manifest.MemoryIDs = []string{"memory-z", "memory-a"}
 	right.Warnings = []string{"z warning", "a warning"}
+	left.Manifest.Changes = []artifact.Change{{Path: "z.go", Status: "modified"}, {Path: "a.go", Status: "added"}}
+	right.Manifest.Changes = []artifact.Change{{Path: "a.go", Status: "added"}, {Path: "z.go", Status: "modified"}}
 	leftRef, err := artifact.ReferenceFor(left)
 	if err != nil {
 		t.Fatal(err)
@@ -202,14 +205,31 @@ func TestReferenceForNormalizesNilEmptyAndRejectsUnsafeMetadataAndNumbers(t *tes
 	}
 
 	unsafe := testBundle()
-	unsafe.ExecutionMetadata = json.RawMessage(`{"completed":true,"environment":{"TOKEN":"secret"}}`)
+	unsafe.ExecutionMetadata = json.RawMessage(`{"exit_code":0,"duration":2.5,"started":true,"completed":true,"truncated":false,"environment":{"TOKEN":"secret"}}`)
 	if _, err := artifact.ReferenceFor(unsafe); !errors.Is(err, artifact.ErrInvalidBundle) {
 		t.Fatalf("unsafe metadata error = %v", err)
 	}
 	numeric := testBundle()
-	numeric.ExecutionMetadata = json.RawMessage(`{"completed":true,"duration":1.0}`)
+	numeric.ExecutionMetadata = json.RawMessage(`{"exit_code":0,"duration":1.0,"started":true,"completed":true,"truncated":false}`)
 	if _, err := artifact.ReferenceFor(numeric); !errors.Is(err, artifact.ErrInvalidBundle) {
 		t.Fatalf("noncanonical number error = %v", err)
+	}
+}
+
+func TestExecutionEvidenceFromTaskOneAndStrictWireForm(t *testing.T) {
+	t.Parallel()
+	evidence := artifact.ExecutionEvidenceFrom(runner.ExecutionResult{Transcript: "secret transcript", Output: "secret output", ExitCode: 7, Duration: 1.5, Started: true, Completed: true, Truncated: true})
+	if evidence != (artifact.ExecutionEvidence{ExitCode: 7, Duration: 1.5, Started: true, Completed: true, Truncated: true}) {
+		t.Fatalf("evidence = %#v", evidence)
+	}
+	bundle := testBundle()
+	bundle.ExecutionMetadata = json.RawMessage(`{"exit_code":7,"duration":1.5,"started":true,"completed":true,"truncated":true}`)
+	if _, err := artifact.ReferenceFor(bundle); err != nil {
+		t.Fatal(err)
+	}
+	bundle.ExecutionMetadata = json.RawMessage(`{"exit_code":7,"duration":1.5,"started":true,"completed":true,"truncated":true,"output":"secret"}`)
+	if _, err := artifact.ReferenceFor(bundle); !errors.Is(err, artifact.ErrInvalidBundle) {
+		t.Fatalf("unknown metadata field error = %v", err)
 	}
 }
 
@@ -309,7 +329,7 @@ func testBundle() artifact.Bundle {
 		Manifest:          artifact.Manifest{RunID: "run-123", Template: template.ID{Name: "code-change", Version: 1}, Repository: "https://example.test/repo.git", BaseSHA: strings.Repeat("a", 40), TreeSHA: strings.Repeat("b", 40), Changes: []artifact.Change{{Path: "main.go", Status: "modified", OldMode: "100644", NewMode: "100755"}}, MemoryIDs: []string{"memory-z", "memory-a"}, MemoryCount: 2},
 		ChangesPatch:      []byte("diff --git a/main.go b/main.go\n"),
 		AgentOutput:       []byte("agent output"),
-		ExecutionMetadata: json.RawMessage(`{"completed":true,"duration":2.5,"exit_code":0,"started":true,"truncated":false}`),
+		ExecutionMetadata: json.RawMessage(`{"exit_code":0,"duration":2.5,"started":true,"completed":true,"truncated":false}`),
 		Verification:      []verification.Result{{Command: verification.Command{Name: "go test", Directory: "/workspace", Executable: "go", Args: []string{"test", "./..."}, Environment: map[string]string{"GOWORK": "off"}, Timeout: time.Minute, Required: true}, ExitCode: 0, Duration: 2 * time.Second, Output: "ok", Passed: true}},
 		Preflight:         map[string]string{"tool:go": "available", "base_sha": "abc"},
 		Warnings:          []string{"z warning", "a warning"},

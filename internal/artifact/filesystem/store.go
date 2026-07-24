@@ -30,6 +30,10 @@ type Store struct {
 
 var _ artifact.Store = (*Store)(nil)
 
+// Close releases the descriptor anchoring this store. It is optional for the
+// artifact.Store interface but should be called by long-lived compositions.
+func (s *Store) Close() error { return s.root.Close() }
+
 // New creates a secure descriptor-anchored filesystem artifact store.
 func New(root string, maxCompressedBytes int64) (*Store, error) {
 	if maxCompressedBytes <= 0 || maxCompressedBytes > int64(^uint64(0)>>1)/16 {

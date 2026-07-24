@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/araihu/paje/internal/runner"
 	"github.com/araihu/paje/internal/template"
 	"github.com/araihu/paje/internal/verification"
 )
@@ -80,6 +81,22 @@ type Bundle struct {
 	Warnings          []string              `json:"warnings"`
 }
 
+// ExecutionEvidence is the only execution metadata permitted in an artifact.
+// Transcript and output are deliberately stored in their dedicated members.
+type ExecutionEvidence struct {
+	ExitCode  int     `json:"exit_code"`
+	Duration  float64 `json:"duration"`
+	Started   bool    `json:"started"`
+	Completed bool    `json:"completed"`
+	Truncated bool    `json:"truncated"`
+}
+
+// ExecutionEvidenceFrom converts Task 1's safe process outcome into artifact
+// metadata without carrying transcript or terminal output.
+func ExecutionEvidenceFrom(result runner.ExecutionResult) ExecutionEvidence {
+	return ExecutionEvidence{ExitCode: result.ExitCode, Duration: result.Duration, Started: result.Started, Completed: result.Completed, Truncated: result.Truncated}
+}
+
 // Store persists and verifies immutable bundles.
 type Store interface {
 	Save(context.Context, Bundle) (Reference, error)
@@ -125,6 +142,9 @@ func CanonicalizeLimited(ctx context.Context, bundle Bundle, maxTarBytes int64) 
 	if err := ctx.Err(); err != nil {
 		return Bundle{}, nil, Reference{}, err
 	}
+	if err := preflightBundleSize(ctx, bundle, maxTarBytes); err != nil {
+		return Bundle{}, nil, Reference{}, err
+	}
 	normalized, err := normalizeBundle(bundle)
 	if err != nil {
 		return Bundle{}, nil, Reference{}, err
@@ -147,6 +167,65 @@ func CanonicalizeLimited(ctx context.Context, bundle Bundle, maxTarBytes int64) 
 		return Bundle{}, nil, Reference{}, err
 	}
 	return normalized, tarBytes, Reference{RunID: normalized.Manifest.RunID, Digest: DigestTar(tarBytes), Size: int64(len(tarBytes))}, nil
+}
+
+// preflightBundleSize rejects hostile payloads before CloneBundle duplicates
+// their byte slices. The exact tar framing bound is enforced by writeTar.
+func preflightBundleSize(ctx context.Context, bundle Bundle, limit int64) error {
+	if limit <= 0 {
+		return nil
+	}
+	remaining := limit
+	consume := func(size int) error {
+		if size < 0 || int64(size) > remaining {
+			return ErrTooLarge
+		}
+		remaining -= int64(size)
+		return nil
+	}
+	for _, data := range [][]byte{bundle.ChangesPatch, bundle.AgentOutput, bundle.ExecutionMetadata} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := consume(len(data)); err != nil {
+			return err
+		}
+	}
+	for _, values := range [][]string{bundle.Manifest.MemoryIDs, bundle.Warnings} {
+		for _, value := range values {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := consume(len(value)); err != nil {
+				return err
+			}
+		}
+	}
+	for _, result := range bundle.Verification {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := consume(len(result.Output)); err != nil {
+			return err
+		}
+		for _, arg := range result.Command.Args {
+			if err := consume(len(arg)); err != nil {
+				return err
+			}
+		}
+	}
+	for key, value := range bundle.Preflight {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := consume(len(key)); err != nil {
+			return err
+		}
+		if err := consume(len(value)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DecodeCanonicalTar verifies the fixed member set and reconstructs a bundle.
@@ -395,8 +474,8 @@ var canonicalNumber = regexp.MustCompile(`^(0|[1-9][0-9]*|-[1-9][0-9]*)(\.[0-9]*
 
 func canonicalExecutionMetadata(raw []byte) ([]byte, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value map[string]any
+	decoder.DisallowUnknownFields()
+	var value ExecutionEvidence
 	if err := decoder.Decode(&value); err != nil {
 		return nil, err
 	}
@@ -404,43 +483,19 @@ func canonicalExecutionMetadata(raw []byte) ([]byte, error) {
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("multiple JSON values")
 	}
-	if err := validateExecutionObject(value); err != nil {
+	canonical, err := json.Marshal(value)
+	if err != nil {
 		return nil, err
 	}
-	var out bytes.Buffer
-	if err := writeJSON(&out, value); err != nil {
+	canonical, err = canonicalJSON(canonical)
+	if err != nil {
 		return nil, err
 	}
-	return out.Bytes(), nil
-}
-
-func validateExecutionObject(value map[string]any) error {
-	if len(value) == 0 {
-		return fmt.Errorf("execution metadata is empty")
+	input, err := canonicalJSON(raw)
+	if err != nil || !bytes.Equal(input, canonical) {
+		return nil, fmt.Errorf("execution metadata is not canonical")
 	}
-	allowed := map[string]struct{}{"exit_code": {}, "duration": {}, "started": {}, "completed": {}, "truncated": {}, "status": {}, "failure_class": {}, "cause_code": {}}
-	for key, item := range value {
-		if _, ok := allowed[key]; !ok || strings.Contains(strings.ToLower(key), "env") || strings.Contains(strings.ToLower(key), "secret") || strings.Contains(strings.ToLower(key), "token") || strings.Contains(strings.ToLower(key), "credential") || strings.Contains(strings.ToLower(key), "password") {
-			return fmt.Errorf("unsafe execution metadata key %q", key)
-		}
-		switch key {
-		case "started", "completed", "truncated":
-			if _, ok := item.(bool); !ok {
-				return fmt.Errorf("invalid execution metadata value for %q", key)
-			}
-		case "exit_code", "duration":
-			number, ok := item.(json.Number)
-			if !ok || !canonicalNumber.MatchString(number.String()) || (key == "exit_code" && strings.Contains(number.String(), ".")) {
-				return fmt.Errorf("non-canonical execution number for %q", key)
-			}
-		default:
-			text, ok := item.(string)
-			if !ok || len(text) > 128 {
-				return fmt.Errorf("invalid execution metadata value for %q", key)
-			}
-		}
-	}
-	return nil
+	return canonical, nil
 }
 
 func writeJSON(out *bytes.Buffer, value any) error {

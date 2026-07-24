@@ -85,6 +85,6 @@ func TestStoreFailuresAndConcurrentAccess(t *testing.T) {
 func mockBundle() artifact.Bundle {
 	return artifact.Bundle{
 		Manifest:     artifact.Manifest{RunID: "run-123", Template: template.ID{Name: "code-change", Version: 1}, Repository: "https://example.test/repo.git", BaseSHA: strings.Repeat("a", 40), TreeSHA: strings.Repeat("b", 40)},
-		ChangesPatch: []byte("patch"), AgentOutput: []byte("agent output"), ExecutionMetadata: json.RawMessage(`{"completed":true,"status":"done"}`), Preflight: map[string]string{"base_sha": "abc"},
+		ChangesPatch: []byte("patch"), AgentOutput: []byte("agent output"), ExecutionMetadata: json.RawMessage(`{"exit_code":0,"duration":1,"started":true,"completed":true,"truncated":false}`), Preflight: map[string]string{"base_sha": "abc"},
 	}
 }

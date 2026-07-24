@@ -60,6 +60,9 @@ func (s *Store) Save(ctx context.Context, bundle artifact.Bundle) (artifact.Refe
 	if err != nil {
 		return artifact.Reference{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return artifact.Reference{}, err
+	}
 	s.bundles[ref.Digest] = artifact.CloneBundle(normalized)
 	s.saves = append(s.saves, ref)
 	return ref, nil
