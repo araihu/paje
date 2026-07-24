@@ -40,8 +40,12 @@ type Command struct {
 	Directory  string
 	Executable string
 	Args       []string
-	Timeout    time.Duration
-	Required   bool
+	// Environment contains command-specific exact-environment overrides.
+	// It is intentionally separate from Args so callers never need shell syntax
+	// for values such as GOWORK=off.
+	Environment map[string]string
+	Timeout     time.Duration
+	Required    bool
 }
 
 // Result captures one bounded verification execution.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -61,7 +62,7 @@ func (e *Executor) Run(ctx context.Context, command Command, values map[string]s
 	if err := e.validateCommand(command); err != nil {
 		return failedResult(result, failureInternal, "invalid_command", command.Required)
 	}
-	environment, err := exactEnvironment(values)
+	environment, err := exactEnvironment(mergeEnvironment(values, command.Environment))
 	if err != nil {
 		return failedResult(result, failureInternal, "invalid_environment", command.Required)
 	}
@@ -72,7 +73,11 @@ func (e *Executor) Run(ctx context.Context, command Command, values map[string]s
 
 	childCtx, cancel := context.WithTimeout(ctx, command.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(childCtx, command.Executable, command.Args...)
+	executable, err := resolveExecutable(command.Executable, values, command.Environment)
+	if err != nil {
+		return failedResult(result, failureEnvironment, "start", command.Required)
+	}
+	cmd := exec.CommandContext(childCtx, executable, command.Args...)
 	executil.Configure(cmd)
 	configuredCancel := cmd.Cancel
 	var cancellationTerminated atomic.Bool
@@ -220,5 +225,44 @@ func exactEnvironment(values map[string]string) ([]string, error) {
 
 func copyCommand(command Command) Command {
 	command.Args = append([]string(nil), command.Args...)
+	if command.Environment != nil {
+		command.Environment = make(map[string]string, len(command.Environment))
+		for key, value := range command.Environment {
+			command.Environment[key] = value
+		}
+	}
 	return command
+}
+
+func mergeEnvironment(base, overrides map[string]string) map[string]string {
+	values := make(map[string]string, len(base)+len(overrides))
+	for key, value := range base {
+		values[key] = value
+	}
+	for key, value := range overrides {
+		values[key] = value
+	}
+	return values
+}
+
+func resolveExecutable(executable string, values, overrides map[string]string) (string, error) {
+	if strings.ContainsRune(executable, filepath.Separator) {
+		return executable, nil
+	}
+	environment := mergeEnvironment(values, overrides)
+	path, ok := environment["PATH"]
+	if !ok {
+		return "", exec.ErrNotFound
+	}
+	for _, directory := range filepath.SplitList(path) {
+		if directory == "" {
+			continue
+		}
+		candidate := filepath.Join(directory, executable)
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
 }

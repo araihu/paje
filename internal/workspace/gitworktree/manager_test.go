@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -22,11 +23,15 @@ func TestManagerPreparesIsolatedWorktreesAndCleansThem(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	first, err := manager.Prepare(context.Background(), source, "main")
+	revision, err := manager.Resolve(context.Background(), source, "refs/heads/main")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	first, err := manager.Prepare(context.Background(), source, revision.SHA)
 	if err != nil {
 		t.Fatalf("Prepare(first) error = %v", err)
 	}
-	second, err := manager.Prepare(context.Background(), source, "main")
+	second, err := manager.Prepare(context.Background(), source, revision.SHA)
 	if err != nil {
 		t.Fatalf("Prepare(second) error = %v", err)
 	}
@@ -74,18 +79,89 @@ func TestManagerValidatesInputs(t *testing.T) {
 	testCases := []struct {
 		name    string
 		repoURI string
-		branch  string
+		sha     string
 	}{
-		{name: "missing repository", branch: "main"},
-		{name: "missing branch", repoURI: "repository"},
+		{name: "missing repository", sha: strings.Repeat("a", 40)},
+		{name: "missing SHA", repoURI: "repository"},
+		{name: "non immutable SHA", repoURI: "repository", sha: "main"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := manager.Prepare(context.Background(), testCase.repoURI, testCase.branch); err == nil {
+			if _, err := manager.Prepare(context.Background(), testCase.repoURI, testCase.sha); err == nil {
 				t.Fatal("Prepare() error = nil, want validation error")
 			}
 		})
+	}
+}
+
+func TestManagerResolvesImmutableRemoteRevisionAndPreparesIt(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	source := newRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, "", "clone", "--bare", source, remote)
+	manager, err := gitworktree.New(filepath.Join(t.TempDir(), "paje-workspaces"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	revision, err := manager.Resolve(ctx, remote, "refs/heads/main")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if revision.RepositoryURI != remote || revision.Ref != "refs/heads/main" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(revision.SHA) || revision.SourceDirty {
+		t.Fatalf("revision = %#v", revision)
+	}
+	prepared, err := manager.Prepare(ctx, remote, revision.SHA)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	t.Cleanup(func() { _ = prepared.Cleanup(context.Background()) })
+	assertFileContent(t, filepath.Join(prepared.Path(), "file.txt"), "original")
+}
+
+func TestManagerResolveDetectsDirtyLocalSourceWithoutChangingHEAD(t *testing.T) {
+	requireGit(t)
+	source := newRepository(t)
+	before := gitOutput(t, source, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	manager, err := gitworktree.New(filepath.Join(t.TempDir(), "paje-workspaces"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	revision, err := manager.Resolve(context.Background(), source, "HEAD")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if !revision.SourceDirty || revision.SHA != before {
+		t.Fatalf("revision = %#v, want dirty source at %q", revision, before)
+	}
+	if after := gitOutput(t, source, "rev-parse", "HEAD"); after != before {
+		t.Fatalf("Resolve() changed source HEAD from %q to %q", before, after)
+	}
+}
+
+func TestManagerResolveRejectsUnsafeInputsBeforeGitArguments(t *testing.T) {
+	requireGit(t)
+	manager, err := gitworktree.New(filepath.Join(t.TempDir(), "paje-workspaces"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	source := newRepository(t)
+	for _, testCase := range []struct{ uri, ref string }{
+		{uri: "", ref: "HEAD"},
+		{uri: "-repository", ref: "HEAD"},
+		{uri: source, ref: ""},
+		{uri: source, ref: "-c"},
+		{uri: source, ref: "does-not-exist"},
+	} {
+		if _, err := manager.Resolve(context.Background(), testCase.uri, testCase.ref); err == nil {
+			t.Fatalf("Resolve(%q, %q) error = nil", testCase.uri, testCase.ref)
+		}
 	}
 }
 
@@ -118,6 +194,17 @@ func runGit(t *testing.T, directory string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s error = %v\n%s", strings.Join(args, " "), err, output)
 	}
+}
+
+func gitOutput(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("git %s error = %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func assertFileContent(t *testing.T, path, want string) {
