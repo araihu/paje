@@ -43,9 +43,12 @@ var publisherCredentialKeys = []string{
 	"GITHUB_APP_PRIVATE_KEY",
 }
 
-var hardDeniedWorkerCredentialPrefixes = []string{
+var hardDeniedEnvironmentPrefixes = []string{
 	"HATCHET_",
 	"MEM0_",
+	"GIT_",
+	"SSH_",
+	"PAJE_GIT_",
 }
 
 // Stage identifies a bounded workflow execution stage.
@@ -57,6 +60,7 @@ type Config struct {
 	Source      map[string]string
 	Allowed     []string
 	CodexHome   string
+	CodexAgent  bool
 }
 
 // Request identifies the stage and non-secret operator keys needed by a child.
@@ -86,6 +90,7 @@ type Policy struct {
 	source      map[string]string
 	allowed     map[string]struct{}
 	codexHome   string
+	codexAgent  bool
 }
 
 var _ Builder = (*Policy)(nil)
@@ -119,6 +124,7 @@ func NewPolicy(config Config) (*Policy, error) {
 		source:      source,
 		allowed:     allowed,
 		codexHome:   config.CodexHome,
+		codexAgent:  config.CodexAgent,
 	}, nil
 }
 
@@ -137,7 +143,7 @@ func (p *Policy) Build(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if request.Stage == StageAgent && strings.TrimSpace(p.codexHome) == "" {
+	if request.Stage == StageAgent && p.codexAgent && strings.TrimSpace(p.codexHome) == "" {
 		return Result{}, fmt.Errorf("build environment: Codex home is required for agent stage")
 	}
 
@@ -169,7 +175,9 @@ func (p *Policy) Build(ctx context.Context, request Request) (Result, error) {
 	}
 	switch request.Stage {
 	case StageAgent:
-		values["CODEX_HOME"] = p.codexHome
+		if p.codexAgent {
+			values["CODEX_HOME"] = p.codexHome
+		}
 	case StagePublisher:
 		for _, key := range publisherCredentialKeys {
 			if value, ok := p.source[key]; ok {
@@ -244,7 +252,7 @@ func isBaselineKey(key string) bool {
 }
 
 func isHardDeniedWorkerCredential(key string) bool {
-	for _, prefix := range hardDeniedWorkerCredentialPrefixes {
+	for _, prefix := range hardDeniedEnvironmentPrefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
 		}

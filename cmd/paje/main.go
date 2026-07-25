@@ -238,6 +238,7 @@ func buildBetaServices(cfg config.Config, dependencies *runtimeDependencies) err
 		Source:      cfg.Environment,
 		Allowed:     cfg.EnvironmentAllowlist,
 		CodexHome:   cfg.CodexHome,
+		CodexAgent:  cfg.RunnerAdapter == "codex",
 	})
 	if err != nil {
 		return fmt.Errorf("build environment policy: %w", err)

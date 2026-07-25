@@ -27,6 +27,7 @@ func TestPolicyBuildAgentEnvironmentIsAllowlistedAndRedacted(t *testing.T) {
 		Source:      source,
 		Allowed:     []string{"SAFE_CACHE"},
 		CodexHome:   "/auth/codex",
+		CodexAgent:  true,
 	})
 	if err != nil {
 		t.Fatalf("NewPolicy() error = %v", err)
@@ -110,6 +111,62 @@ func TestPolicyBuildRejectsDeniedAndUnknownRequestedKeys(t *testing.T) {
 	}
 }
 
+func TestPolicyBuildAgentWithoutCodexAuth(t *testing.T) {
+	policy, err := environment.NewPolicy(environment.Config{
+		RuntimeRoot: t.TempDir(),
+		Source:      map[string]string{"PATH": "/tools"},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+
+	result, err := policy.Build(context.Background(), environment.Request{
+		RunID: "run-mock-agent",
+		Stage: environment.StageAgent,
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v, want non-Codex agent environment", err)
+	}
+	if _, found := result.Values["CODEX_HOME"]; found {
+		t.Error("Values contains CODEX_HOME for a non-Codex agent")
+	}
+}
+
+func TestPolicyRejectsGitAndSSHCredentialChannels(t *testing.T) {
+	channels := []string{
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_SYSTEM",
+		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_KEY_0",
+		"GIT_CONFIG_VALUE_0",
+		"GIT_PROXY_COMMAND",
+		"GIT_SSH",
+		"GIT_SSH_COMMAND",
+		"SSH_AGENT_PID",
+		"SSH_AUTH_SOCK",
+	}
+	for _, key := range channels {
+		t.Run(key, func(t *testing.T) {
+			policy, err := environment.NewPolicy(environment.Config{
+				RuntimeRoot: t.TempDir(),
+				Source:      map[string]string{"PATH": "/tools", key: "credential-channel"},
+				Allowed:     []string{key},
+			})
+			if err != nil {
+				t.Fatalf("NewPolicy() error = %v", err)
+			}
+
+			if _, err := policy.Build(context.Background(), environment.Request{
+				RunID:         "run-verification",
+				Stage:         environment.StageVerification,
+				RequestedKeys: []string{key},
+			}); err == nil {
+				t.Fatalf("Build(requested %q) error = nil, want credential-channel rejection", key)
+			}
+		})
+	}
+}
+
 func TestPolicyHardDeniesWorkerCredentialsEvenWhenAllowed(t *testing.T) {
 	credentials := []string{
 		"HATCHET_CLIENT_TOKEN",
@@ -126,6 +183,7 @@ func TestPolicyHardDeniesWorkerCredentialsEvenWhenAllowed(t *testing.T) {
 		Source:      source,
 		Allowed:     credentials,
 		CodexHome:   "/auth/codex",
+		CodexAgent:  true,
 	})
 	if err != nil {
 		t.Fatalf("NewPolicy() error = %v", err)
@@ -163,8 +221,9 @@ func TestPolicyStagesKeepServiceCredentialsIsolated(t *testing.T) {
 			"GITHUB_TOKEN": "github-secret",
 			"GH_TOKEN":     "gh-secret",
 		},
-		Allowed:   []string{"CODEX_HOME", "GITHUB_TOKEN", "GH_TOKEN"},
-		CodexHome: "/auth/codex",
+		Allowed:    []string{"CODEX_HOME", "GITHUB_TOKEN", "GH_TOKEN"},
+		CodexHome:  "/auth/codex",
+		CodexAgent: true,
 	})
 	if err != nil {
 		t.Fatalf("NewPolicy() error = %v", err)

@@ -152,6 +152,50 @@ func TestBuildDependenciesIsolatesAgentEnvironment(t *testing.T) {
 	}
 }
 
+func TestBuildDependenciesMockAgentDoesNotRequireCodexHome(t *testing.T) {
+	t.Parallel()
+
+	dependencies, err := buildDependencies(mockConfig(t))
+	if err != nil {
+		t.Fatalf("buildDependencies() error = %v", err)
+	}
+	t.Cleanup(func() { _ = dependencies.Close() })
+
+	result, err := dependencies.environments.Build(context.Background(), environment.Request{
+		RunID: "run-mock-agent", Stage: environment.StageAgent,
+	})
+	if err != nil {
+		t.Fatalf("Build(agent environment) error = %v", err)
+	}
+	if _, found := result.Values["CODEX_HOME"]; found {
+		t.Error("mock agent environment contains CODEX_HOME")
+	}
+}
+
+func TestBuildDependenciesLocalAgentCannotReceiveCodexHome(t *testing.T) {
+	t.Parallel()
+
+	cfg := mockConfig(t)
+	cfg.RunnerAdapter = "local"
+	cfg.RunnerCommand = os.Args[0]
+	cfg.CodexHome = "/codex-home"
+	dependencies, err := buildDependencies(cfg)
+	if err != nil {
+		t.Fatalf("buildDependencies() error = %v", err)
+	}
+	t.Cleanup(func() { _ = dependencies.Close() })
+
+	result, err := dependencies.environments.Build(context.Background(), environment.Request{
+		RunID: "run-local-agent", Stage: environment.StageAgent,
+	})
+	if err != nil {
+		t.Fatalf("Build(agent environment) error = %v", err)
+	}
+	if _, found := result.Values["CODEX_HOME"]; found {
+		t.Error("local agent environment contains CODEX_HOME")
+	}
+}
+
 func TestBuildDependenciesReconstructsFilesystemStores(t *testing.T) {
 	t.Parallel()
 

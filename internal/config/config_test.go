@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -148,6 +149,44 @@ func TestLoadParsesBetaLimitsRootsAndEnvironmentAllowlist(t *testing.T) {
 	}
 	if got := cfg.Environment["HTTP_PROXY"]; got != values["HTTP_PROXY"] {
 		t.Errorf("Environment[HTTP_PROXY] = %q, want configured value", got)
+	}
+}
+
+func TestLoadRejectsGitAndSSHEnvironmentChannels(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_SYSTEM",
+		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_KEY_0",
+		"GIT_CONFIG_VALUE_0",
+		"GIT_PROXY_COMMAND",
+		"GIT_SSH",
+		"GIT_SSH_COMMAND",
+		"SSH_AGENT_PID",
+		"SSH_AUTH_SOCK",
+	} {
+		key := key
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+
+			encoded, err := json.Marshal([]string{key})
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+			_, err = config.Load(environment(map[string]string{
+				"HATCHET_CLIENT_TOKEN": "hatchet-token",
+				"PAJE_ENV_ALLOWLIST":   string(encoded),
+				key:                    "credential-channel",
+			}))
+			if err == nil {
+				t.Fatalf("Load(allowlist %q) error = nil, want credential-channel rejection", key)
+			}
+			if strings.Contains(err.Error(), "credential-channel") {
+				t.Fatalf("Load() error exposes environment value: %v", err)
+			}
+		})
 	}
 }
 

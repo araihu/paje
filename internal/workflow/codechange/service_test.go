@@ -44,7 +44,8 @@ func TestServiceArtifactOnlyRealGitFlowReloadsFilesystemStores(t *testing.T) {
 	runtimeRoot := t.TempDir()
 	envPolicy, err := environment.NewPolicy(environment.Config{
 		RuntimeRoot: runtimeRoot, Source: map[string]string{"PATH": os.Getenv("PATH")},
-		CodexHome: t.TempDir(),
+		CodexHome:  t.TempDir(),
+		CodexAgent: true,
 	})
 	if err != nil {
 		t.Fatal(err)

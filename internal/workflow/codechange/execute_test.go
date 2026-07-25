@@ -49,7 +49,8 @@ func TestExecuteUsesFreshRealWorktreeAndPersistsCompleteArtifact(t *testing.T) {
 			"PATH": os.Getenv("PATH"), "HATCHET_CLIENT_TOKEN": "hatchet-secret",
 			"MEM0_API_KEY": "mem0-secret", "GITHUB_TOKEN": "github-secret",
 		},
-		CodexHome: codexHome,
+		CodexHome:  codexHome,
+		CodexAgent: true,
 	})
 	if err != nil {
 		t.Fatalf("environment.NewPolicy() error = %v", err)

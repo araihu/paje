@@ -229,6 +229,7 @@ func selectedEnvironment(getenv func(string) string, allowlist []string) map[str
 func validateEnvironmentAllowlist(allowlist []string) error {
 	for _, key := range allowlist {
 		if strings.HasPrefix(key, "HATCHET_") || strings.HasPrefix(key, "MEM0_") ||
+			strings.HasPrefix(key, "GIT_") || strings.HasPrefix(key, "SSH_") ||
 			strings.HasPrefix(key, "GITHUB_") || strings.HasPrefix(key, "PAJE_GIT_") ||
 			key == "GH_TOKEN" || key == "GIT_ASKPASS" || key == "CODEX_HOME" ||
 			key == "HOME" || key == "TMPDIR" || key == "TMP" || key == "TEMP" {

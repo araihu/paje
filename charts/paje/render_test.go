@@ -191,6 +191,54 @@ func TestChartSchemaRejectsUnsafeRuntimeSelections(t *testing.T) {
 	}
 }
 
+func TestChartRejectsSharedActiveCredentialSecrets(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "Hatchet and Mem0",
+			args: []string{
+				"--set", "adapters.runner=mock",
+				"--set", "adapters.memory=mem0",
+				"--set", "secrets.hatchet.existingSecret=shared-credentials",
+				"--set", "secrets.mem0.existingSecret=shared-credentials",
+			},
+		},
+		{
+			name: "Hatchet and GitHub",
+			args: []string{
+				"--set", "adapters.runner=mock",
+				"--set", "publisher.adapter=github",
+				"--set", "secrets.hatchet.existingSecret=shared-credentials",
+				"--set", "secrets.github.existingSecret=shared-credentials",
+			},
+		},
+		{
+			name: "Mem0 and GitHub",
+			args: []string{
+				"--set", "adapters.runner=mock",
+				"--set", "adapters.memory=mem0",
+				"--set", "publisher.adapter=github",
+				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
+				"--set", "secrets.mem0.existingSecret=shared-credentials",
+				"--set", "secrets.github.existingSecret=shared-credentials",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output, err := helmTemplate(test.args...)
+			if err == nil {
+				t.Fatal("helm template error = nil, want shared active Secret rejection")
+			}
+			if !strings.Contains(output, "active credentials must use distinct Secrets") {
+				t.Fatalf("helm template output = %q, want separation error", output)
+			}
+		})
+	}
+}
+
 func renderChart(t *testing.T, args ...string) ([]map[string]any, string) {
 	t.Helper()
 	output, err := helmTemplate(args...)
