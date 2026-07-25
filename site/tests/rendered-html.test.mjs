@@ -27,6 +27,7 @@ test("server-renders the Pajé product site", async () => {
   assert.match(html, /Hooks e skills são a superfície de integração pretendida/i);
   assert.match(html, /Hoje, inicie.*paje-code-change-v1.*no Hatchet/is);
   assert.match(html, /independente da linguagem/i);
+  assert.match(html, /toolchain correspondente na imagem do worker/i);
   assert.match(html, /Codex é o primeiro harness/i);
   assert.match(html, /Outros harnesses serão suportados no futuro/i);
   assert.match(html, /profile: generic/i);

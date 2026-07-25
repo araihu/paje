@@ -52,7 +52,7 @@ const features = [
   {
     number: "02",
     title: "Linguagem neutra",
-    text: "O profile generic executa checks estruturados para qualquer stack. Go é a implementação do Pajé e um profile opcional, não um requisito do repositório.",
+    text: "O profile generic executa checks estruturados para qualquer stack disponível na imagem do worker. Go é a implementação e um profile opcional, não um requisito do repositório.",
     signal: "any stack",
   },
   {
@@ -318,7 +318,8 @@ export default function Home() {
                 </div>
                 <p>
                   Go 1.26+ é necessário apenas para desenvolver o Pajé, que é implementado em Go. O repositório atendido
-                  pode usar qualquer linguagem. No beta, prepare Docker, Helm 3, Hatchet e autenticação do Codex.
+                  pode usar qualquer linguagem; inclua o toolchain correspondente na imagem do worker. No beta, prepare
+                  Docker, Helm 3, Hatchet e autenticação do Codex.
                 </p>
                 <div className="requirement-list">
                   <span>Qualquer stack</span><span>Docker</span><span>Helm 3</span><span>Hatchet</span><span>Codex · primeiro harness</span>
@@ -347,8 +348,8 @@ export default function Home() {
                 </div>
                 <p>
                   Hoje, inicie <code>paje-code-change-v1</code> no Hatchet. A integração pretendida levará esse trigger para
-                  hooks e skills do harness. Use <code>profile: generic</code> com checks explícitos para qualquer linguagem;
-                  o profile <code>go</code> é só uma conveniência para descoberta de módulos e defaults de teste.
+                  hooks e skills do harness. Use <code>profile: generic</code> com checks explícitos e o toolchain presente
+                  na imagem. O profile <code>go</code> é só uma conveniência para descoberta de módulos e defaults de teste.
                 </p>
                 <div className="code-window code-window-light">
                   <div className="code-title"><span>workflow-input.json</span><code>json</code></div>
