@@ -516,6 +516,206 @@ func TestServiceFinalizeRejectsTamperedDurableApprovalBeforeMemoryAndResult(t *t
 	}
 }
 
+func TestServiceValidateDurableEvidenceRejectsIncompleteProviderMatrix(t *testing.T) {
+	tests := []struct {
+		name    string
+		fixture func(*testing.T) *serviceFixture
+		mutate  func(*run.Record)
+		wantErr bool
+	}{
+		{
+			name:    "artifact approval stage missing",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Stages = withoutStage(record.Stages, approvalStage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "artifact approval stage succeeded",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				setLatestStageStatus(record, approvalStage, run.StageSucceeded)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "artifact publish stage running",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				setLatestStageStatus(record, publishStage, run.StageRunning)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval succeeded without decision",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval pointer with skipped stage",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				setLatestStageStatus(record, approvalStage, run.StageSkipped)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval pointer with missing stage",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Stages = withoutStage(record.Stages, approvalStage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval pointer with failed stage",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				setLatestStageStatus(record, approvalStage, run.StageFailed)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish succeeded without result",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Publication = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publication pointer with skipped stage",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				setLatestStageStatus(record, publishStage, run.StageSkipped)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publication pointer with missing stage",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Stages = withoutStage(record.Stages, publishStage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publication pointer with running stage",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				setLatestStageStatus(record, publishStage, run.StageRunning)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publication without approval",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Stages = withoutStage(record.Stages, approvalStage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "duplicate latest approval evidence",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				stage, _ := latestStage(*record, approvalStage)
+				record.Stages = append(record.Stages, stage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "duplicate latest publication evidence",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				stage, _ := latestStage(*record, publishStage)
+				record.Stages = append(record.Stages, stage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "declined decision and stage match terminal status",
+			fixture: declinedServiceFixture,
+		},
+		{
+			name:    "declined status with approved decision",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusDeclined
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "declined decision outside declined status",
+			fixture: declinedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			record, err := fixture.runs.Load(context.Background(), "run-123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.mutate != nil {
+				test.mutate(&record)
+			}
+			input, err := validateRunBinding(record)
+			if err != nil {
+				t.Fatalf("validateRunBinding() error = %v", err)
+			}
+			err = fixture.service.validateDurableEvidence(context.Background(), record, input)
+			if test.wantErr && err == nil {
+				t.Fatalf("validateDurableEvidence() error = nil for record %#v", record)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validateDurableEvidence() error = %v", err)
+			}
+			_, resultErr := fixture.service.resultFromRecord(context.Background(), record)
+			if test.wantErr && resultErr == nil {
+				t.Fatalf("resultFromRecord() error = nil for record %#v", record)
+			}
+			if !test.wantErr && resultErr != nil {
+				t.Fatalf("resultFromRecord() error = %v", resultErr)
+			}
+		})
+	}
+}
+
+func TestServiceFinalizeRejectsFalseProviderStatusBeforeMemory(t *testing.T) {
+	fixture := artifactReadyServiceFixture(t)
+	outcomes := &outcomeMemory{}
+	fixture.service.memory = outcomes
+	fixture.service.runs = &mutateSaveResultStore{
+		Store: fixture.runs,
+		mutate: func(record run.Record) run.Record {
+			setLatestStageStatus(&record, approvalStage, run.StageSucceeded)
+			return record
+		},
+	}
+
+	result, err := fixture.service.Finalize(context.Background(), "run-123")
+	if err == nil || result.RunID != "run-123" || outcomes.SaveCount() != 0 {
+		t.Fatalf("Finalize(false provider status) result=%#v error=%v saves=%d",
+			result, err, outcomes.SaveCount())
+	}
+}
+
 func TestServiceRejectsUnsafePullRequestRepositoryBeforePorts(t *testing.T) {
 	for _, repositoryURI := range []string{
 		"/tmp/repository", "git@github.com:owner/repo.git",
@@ -914,6 +1114,17 @@ func completedServiceFixture(t *testing.T, mode string) *serviceFixture {
 	if _, err := fixture.service.Execute(context.Background(), "run-123"); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
+	if mode == "artifact" {
+		if _, err := fixture.service.Approval(
+			context.Background(), "run-123",
+			approvalmock.NewGate(approval.Result{}, errors.New("must not be called")),
+		); err != nil {
+			t.Fatalf("Approval(artifact) error = %v", err)
+		}
+		if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
+			t.Fatalf("Publish(artifact) error = %v", err)
+		}
+	}
 	return fixture
 }
 
@@ -929,6 +1140,65 @@ func approvedServiceFixture(t *testing.T) *serviceFixture {
 		t.Fatalf("Approval() error = %v", err)
 	}
 	return fixture
+}
+
+func publishedServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	fixture := approvedServiceFixture(t)
+	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
+		Provider: "github", Branch: "paje/code-change/run-123",
+		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
+		PullRequestURL: "https://example.test/pull/42",
+	}}}
+	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	return fixture
+}
+
+func artifactReadyServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	return completedServiceFixture(t, "artifact")
+}
+
+func declinedServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	fixture := completedServiceFixture(t, "pull_request")
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := approvalmock.NewGate(approval.Result{
+		RunID: record.ID, ArtifactDigest: record.Artifact.Digest,
+		Actor: "reviewer", DecidedAt: time.Unix(200, 0).UTC(), Reason: "needs changes",
+	}, nil)
+	if _, err := fixture.service.Approval(context.Background(), "run-123", gate); err != nil {
+		t.Fatalf("Approval() error = %v", err)
+	}
+	return fixture
+}
+
+func withoutStage(stages []run.StageResult, name string) []run.StageResult {
+	result := make([]run.StageResult, 0, len(stages))
+	for _, stage := range stages {
+		if stage.Name != name {
+			result = append(result, stage)
+		}
+	}
+	return result
+}
+
+func setLatestStageStatus(record *run.Record, name string, status run.StageStatus) {
+	latest, found := latestStage(*record, name)
+	if !found {
+		return
+	}
+	for index := range record.Stages {
+		if record.Stages[index].Name == name &&
+			record.Stages[index].Attempts == latest.Attempts {
+			record.Stages[index].Status = status
+		}
+	}
 }
 
 func (f *serviceFixture) publisherCalls() int {
@@ -1087,6 +1357,23 @@ type cancelOnEvidenceStore struct {
 	cancel   context.CancelFunc
 	evidence string
 	once     sync.Once
+}
+
+type mutateSaveResultStore struct {
+	run.Store
+	mutate func(run.Record) run.Record
+}
+
+func (s *mutateSaveResultStore) Save(
+	ctx context.Context,
+	record run.Record,
+	expected uint64,
+) (run.Record, error) {
+	saved, err := s.Store.Save(ctx, record, expected)
+	if err != nil {
+		return saved, err
+	}
+	return s.mutate(saved), nil
 }
 
 func (s *cancelOnEvidenceStore) Save(

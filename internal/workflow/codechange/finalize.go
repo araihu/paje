@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/araihu/paje/internal/approval"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/run"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
@@ -550,9 +551,21 @@ func (s *Service) validateDurableEvidence(
 	record run.Record,
 	input templatecodechange.Input,
 ) error {
+	approvalStageResult, approvalFound, err := uniqueLatestProviderStage(record, approvalStage)
+	if err != nil {
+		return err
+	}
+	publishStageResult, publishFound, err := uniqueLatestProviderStage(record, publishStage)
+	if err != nil {
+		return err
+	}
 	if record.Artifact == nil {
 		if record.Approval != nil || record.Publication != nil {
 			return fmt.Errorf("%w: durable decision lacks artifact", ErrRunBinding)
+		}
+		if (approvalFound && approvalStageResult.Status == run.StageSucceeded) ||
+			(publishFound && publishStageResult.Status == run.StageSucceeded) {
+			return fmt.Errorf("%w: provider success lacks artifact", ErrRunBinding)
 		}
 		return nil
 	}
@@ -563,29 +576,156 @@ func (s *Service) validateDurableEvidence(
 	if err := validateArtifactBinding(record, bundle); err != nil {
 		return err
 	}
-	if input.Publication.Mode != "pull_request" {
+	if input.Publication.Mode == "artifact" {
 		if record.Approval != nil || record.Publication != nil {
 			return fmt.Errorf("%w: artifact-only run contains publication evidence", ErrRunBinding)
 		}
-		return nil
-	}
-	approvalRequest := buildApprovalRequest(record, input, bundle)
-	if record.Approval != nil {
-		if err := validatePersistedApproval(record, approvalRequest); err != nil {
+		if err := validateArtifactSkipStage(approvalStageResult, approvalFound); err != nil {
 			return fmt.Errorf("%w: approval evidence: %v", ErrRunBinding, err)
 		}
-	}
-	if record.Publication != nil {
-		if record.Approval == nil || !record.Approval.Approved {
-			return fmt.Errorf("%w: publication lacks approved decision", ErrRunBinding)
-		}
-		request, err := buildPublisherRequest(record, input)
-		if err != nil {
-			return fmt.Errorf("%w: publisher request: %v", ErrRunBinding, err)
-		}
-		if err := validatePersistedPublication(record, request, input.Publication.Provider); err != nil {
+		if err := validateArtifactSkipStage(publishStageResult, publishFound); err != nil {
 			return fmt.Errorf("%w: publication evidence: %v", ErrRunBinding, err)
 		}
+		return nil
+	}
+	if input.Publication.Mode != "pull_request" {
+		return fmt.Errorf("%w: unsupported publication mode", ErrRunBinding)
+	}
+	approvalRequest := buildApprovalRequest(record, input, bundle)
+	if err := validatePullRequestApprovalEvidence(
+		record, approvalRequest, approvalStageResult, approvalFound,
+	); err != nil {
+		return fmt.Errorf("%w: approval evidence: %v", ErrRunBinding, err)
+	}
+	if err := validatePullRequestPublicationEvidence(
+		record, input, publishStageResult, publishFound,
+	); err != nil {
+		return fmt.Errorf("%w: publication evidence: %v", ErrRunBinding, err)
+	}
+	return nil
+}
+
+func uniqueLatestProviderStage(
+	record run.Record,
+	name string,
+) (run.StageResult, bool, error) {
+	var latest run.StageResult
+	found := false
+	count := 0
+	for _, stage := range record.Stages {
+		if stage.Name != name {
+			continue
+		}
+		switch {
+		case !found || stage.Attempts > latest.Attempts:
+			latest = stage
+			found = true
+			count = 1
+		case stage.Attempts == latest.Attempts:
+			count++
+		}
+	}
+	if count > 1 {
+		return run.StageResult{}, false, fmt.Errorf(
+			"%w: %s stage has ambiguous latest evidence", ErrRunBinding, name,
+		)
+	}
+	return latest, found, nil
+}
+
+func validateArtifactSkipStage(stage run.StageResult, found bool) error {
+	if !found {
+		return errors.New("skipped stage is missing")
+	}
+	if stage.Status != run.StageSkipped {
+		return fmt.Errorf("stage status is %q, want %q", stage.Status, run.StageSkipped)
+	}
+	if !sameStringMap(stage.Evidence, map[string]string{"publication_mode": "artifact"}) {
+		return errors.New("skip binding is missing or changed")
+	}
+	return nil
+}
+
+func validatePullRequestApprovalEvidence(
+	record run.Record,
+	request approval.Request,
+	stage run.StageResult,
+	found bool,
+) error {
+	if found && stage.Status == run.StageSkipped {
+		return errors.New("pull-request approval cannot be skipped")
+	}
+	switch {
+	case found && stage.Status == run.StageSucceeded && record.Approval == nil:
+		return errors.New("succeeded approval stage lacks decision")
+	case record.Approval != nil && (!found || stage.Status != run.StageSucceeded):
+		return errors.New("approval decision lacks succeeded stage")
+	case record.Status == run.StatusDeclined &&
+		(record.Approval == nil || record.Approval.Approved):
+		return errors.New("declined status lacks declined decision")
+	case record.Approval != nil && !record.Approval.Approved &&
+		record.Status != run.StatusDeclined:
+		return errors.New("declined decision requires declined status")
+	}
+	if record.Approval == nil {
+		if record.Status == run.StatusPublishing || record.Status == run.StatusSucceeded {
+			return errors.New("publication status lacks approved decision")
+		}
+		return nil
+	}
+	if err := record.Approval.Validate(request); err != nil {
+		return err
+	}
+	if !sameStringMap(stage.Evidence, approvalEvidence(request)) {
+		return errors.New("approval request binding changed")
+	}
+	if record.Status != run.StatusDeclined && !record.Approval.Approved {
+		return errors.New("approval decision is not approved")
+	}
+	return nil
+}
+
+func validatePullRequestPublicationEvidence(
+	record run.Record,
+	input templatecodechange.Input,
+	stage run.StageResult,
+	found bool,
+) error {
+	if record.Status == run.StatusDeclined {
+		if record.Publication != nil || found {
+			return errors.New("declined run contains publication evidence")
+		}
+		return nil
+	}
+	if found && stage.Status == run.StageSkipped {
+		return errors.New("pull-request publication cannot be skipped")
+	}
+	switch {
+	case found && stage.Status == run.StageSucceeded && record.Publication == nil:
+		return errors.New("succeeded publish stage lacks result")
+	case record.Publication != nil && (!found || stage.Status != run.StageSucceeded):
+		return errors.New("publication result lacks succeeded stage")
+	}
+	if record.Publication == nil {
+		if record.Status == run.StatusSucceeded {
+			return errors.New("successful run lacks publication result")
+		}
+		return nil
+	}
+	if record.Approval == nil || !record.Approval.Approved {
+		return errors.New("publication lacks approved decision")
+	}
+	request, err := buildPublisherRequest(record, input)
+	if err != nil {
+		return fmt.Errorf("publisher request: %v", err)
+	}
+	if err := validatePublicationResult(
+		*record.Publication, request, input.Publication.Provider,
+	); err != nil {
+		return err
+	}
+	if !sameStringMap(stage.Evidence, publicationEvidence(request, *record.Publication)) {
+		return errors.New("publication binding evidence is missing or changed")
 	}
 	return nil
 }
