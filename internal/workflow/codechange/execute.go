@@ -1116,6 +1116,9 @@ func encodeFindings(findings []policy.Finding) string {
 // Exhaust turns the named stage's latest retryable failure into durable,
 // terminal retry exhaustion evidence.
 func (s *Service) Exhaust(ctx context.Context, runID, stage string) (PhaseResult, error) {
+	if stage == finalizeStage {
+		return s.exhaustFinalize(ctx, runID)
+	}
 	record, err := s.runs.Load(ctx, runID)
 	if err != nil {
 		return phaseResult(record), err

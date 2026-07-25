@@ -93,6 +93,7 @@ type Service struct {
 	resolveLease        time.Duration
 	executeLease        time.Duration
 	artifactSaveTimeout time.Duration
+	finalizeLocks       *keyedMutex
 }
 
 // New validates and snapshots the workflow dependency bundle.
@@ -156,6 +157,7 @@ func New(dependencies Dependencies) (*Service, error) {
 		newID: dependencies.NewID, cleanupTimeout: defaultCleanupTimeout,
 		resolveLease: defaultResolveLease, executeLease: defaultExecuteLease,
 		artifactSaveTimeout: defaultArtifactSave,
+		finalizeLocks:       &keyedMutex{},
 	}, nil
 }
 
