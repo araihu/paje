@@ -1,0 +1,9 @@
+.git
+.gitignore
+.worktrees
+Dockerfile
+docs
+charts
+paje
+*.out
+coverage.*

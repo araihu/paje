@@ -1,0 +1,142 @@
+{{- include "paje.validateCredentialSecretSeparation" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "paje.fullname" . }}
+  labels:
+    {{- include "paje.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "paje.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "paje.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "paje.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if eq .Values.adapters.runner "codex" }}
+      initContainers:
+        - name: seed-codex-home
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              cp -R /codex-auth-seed/. /codex-home/
+              chmod -R go-rwx /codex-home
+          volumeMounts:
+            - name: codex-auth-seed
+              mountPath: /codex-auth-seed
+              readOnly: true
+            - name: codex-home
+              mountPath: /codex-home
+      {{- end }}
+      containers:
+        - name: paje
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "paje.fullname" . }}
+          env:
+            - name: HATCHET_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "paje.hatchetSecretName" . }}
+                  key: {{ .Values.secrets.hatchet.key }}
+            {{- if eq .Values.adapters.memory "mem0" }}
+            - name: MEM0_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "paje.mem0SecretName" . }}
+                  key: {{ .Values.secrets.mem0.key }}
+            {{- end }}
+            {{- if eq .Values.publisher.adapter "github" }}
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "paje.githubSecretName" . }}
+                  key: {{ .Values.secrets.github.key }}
+            {{- end }}
+            {{- if eq .Values.adapters.runner "codex" }}
+            - name: CODEX_HOME
+              value: /codex-home
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              {{- if .Values.persistence.enabled }}
+              mountPath: /var/lib/paje
+              {{- else }}
+              mountPath: {{ .Values.workspace.root }}
+              {{- end }}
+            - name: runtime
+              mountPath: /run/paje
+            - name: tmp
+              mountPath: /tmp
+            {{- if eq .Values.adapters.runner "codex" }}
+            - name: codex-home
+              mountPath: /codex-home
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "paje.pvcName" . }}
+          {{- else }}
+          emptyDir:
+            {{- with .Values.workspace.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+          {{- end }}
+        - name: runtime
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if eq .Values.adapters.runner "codex" }}
+        - name: codex-auth-seed
+          secret:
+            secretName: {{ required "codexAuth.existingSecret is required when adapters.runner=codex" .Values.codexAuth.existingSecret }}
+        - name: codex-home
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

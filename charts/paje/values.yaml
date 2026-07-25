@@ -1,0 +1,103 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/araihu/paje
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+
+adapters:
+  memory: mock
+  workspace: mock
+  runner: mock
+
+publisher:
+  adapter: mock
+  githubAPIURL: https://api.github.com
+
+workspace:
+  root: /workspace
+  sizeLimit: 10Gi
+
+persistence:
+  enabled: false
+  existingClaim: ""
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+limits:
+  artifactBytes: 10485760
+  commandOutputBytes: 1048576
+
+environment:
+  allowlist: []
+
+runner:
+  command: codex
+  args:
+    - exec
+
+mem0:
+  baseURL: ""
+
+hatchet:
+  hostPort: ""
+  serverURL: ""
+  namespace: ""
+  tlsStrategy: ""
+  logLevel: info
+
+secrets:
+  hatchet:
+    existingSecret: ""
+    key: hatchet-client-token
+    value: ""
+  mem0:
+    existingSecret: ""
+    key: mem0-api-key
+    value: ""
+  github:
+    existingSecret: ""
+    key: github-token
+    value: ""
+
+codexAuth:
+  existingSecret: ""
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+terminationGracePeriodSeconds: 60
+
+extraEnv: []
