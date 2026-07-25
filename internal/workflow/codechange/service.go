@@ -33,6 +33,7 @@ const (
 	defaultCleanupTimeout = 30 * time.Second
 	defaultResolveLease   = 5 * time.Minute
 	defaultExecuteLease   = 35 * time.Minute
+	defaultArtifactSave   = 2 * time.Minute
 )
 
 // ErrPhaseInProgress asks an outer adapter to retry rather than launch a
@@ -73,24 +74,25 @@ type PhaseResult struct {
 
 // Service implements the provider-neutral workflow phases.
 type Service struct {
-	templates      *template.Registry
-	runs           run.Store
-	memory         memory.Store
-	resolver       repository.Resolver
-	workspaces     workspace.Manager
-	profiles       map[string]repository.Profile
-	environments   environment.Builder
-	agent          runner.Runner
-	verifier       verification.Runner
-	capturer       gitcapture.Capturer
-	policy         policy.Evaluator
-	artifacts      artifact.Store
-	publisher      publisher.Publisher
-	clock          func() time.Time
-	newID          func() string
-	cleanupTimeout time.Duration
-	resolveLease   time.Duration
-	executeLease   time.Duration
+	templates           *template.Registry
+	runs                run.Store
+	memory              memory.Store
+	resolver            repository.Resolver
+	workspaces          workspace.Manager
+	profiles            map[string]repository.Profile
+	environments        environment.Builder
+	agent               runner.Runner
+	verifier            verification.Runner
+	capturer            gitcapture.Capturer
+	policy              policy.Evaluator
+	artifacts           artifact.Store
+	publisher           publisher.Publisher
+	clock               func() time.Time
+	newID               func() string
+	cleanupTimeout      time.Duration
+	resolveLease        time.Duration
+	executeLease        time.Duration
+	artifactSaveTimeout time.Duration
 }
 
 // New validates and snapshots the workflow dependency bundle.
@@ -153,6 +155,7 @@ func New(dependencies Dependencies) (*Service, error) {
 		publisher: dependencies.Publisher, clock: dependencies.Clock,
 		newID: dependencies.NewID, cleanupTimeout: defaultCleanupTimeout,
 		resolveLease: defaultResolveLease, executeLease: defaultExecuteLease,
+		artifactSaveTimeout: defaultArtifactSave,
 	}, nil
 }
 

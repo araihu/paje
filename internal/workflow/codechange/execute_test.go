@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -681,7 +683,7 @@ func TestExecuteCancellationAtFinalSaveIsCompensatedDurably(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.runs.saveCalls = 0
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 3 {
+		if call == 4 {
 			cancel()
 		}
 	}
@@ -706,11 +708,11 @@ func TestExecuteCancellationWithFinalSaveErrorStillCompensates(t *testing.T) {
 	fixture.runs.saveCalls = 0
 	finalSaveErr := errors.New("final save unavailable")
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 3 {
+		if call == 4 {
 			cancel()
 		}
 	}
-	fixture.runs.saveErrors = map[int]error{3: finalSaveErr}
+	fixture.runs.saveErrors = map[int]error{4: finalSaveErr}
 	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
 		return capturedChange(), nil
 	}
@@ -735,14 +737,14 @@ func TestExecuteCancellationAfterExhaustedFinalCASStillCompensates(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.runs.saveCalls = 0
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 3 {
+		if call == 4 {
 			cancel()
 		}
 	}
 	fixture.runs.saveErrors = map[int]error{
-		3: run.ErrVersionConflict,
 		4: run.ErrVersionConflict,
 		5: run.ErrVersionConflict,
+		6: run.ErrVersionConflict,
 	}
 	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
 		return capturedChange(), nil
@@ -770,11 +772,11 @@ func TestExecuteCancellationJoinsFinalAndCompensationSaveErrors(t *testing.T) {
 	finalSaveErr := errors.New("final save unavailable")
 	compensationErr := errors.New("compensation save unavailable")
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 3 {
+		if call == 4 {
 			cancel()
 		}
 	}
-	fixture.runs.saveErrors = map[int]error{3: finalSaveErr, 4: compensationErr}
+	fixture.runs.saveErrors = map[int]error{4: finalSaveErr, 5: compensationErr}
 	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
 		return capturedChange(), nil
 	}
@@ -783,6 +785,109 @@ func TestExecuteCancellationJoinsFinalAndCompensationSaveErrors(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || !errors.Is(err, finalSaveErr) ||
 		!errors.Is(err, compensationErr) || result.Artifact == nil {
 		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+}
+
+func TestExecuteLateCancellationAfterPersistedFailureWinsDurably(t *testing.T) {
+	tests := []struct {
+		name         string
+		failureClass run.FailureClass
+		configure    func(*serviceFixture)
+	}{
+		{
+			name: "nonretryable agent failure", failureClass: run.FailureAgent,
+			configure: func(fixture *serviceFixture) {
+				fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
+					return runner.ExecutionResult{ExitCode: 7, Started: true, Completed: true}, nil
+				}
+			},
+		},
+		{
+			name: "verification failure", failureClass: run.FailureVerification,
+			configure: func(fixture *serviceFixture) {
+				fixture.profile.result.Commands = []verification.Command{{
+					Name: "test", Directory: "/tmp/workspace", Executable: "go",
+					Args: []string{"test", "./..."}, Timeout: time.Minute, Required: true,
+				}}
+				fixture.verifier.run = func(_ context.Context, command verification.Command, _ map[string]string) verification.Result {
+					return verification.Result{
+						Command: command, FailureClass: "verification",
+						CauseCode: "test_failed",
+					}
+				}
+			},
+		},
+		{
+			name: "cleanup failure", failureClass: run.FailureCleanup,
+			configure: func(fixture *serviceFixture) {
+				fixture.service.workspaces = &fakeWorkspaceManager{
+					prepare: func(context.Context, string, string) (workspace.Workspace, error) {
+						return &fakeWorkspace{
+							path: "/tmp/workspace",
+							cleanup: func(context.Context) error {
+								return errors.New("cleanup failed")
+							},
+						}, nil
+					},
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			test.configure(fixture)
+			fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+				return capturedChange(), nil
+			}
+
+			var persistedFailure run.Record
+			fixture.runs.saveHook = func(_ int, candidate run.Record) {
+				if candidate.Status == run.StatusFailed && persistedFailure.ID == "" {
+					persistedFailure = run.CloneRecord(candidate)
+					cancel()
+				}
+			}
+
+			result, err := fixture.service.Execute(ctx, "run-123")
+			if !errors.Is(err, context.Canceled) || result.Status != run.StatusCanceled ||
+				result.FailureClass != run.FailureCanceled || result.Retryable {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			if persistedFailure.Status != run.StatusFailed ||
+				persistedFailure.Failure == nil ||
+				persistedFailure.Failure.Class != test.failureClass {
+				t.Fatalf("successfully persisted failure = %#v", persistedFailure)
+			}
+
+			record, loadErr := fixture.runs.Store.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if record.Status != run.StatusCanceled || record.Failure == nil ||
+				record.Failure.Class != run.FailureCanceled ||
+				record.Artifact == nil || !reflect.DeepEqual(record.Artifact, persistedFailure.Artifact) {
+				t.Fatalf("durable cancellation record = %#v", record)
+			}
+			if len(record.Stages) != len(persistedFailure.Stages)+1 ||
+				!reflect.DeepEqual(record.Stages[:len(persistedFailure.Stages)], persistedFailure.Stages) {
+				t.Fatalf("prior failure evidence was rewritten:\nbefore=%#v\nafter=%#v",
+					persistedFailure.Stages, record.Stages)
+			}
+			cancellation := record.Stages[len(record.Stages)-1]
+			owned, found := latestStage(persistedFailure, "execute")
+			if !found || cancellation.Name != run.ExecuteCancellationStage ||
+				cancellation.Status != run.StageFailed ||
+				cancellation.Failure == nil ||
+				cancellation.Failure.Class != run.FailureCanceled ||
+				cancellation.Evidence["execute_attempt"] != strconv.Itoa(owned.Attempts) ||
+				cancellation.Evidence["execute_started_at"] != owned.StartedAt.UTC().Format(time.RFC3339Nano) {
+				t.Fatalf("cancellation evidence = %#v, owned execute = %#v", cancellation, owned)
+			}
+		})
 	}
 }
 
@@ -961,7 +1066,7 @@ func TestExecuteArtifactCheckpointSurvivesFinalPersistenceCrash(t *testing.T) {
 	}
 	fixture.runs.saveCalls = 0
 	finalPersistErr := errors.New("worker lost before final run persistence")
-	fixture.runs.saveErrors = map[int]error{3: finalPersistErr}
+	fixture.runs.saveErrors = map[int]error{4: finalPersistErr}
 
 	result, err := fixture.service.Execute(context.Background(), "run-123")
 	if !errors.Is(err, finalPersistErr) {
@@ -1091,6 +1196,140 @@ func TestExecuteTakeoverBeforeArtifactSaveProducesNoOrphanArtifact(t *testing.T)
 	}
 	if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
 		t.Fatalf("stale Execute persisted orphan artifacts: %#v", saves)
+	}
+}
+
+func TestExecuteArtifactWriteSubleaseBlocksTakeoverAndExhaustUntilCheckpoint(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.executeLease = time.Minute
+	fixture.service.artifactSaveTimeout = 5 * time.Minute
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	saveDeadline := make(chan time.Time, 1)
+	fixture.service.artifacts = &artifactStoreFunc{
+		Store: fixture.artifacts,
+		save: func(ctx context.Context, bundle artifact.Bundle) (artifact.Reference, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				return artifact.Reference{}, errors.New("artifact Save context is unbounded")
+			}
+			saveDeadline <- deadline
+			close(saveStarted)
+			<-releaseSave
+			return fixture.artifacts.Save(ctx, bundle)
+		},
+	}
+
+	type response struct {
+		result PhaseResult
+		err    error
+	}
+	done := make(chan response, 1)
+	go func() {
+		result, err := fixture.service.Execute(context.Background(), "run-123")
+		done <- response{result: result, err: err}
+	}()
+	<-saveStarted
+
+	record, err := fixture.runs.Store.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, found := latestStage(record, "execute")
+	if !found || record.ArtifactWriteLease == nil ||
+		record.ArtifactWriteLease.Attempt != owned.Attempts ||
+		!record.ArtifactWriteLease.StartedAt.Equal(owned.StartedAt) ||
+		!record.ArtifactWriteLease.Deadline.After(clock.Now().Add(fixture.service.artifactSaveTimeout)) {
+		t.Fatalf("artifact-write sublease = %#v, execute = %#v", record.ArtifactWriteLease, owned)
+	}
+	if deadline := <-saveDeadline; time.Until(deadline) > fixture.service.artifactSaveTimeout ||
+		time.Until(deadline) < fixture.service.artifactSaveTimeout-time.Second {
+		t.Fatalf("artifact Save deadline = %v, timeout = %v", deadline, fixture.service.artifactSaveTimeout)
+	}
+
+	clock.Advance(2 * time.Minute)
+	exhausted, exhaustErr := fixture.service.Exhaust(context.Background(), "run-123", "execute")
+	if !errors.Is(exhaustErr, ErrPhaseInProgress) || exhausted.Status != run.StatusExecuting {
+		t.Fatalf("Exhaust(during Save) result=%#v error=%v", exhausted, exhaustErr)
+	}
+	taken, takeoverErr := fixture.service.Execute(context.Background(), "run-123")
+	if !errors.Is(takeoverErr, ErrPhaseInProgress) || taken.Status != run.StatusExecuting {
+		t.Fatalf("Execute(takeover during Save) result=%#v error=%v", taken, takeoverErr)
+	}
+
+	close(releaseSave)
+	completed := <-done
+	if completed.err != nil || completed.result.Artifact == nil ||
+		completed.result.Status != run.StatusExecuting {
+		t.Fatalf("Execute() result=%#v error=%v", completed.result, completed.err)
+	}
+	record, err = fixture.runs.Store.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ArtifactWriteLease != nil || record.Artifact == nil ||
+		*record.Artifact != *completed.result.Artifact ||
+		len(fixture.artifacts.Snapshot().Saves) != 1 {
+		t.Fatalf("checkpoint record=%#v saves=%#v", record, fixture.artifacts.Snapshot().Saves)
+	}
+}
+
+func TestExecutePostSaveOwnershipLossReturnsDurableOutcomeNotCheckpointFailure(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.executeLease = time.Minute
+	fixture.service.artifactSaveTimeout = 5 * time.Minute
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	var exhausted PhaseResult
+	var exhaustErr error
+	fixture.service.artifacts = &artifactStoreFunc{
+		Store: fixture.artifacts,
+		save: func(ctx context.Context, bundle artifact.Bundle) (artifact.Reference, error) {
+			reference, err := fixture.artifacts.Save(ctx, bundle)
+			if err != nil {
+				return artifact.Reference{}, err
+			}
+			record, loadErr := fixture.runs.Store.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				return artifact.Reference{}, loadErr
+			}
+			clock.Advance(record.ArtifactWriteLease.Deadline.Sub(clock.Now()) + time.Second)
+			exhausted, exhaustErr = fixture.service.Exhaust(context.Background(), "run-123", "execute")
+			return reference, nil
+		},
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if exhaustErr != nil || exhausted.Status != run.StatusFailed {
+		t.Fatalf("Exhaust(after Save) result=%#v error=%v", exhausted, exhaustErr)
+	}
+	if err == nil || result.Status != run.StatusFailed ||
+		result.FailureClass != run.FailureInternal || result.Artifact != nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	if strings.Contains(err.Error(), "artifact_checkpoint") ||
+		strings.Contains(err.Error(), "checkpoint artifact reference failed") {
+		t.Fatalf("ownership loss misclassified as checkpoint corruption: %v", err)
+	}
+	record, loadErr := fixture.runs.Store.Load(context.Background(), "run-123")
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if record.Failure == nil || record.Failure.CauseCode != "ambiguous_attempt" ||
+		record.Artifact != nil || record.ArtifactWriteLease != nil ||
+		len(fixture.artifacts.Snapshot().Saves) != 1 {
+		t.Fatalf("durable ownership-loss boundary record=%#v saves=%#v",
+			record, fixture.artifacts.Snapshot().Saves)
 	}
 }
 

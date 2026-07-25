@@ -71,6 +71,8 @@ const (
 	StageFailed    StageStatus = "failed"
 )
 
+const ExecuteCancellationStage = "execute-cancellation"
+
 type StageResult struct {
 	Name       string            `json:"name"`
 	Status     StageStatus       `json:"status"`
@@ -89,6 +91,17 @@ type Failure struct {
 	CauseCode  string       `json:"cause_code"`
 }
 
+// ArtifactWriteLease fences the single side effect that can outlive an
+// execute attempt's base worker lease. Reference binds the write to the exact
+// content-addressed artifact that may be checkpointed when the lease is
+// consumed.
+type ArtifactWriteLease struct {
+	Attempt   int                `json:"attempt"`
+	StartedAt time.Time          `json:"started_at"`
+	Deadline  time.Time          `json:"deadline"`
+	Reference artifact.Reference `json:"reference"`
+}
+
 type Record struct {
 	ID                 string              `json:"id"`
 	Version            uint64              `json:"version"`
@@ -102,6 +115,7 @@ type Record struct {
 	BaseRef            string              `json:"base_ref"`
 	BaseSHA            string              `json:"base_sha,omitempty"`
 	MemorySnapshot     []memory.Memory     `json:"memory_snapshot,omitempty"`
+	ArtifactWriteLease *ArtifactWriteLease `json:"artifact_write_lease,omitempty"`
 	Artifact           *artifact.Reference `json:"artifact,omitempty"`
 	Approval           *approval.Result    `json:"approval,omitempty"`
 	Publication        *publisher.Result   `json:"publication,omitempty"`
@@ -248,6 +262,10 @@ func CloneRecord(source Record) Record {
 	if source.Artifact != nil {
 		value := *source.Artifact
 		cloned.Artifact = &value
+	}
+	if source.ArtifactWriteLease != nil {
+		value := *source.ArtifactWriteLease
+		cloned.ArtifactWriteLease = &value
 	}
 	if source.Approval != nil {
 		value := *source.Approval

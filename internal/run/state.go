@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/araihu/paje/internal/artifact"
 )
 
 func Validate(record Record) error {
@@ -52,6 +54,9 @@ func Validate(record Record) error {
 	}
 	if record.Artifact != nil && record.Artifact.RunID != record.ID {
 		return invalidRecord("artifact run ID differs from record")
+	}
+	if err := validateArtifactWriteLease(record); err != nil {
+		return err
 	}
 	if record.Approval != nil {
 		if record.Artifact == nil {
@@ -148,6 +153,17 @@ func PrepareSave(current, next Record) (Record, error) {
 	if !SameImmutableIdentity(current, next) {
 		return Record{}, invalidRecord("immutable identity or input changed")
 	}
+	if current.Status == StatusFailed && next.Status == StatusCanceled {
+		if err := validateExecuteCancellationCompensation(current, next); err != nil {
+			return Record{}, err
+		}
+		if err := Validate(next); err != nil {
+			return Record{}, err
+		}
+		saved := CloneRecord(next)
+		saved.Version = current.Version + 1
+		return saved, nil
+	}
 	if current.Terminal() {
 		if err := validateTerminalUpdate(current, next); err != nil {
 			return Record{}, err
@@ -165,6 +181,9 @@ func PrepareSave(current, next Record) (Record, error) {
 	if next.UpdatedAt.Before(current.UpdatedAt) {
 		return Record{}, invalidRecord("updated time moved backward")
 	}
+	if err := validateArtifactWriteLeaseTransition(current, next); err != nil {
+		return Record{}, err
+	}
 	if current.Status != next.Status {
 		if current.Terminal() {
 			return Record{}, fmt.Errorf("%w: terminal status %q cannot change", ErrInvalidTransition, current.Status)
@@ -179,6 +198,133 @@ func PrepareSave(current, next Record) (Record, error) {
 	saved := CloneRecord(next)
 	saved.Version = current.Version + 1
 	return saved, nil
+}
+
+// CompensateExecuteCancellation constructs the only permitted terminal status
+// correction: a failed execute attempt may become canceled when the caller
+// cancellation was observed after the failure was durably committed. The
+// prior failed record remains an exact prefix of the compensated record.
+func CompensateExecuteCancellation(
+	record Record,
+	attempt int,
+	startedAt time.Time,
+	now time.Time,
+) (Record, error) {
+	if err := Validate(record); err != nil {
+		return Record{}, fmt.Errorf("compensate execute cancellation source: %w", err)
+	}
+	if record.Status != StatusFailed || record.Failure == nil ||
+		record.Failure.Stage != "execute" || record.Failure.Class == FailureCanceled ||
+		record.Failure.Retryable {
+		return Record{}, fmt.Errorf("%w: only a non-retryable execute failure can be compensated", ErrInvalidTransition)
+	}
+	latest, found := latestStage(record.Stages, "execute")
+	if !found || latest.Status != StageFailed || latest.Failure == nil ||
+		!reflect.DeepEqual(latest.Failure, record.Failure) ||
+		latest.Attempts != attempt || !latest.StartedAt.Equal(startedAt) {
+		return Record{}, fmt.Errorf("%w: execute cancellation ownership differs", ErrInvalidTransition)
+	}
+	if now.IsZero() || !now.After(record.UpdatedAt) {
+		return Record{}, fmt.Errorf("%w: execute cancellation time must advance", ErrInvalidTransition)
+	}
+	for _, stage := range record.Stages {
+		if stage.Name == ExecuteCancellationStage {
+			return Record{}, fmt.Errorf("%w: execute cancellation evidence already exists", ErrInvalidTransition)
+		}
+	}
+
+	failure := Failure{
+		Stage: ExecuteCancellationStage, Class: FailureCanceled, Retryable: false,
+		Diagnostic: "caller canceled", CauseCode: "caller_canceled",
+	}
+	next := CloneRecord(record)
+	next.Status = StatusCanceled
+	next.Failure = &failure
+	next.Stages = append(next.Stages, StageResult{
+		Name: ExecuteCancellationStage, Status: StageFailed,
+		StartedAt: now, FinishedAt: now, Attempts: 1,
+		Evidence: map[string]string{
+			"execute_attempt":    fmt.Sprintf("%d", attempt),
+			"execute_started_at": startedAt.UTC().Format(time.RFC3339Nano),
+		},
+		Failure: &failure,
+	})
+	next.UpdatedAt = now
+	if err := Validate(next); err != nil {
+		return Record{}, fmt.Errorf("compensate execute cancellation result: %w", err)
+	}
+	return next, nil
+}
+
+func validateExecuteCancellationCompensation(current, next Record) error {
+	latest, found := latestStage(current.Stages, "execute")
+	if !found {
+		return invalidRecord("terminal cancellation compensation lacks execute ownership")
+	}
+	expected, err := CompensateExecuteCancellation(
+		current, latest.Attempts, latest.StartedAt, next.UpdatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(expected, next) {
+		return invalidRecord("terminal cancellation compensation changed prior evidence")
+	}
+	return nil
+}
+
+func validateArtifactWriteLease(record Record) error {
+	lease := record.ArtifactWriteLease
+	if lease == nil {
+		return nil
+	}
+	if record.Terminal() {
+		return invalidRecord("terminal run retains artifact write lease")
+	}
+	if record.Artifact != nil {
+		return invalidRecord("checkpointed artifact retains write lease")
+	}
+	if lease.Attempt <= 0 || lease.StartedAt.IsZero() || lease.Deadline.IsZero() ||
+		!lease.Deadline.After(record.UpdatedAt) {
+		return invalidRecord("artifact write lease timing is invalid")
+	}
+	if lease.Reference.RunID != record.ID || lease.Reference.Size < 0 ||
+		!artifact.ValidDigest(lease.Reference.Digest) {
+		return invalidRecord("artifact write lease reference is invalid")
+	}
+	latest, found := latestStage(record.Stages, "execute")
+	if !found || latest.Status != StageRunning ||
+		latest.Attempts != lease.Attempt ||
+		!latest.StartedAt.Equal(lease.StartedAt) {
+		return invalidRecord("artifact write lease differs from running execute attempt")
+	}
+	return nil
+}
+
+func validateArtifactWriteLeaseTransition(current, next Record) error {
+	before, after := current.ArtifactWriteLease, next.ArtifactWriteLease
+	switch {
+	case before == nil && after == nil:
+		return nil
+	case before == nil:
+		if current.Artifact != nil || next.Artifact != nil {
+			return invalidRecord("artifact write lease cannot start after checkpoint")
+		}
+		return nil
+	case after != nil:
+		if before.Attempt != after.Attempt ||
+			!before.StartedAt.Equal(after.StartedAt) ||
+			before.Reference != after.Reference ||
+			after.Deadline.Before(before.Deadline) {
+			return invalidRecord("artifact write lease identity regressed")
+		}
+		return nil
+	default:
+		if next.Artifact != nil && *next.Artifact != before.Reference {
+			return invalidRecord("artifact checkpoint differs from write lease")
+		}
+		return nil
+	}
 }
 
 func UpsertStage(record Record, result StageResult) (Record, error) {

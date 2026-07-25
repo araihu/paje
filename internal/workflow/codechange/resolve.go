@@ -256,7 +256,12 @@ func (s *Service) beginStage(ctx context.Context, runID, name string, status run
 			if name == "execute" {
 				lease = s.executeLease
 			}
-			if !stageExpired(latest, s.clock(), lease) {
+			if !stageExpired(latest, s.clock(), lease) ||
+				(name == "execute" && activeArtifactWriteLease(
+					current,
+					stageOwnership{name: name, attempt: latest.Attempts, startedAt: latest.StartedAt},
+					s.clock(),
+				)) {
 				return current, false, nil
 			}
 			if name == "execute" {
@@ -268,6 +273,7 @@ func (s *Service) beginStage(ctx context.Context, runID, name string, status run
 				latest.FinishedAt = s.clock()
 				latest.Failure = &failure
 				next.Failure = &failure
+				next.ArtifactWriteLease = nil
 				var mutationErr error
 				next, mutationErr = run.UpsertStage(next, latest)
 				if mutationErr != nil {

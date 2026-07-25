@@ -87,19 +87,6 @@ func (s *Service) Execute(ctx context.Context, runID string) (PhaseResult, error
 
 	outcome := s.executePrepared(ctx, record, input, prepared.Path(), runtimeID, ownership)
 	outcome = outcome.withCancellation(ctx.Err())
-	if !outcome.ownershipLost && outcome.artifact != nil {
-		ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, runID, ownership)
-		if ownershipErr != nil || !owned {
-			outcome = outcome.withOwnershipLost(ownedRecord, ownershipErr)
-		} else if checkpointErr := s.checkpointArtifact(ctx, runID, ownership, *outcome.artifact); checkpointErr != nil {
-			failure := run.Failure{
-				Stage: "execute", Class: run.FailureInternal, Retryable: false,
-				Diagnostic: "checkpoint artifact reference failed", CauseCode: "artifact_checkpoint",
-			}
-			outcome = outcome.withFailure(failure, checkpointErr)
-		}
-	}
-	outcome = outcome.withCancellation(ctx.Err())
 	cleanupErr := s.cleanupAttempt(ctx, runtimeID, prepared)
 	if cleanupErr != nil {
 		outcome.cause = errors.Join(outcome.cause, cleanupErr)
@@ -304,10 +291,31 @@ func (s *Service) executePrepared(
 		}
 		return outcome.withFailure(failure, err)
 	}
-	if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, record.ID, ownership); ownershipErr != nil || !owned {
-		return outcome.withOwnershipLost(ownedRecord, ownershipErr)
+	expected, err := artifact.ReferenceFor(bundle)
+	if err != nil {
+		failure := run.Failure{
+			Stage: "execute", Class: run.FailureInternal,
+			Retryable: false, Diagnostic: "build artifact reference failed",
+			CauseCode: "artifact_encoding",
+		}
+		return outcome.withFailure(failure, err)
 	}
-	reference, err := s.artifacts.Save(ctx, bundle)
+	leased, err := s.acquireArtifactWrite(ctx, record.ID, ownership, expected)
+	if err != nil {
+		if errors.Is(err, ErrPhaseInProgress) {
+			return outcome.withOwnershipLost(leased, err)
+		}
+		failure := run.Failure{
+			Stage: "execute", Class: run.FailureInternal,
+			Retryable: false, Diagnostic: "acquire artifact write lease failed",
+			CauseCode: "artifact_lease",
+		}
+		return outcome.withFailure(failure, err)
+	}
+	saveCtx, cancelSave := context.WithTimeout(ctx, s.artifactSaveTimeout)
+	reference, err := s.artifacts.Save(saveCtx, bundle)
+	saveCtxErr := saveCtx.Err()
+	cancelSave()
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			return outcome.withFailure(canceledFailure("execute"), errors.Join(err, ctx.Err()))
@@ -316,6 +324,25 @@ func (s *Service) executePrepared(
 			Stage: "execute", Class: run.FailureInternal,
 			Retryable:  !outcome.execution.Completed,
 			Diagnostic: "persist artifact failed", CauseCode: "artifact_store",
+		}
+		return outcome.withFailure(failure, errors.Join(err, saveCtxErr))
+	}
+	if reference != expected {
+		failure := run.Failure{
+			Stage: "execute", Class: run.FailureInternal, Retryable: false,
+			Diagnostic: "artifact store returned an unexpected reference",
+			CauseCode:  "artifact_store",
+		}
+		return outcome.withFailure(failure, errors.New(failure.Diagnostic))
+	}
+	checkpoint, err := s.checkpointArtifact(ctx, record.ID, ownership, reference)
+	if err != nil {
+		if errors.Is(err, ErrPhaseInProgress) {
+			return outcome.withOwnershipLost(checkpoint, err)
+		}
+		failure := run.Failure{
+			Stage: "execute", Class: run.FailureInternal, Retryable: false,
+			Diagnostic: "checkpoint artifact reference failed", CauseCode: "artifact_checkpoint",
 		}
 		return outcome.withFailure(failure, err)
 	}
@@ -644,34 +671,74 @@ func (s *Service) cleanupAttempt(ctx context.Context, runID string, prepared wor
 	return errors.Join(runtimeErr, workspaceErr)
 }
 
+func (s *Service) acquireArtifactWrite(
+	ctx context.Context,
+	runID string,
+	ownership stageOwnership,
+	reference artifact.Reference,
+) (run.Record, error) {
+	persistCtx, cancel := context.WithTimeout(ctx, s.cleanupTimeout)
+	defer cancel()
+	return s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if !s.ownsStage(current, ownership) {
+			return current, false, ErrPhaseInProgress
+		}
+		if current.Artifact != nil {
+			return current, false, ErrPhaseInProgress
+		}
+		now := s.clock()
+		deadline := now.Add(s.artifactWriteLeaseDuration())
+		if current.ArtifactWriteLease != nil {
+			lease := current.ArtifactWriteLease
+			if !artifactWriteLeaseMatches(current, ownership, reference, now) {
+				return current, false, ErrPhaseInProgress
+			}
+			if !deadline.After(lease.Deadline) {
+				return current, false, nil
+			}
+		}
+		next := run.CloneRecord(current)
+		next.ArtifactWriteLease = &run.ArtifactWriteLease{
+			Attempt: ownership.attempt, StartedAt: ownership.startedAt,
+			Deadline: deadline, Reference: reference,
+		}
+		next.UpdatedAt = now
+		return next, true, nil
+	})
+}
+
 func (s *Service) checkpointArtifact(
 	ctx context.Context,
 	runID string,
 	ownership stageOwnership,
 	reference artifact.Reference,
-) error {
+) (run.Record, error) {
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	defer cancel()
-	_, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
-		if !s.ownsStage(current, ownership) {
+	return s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.Terminal() ||
+			!artifactWriteLeaseMatches(current, ownership, reference, s.clock()) {
 			return current, false, ErrPhaseInProgress
-		}
-		if current.Artifact != nil {
-			if *current.Artifact != reference {
-				return run.Record{}, false, fmt.Errorf("checkpoint artifact: durable reference differs")
-			}
-			return current, false, nil
-		}
-		if current.Terminal() {
-			return current, false, fmt.Errorf("checkpoint artifact: run is already terminal")
 		}
 		next := run.CloneRecord(current)
 		checkpoint := reference
 		next.Artifact = &checkpoint
+		next.ArtifactWriteLease = nil
 		next.UpdatedAt = s.clock()
 		return next, true, nil
 	})
-	return err
+}
+
+func (s *Service) artifactWriteLeaseDuration() time.Duration {
+	grace := s.cleanupTimeout
+	if grace <= 0 {
+		grace = time.Second
+	}
+	timeout := s.artifactSaveTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	return timeout + 2*grace
 }
 
 func (s *Service) finishExecute(
@@ -684,9 +751,14 @@ func (s *Service) finishExecute(
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	defer cancel()
 
+	var persistedFailure *run.Failure
 	record, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
 		outcome = outcome.withCancellation(ctx.Err())
-		if !s.ownsStage(current, ownership) {
+		owned := s.ownsStage(current, ownership)
+		if outcome.artifact != nil {
+			owned = ownsCheckpointedArtifact(current, ownership, *outcome.artifact)
+		}
+		if !owned {
 			return current, false, ErrPhaseInProgress
 		}
 		next := run.CloneRecord(current)
@@ -711,7 +783,9 @@ func (s *Service) finishExecute(
 			failure := *outcome.failure
 			stage.Failure = &failure
 			next.Failure = &failure
+			persistedFailure = &failure
 		}
+		next.ArtifactWriteLease = nil
 		next, mutationErr = run.UpsertStage(next, stage)
 		if mutationErr != nil {
 			return run.Record{}, false, mutationErr
@@ -732,7 +806,9 @@ func (s *Service) finishExecute(
 	outcome = outcome.withCancellation(ctx.Err())
 	if ctx.Err() != nil {
 		originalErr := err
-		compensated, compensationErr := s.persistLateCancellation(ctx, runID, ownership)
+		compensated, compensationErr := s.persistLateCancellation(
+			ctx, runID, ownership, persistedFailure,
+		)
 		if compensationErr == nil {
 			record = compensated
 		} else if record.ID == "" {
@@ -745,6 +821,11 @@ func (s *Service) finishExecute(
 			compensationErr = errors.Join(compensationErr, loadErr)
 		}
 		err = errors.Join(originalErr, compensationErr)
+	}
+	if errors.Is(err, ErrPhaseInProgress) {
+		return s.finishOwnershipLost(
+			ctx, runID, outcome.withOwnershipLost(record, err), nil,
+		)
 	}
 	if err != nil {
 		if outcome.failure == nil {
@@ -771,10 +852,55 @@ func (s *Service) ownsStage(record run.Record, ownership stageOwnership) bool {
 		return false
 	}
 	latest, found := latestStage(record, ownership.name)
+	if !found || latest.Status != run.StageRunning ||
+		latest.Attempts != ownership.attempt ||
+		!latest.StartedAt.Equal(ownership.startedAt) {
+		return false
+	}
+	return !stageExpired(latest, s.clock(), s.leaseFor(ownership.name)) ||
+		activeArtifactWriteLease(record, ownership, s.clock())
+}
+
+func activeArtifactWriteLease(
+	record run.Record,
+	ownership stageOwnership,
+	now time.Time,
+) bool {
+	lease := record.ArtifactWriteLease
+	return lease != nil &&
+		lease.Attempt == ownership.attempt &&
+		lease.StartedAt.Equal(ownership.startedAt) &&
+		now.Before(lease.Deadline)
+}
+
+func artifactWriteLeaseMatches(
+	record run.Record,
+	ownership stageOwnership,
+	reference artifact.Reference,
+	now time.Time,
+) bool {
+	return activeArtifactWriteLease(record, ownership, now) &&
+		record.ArtifactWriteLease.Reference == reference
+}
+
+func exactStageIdentity(record run.Record, ownership stageOwnership) bool {
+	if record.Terminal() {
+		return false
+	}
+	latest, found := latestStage(record, ownership.name)
 	return found && latest.Status == run.StageRunning &&
 		latest.Attempts == ownership.attempt &&
-		latest.StartedAt.Equal(ownership.startedAt) &&
-		!stageExpired(latest, s.clock(), s.leaseFor(ownership.name))
+		latest.StartedAt.Equal(ownership.startedAt)
+}
+
+func ownsCheckpointedArtifact(
+	record run.Record,
+	ownership stageOwnership,
+	reference artifact.Reference,
+) bool {
+	return exactStageIdentity(record, ownership) &&
+		record.Artifact != nil && *record.Artifact == reference &&
+		record.ArtifactWriteLease == nil
 }
 
 func (s *Service) leaseFor(stage string) time.Duration {
@@ -846,12 +972,30 @@ func (s *Service) persistLateCancellation(
 	ctx context.Context,
 	runID string,
 	ownership stageOwnership,
+	persistedFailure *run.Failure,
 ) (run.Record, error) {
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	defer cancel()
 	return s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
 		if current.Status == run.StatusCanceled {
 			return current, false, nil
+		}
+		if current.Status == run.StatusFailed {
+			if persistedFailure == nil || current.Failure == nil ||
+				*current.Failure != *persistedFailure {
+				return current, false, ErrPhaseInProgress
+			}
+			now := s.clock()
+			if !now.After(current.UpdatedAt) {
+				now = current.UpdatedAt.Add(time.Nanosecond)
+			}
+			next, err := run.CompensateExecuteCancellation(
+				current, ownership.attempt, ownership.startedAt, now,
+			)
+			if err != nil {
+				return run.Record{}, false, err
+			}
+			return next, true, nil
 		}
 		if current.Terminal() {
 			return current, false, fmt.Errorf("persist late cancellation: run is already terminal")
@@ -990,7 +1134,11 @@ func (s *Service) Exhaust(ctx context.Context, runID, stage string) (PhaseResult
 		}
 		latest, found := latestStage(current, stage)
 		if found && latest.Status == run.StageRunning {
-			if !stageExpired(latest, s.clock(), s.leaseFor(stage)) {
+			ownership := stageOwnership{
+				name: stage, attempt: latest.Attempts, startedAt: latest.StartedAt,
+			}
+			if !stageExpired(latest, s.clock(), s.leaseFor(stage)) ||
+				(stage == "execute" && activeArtifactWriteLease(current, ownership, s.clock())) {
 				inProgress = true
 				return current, false, nil
 			}
@@ -1003,6 +1151,7 @@ func (s *Service) Exhaust(ctx context.Context, runID, stage string) (PhaseResult
 			latest.FinishedAt = s.clock()
 			latest.Failure = &failure
 			next.Failure = &failure
+			next.ArtifactWriteLease = nil
 			var mutationErr error
 			next, mutationErr = run.UpsertStage(next, latest)
 			if mutationErr != nil {

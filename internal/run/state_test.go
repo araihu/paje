@@ -564,6 +564,115 @@ func TestPrepareSaveRejectsInsertionIntoHistoricalAttemptGap(t *testing.T) {
 	}
 }
 
+func TestCompensateExecuteCancellationPreservesTerminalFailureEvidence(t *testing.T) {
+	current := withFailure(validRecord(StatusFailed))
+	current.Failure.Retryable = false
+	current.Artifact = &artifact.Reference{
+		RunID: current.ID, Digest: strings.Repeat("a", 64), Size: 42,
+	}
+	executeFailure := *current.Failure
+	current.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt,
+		FinishedAt: current.UpdatedAt, Attempts: 2, Failure: &executeFailure,
+		Evidence: map[string]string{"original": "preserved"},
+	}}
+	now := current.UpdatedAt.Add(time.Minute)
+
+	next, err := CompensateExecuteCancellation(
+		current, 2, current.Stages[0].StartedAt, now,
+	)
+	if err != nil {
+		t.Fatalf("CompensateExecuteCancellation() error = %v", err)
+	}
+	if next.Status != StatusCanceled || next.Failure == nil ||
+		next.Failure.Class != FailureCanceled || len(next.Stages) != 2 ||
+		!reflect.DeepEqual(next.Stages[0], current.Stages[0]) ||
+		!reflect.DeepEqual(next.Artifact, current.Artifact) {
+		t.Fatalf("compensated record = %#v", next)
+	}
+	if _, err := PrepareSave(current, next); err != nil {
+		t.Fatalf("PrepareSave() rejected cancellation compensation: %v", err)
+	}
+}
+
+func TestCompensateExecuteCancellationRejectsOtherTerminalRunsAndOwnership(t *testing.T) {
+	base := withFailure(validRecord(StatusFailed))
+	base.Failure.Retryable = false
+	stageFailure := *base.Failure
+	base.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: base.CreatedAt,
+		FinishedAt: base.UpdatedAt, Attempts: 2, Failure: &stageFailure,
+	}}
+	now := base.UpdatedAt.Add(time.Minute)
+
+	tests := []struct {
+		name      string
+		record    Record
+		attempt   int
+		startedAt time.Time
+	}{
+		{name: "other attempt", record: base, attempt: 1, startedAt: base.CreatedAt},
+		{name: "other start", record: base, attempt: 2, startedAt: base.CreatedAt.Add(time.Second)},
+		{name: "succeeded", record: validRecord(StatusSucceeded), attempt: 2, startedAt: base.CreatedAt},
+		{name: "declined", record: validRecord(StatusDeclined), attempt: 2, startedAt: base.CreatedAt},
+		{name: "already canceled", record: withCanceledFailure(validRecord(StatusCanceled)), attempt: 2, startedAt: base.CreatedAt},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := CompensateExecuteCancellation(
+				test.record, test.attempt, test.startedAt, now,
+			); err == nil {
+				t.Fatal("CompensateExecuteCancellation() accepted unauthorized terminal rewrite")
+			}
+		})
+	}
+}
+
+func TestPrepareSaveRejectsTamperedFailedToCanceledCompensation(t *testing.T) {
+	current := withFailure(validRecord(StatusFailed))
+	current.Failure.Retryable = false
+	stageFailure := *current.Failure
+	current.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt,
+		FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &stageFailure,
+	}}
+	next, err := CompensateExecuteCancellation(
+		current, 1, current.CreatedAt, current.UpdatedAt.Add(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Record)
+	}{
+		{name: "rewritten prior evidence", mutate: func(record *Record) {
+			record.Stages[0].Failure.Diagnostic = "rewritten"
+		}},
+		{name: "wrong ownership evidence", mutate: func(record *Record) {
+			record.Stages[1].Evidence["execute_attempt"] = "99"
+		}},
+		{name: "extra stage", mutate: func(record *Record) {
+			record.Stages = append(record.Stages, record.Stages[1])
+		}},
+		{name: "artifact changed", mutate: func(record *Record) {
+			record.Artifact = &artifact.Reference{
+				RunID: record.ID, Digest: strings.Repeat("b", 64), Size: 1,
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tampered := CloneRecord(next)
+			test.mutate(&tampered)
+			if _, err := PrepareSave(current, tampered); err == nil {
+				t.Fatal("PrepareSave() accepted tampered terminal cancellation compensation")
+			}
+		})
+	}
+}
+
 func TestTerminalBookkeepingRequiresEligibleStatusAndAdvancedTime(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
