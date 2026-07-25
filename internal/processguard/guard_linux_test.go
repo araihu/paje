@@ -14,6 +14,9 @@ import (
 
 func TestHardenPreventsSameUIDChildFromReadingParentEnvironment(t *testing.T) {
 	if os.Getenv("PAJE_PROCESS_GUARD_HELPER") == "1" {
+		if err := dropPtraceCapability(); err != nil {
+			os.Exit(5)
+		}
 		parentPID, err := strconv.Atoi(os.Getenv("PAJE_PROCESS_GUARD_PARENT_PID"))
 		if err != nil {
 			os.Exit(2)
@@ -48,4 +51,21 @@ func TestHardenPreventsSameUIDChildFromReadingParentEnvironment(t *testing.T) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("same-UID child read parent environment: %v: %s", err, output)
 	}
+}
+
+func dropPtraceCapability() error {
+	header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	data := [2]unix.CapUserData{}
+	if err := unix.Capget(&header, &data[0]); err != nil {
+		return err
+	}
+	index := uint(unix.CAP_SYS_PTRACE) / 32
+	mask := ^(uint32(1) << (uint(unix.CAP_SYS_PTRACE) % 32))
+	data[index].Effective &= mask
+	data[index].Permitted &= mask
+	data[index].Inheritable &= mask
+	if err := unix.Capset(&header, &data[0]); err != nil {
+		return err
+	}
+	return unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_LOWER, uintptr(unix.CAP_SYS_PTRACE), 0, 0)
 }
