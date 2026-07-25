@@ -7,7 +7,7 @@ import (
 	"github.com/araihu/paje/internal/config"
 	"github.com/araihu/paje/internal/memory/mem0"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
-	"github.com/araihu/paje/internal/runner/codex"
+	codexrunner "github.com/araihu/paje/internal/runner/codex"
 	"github.com/araihu/paje/internal/runner/local"
 	runnermock "github.com/araihu/paje/internal/runner/mock"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
@@ -81,8 +81,8 @@ func TestBuildDependenciesUsesCodexRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildDependencies() error = %v", err)
 	}
-	if _, ok := dependencies.runner.(*codex.Runner); !ok {
-		t.Errorf("runner dependency = %T, want *runner/codex.Runner", dependencies.runner)
+	if _, ok := dependencies.runner.(*codexrunner.Runner); !ok {
+		t.Errorf("runner dependency = %T, want *codex.Runner", dependencies.runner)
 	}
 }
 

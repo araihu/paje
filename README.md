@@ -20,7 +20,7 @@ Pajé uses ports and adapters:
 - `internal/workspace`: workspace contract, mock, and isolated Git worktree
   manager.
 - `internal/runner`: black-box execution contract, mock, local `os/exec`
-  runner, and deterministic Codex CLI adapter.
+  runner, and deterministic Codex JSONL adapter.
 - `internal/approval`: human approval contract and mock. Approval is not yet
   part of the first pipeline.
 - `internal/workflow`: service-free orchestration plus the Hatchet task binding.
@@ -35,6 +35,7 @@ Kubernetes.
 
 - Go 1.26 or newer
 - Git for the real workspace adapter
+- An authenticated Codex CLI when the `codex` runner is selected
 - A Hatchet client token for the daemon
 - Docker and Helm 3 for container/Kubernetes packaging
 
@@ -51,6 +52,19 @@ Build the worker:
 ```bash
 go build ./cmd/paje
 ```
+
+Run the opt-in integration proof against the installed Codex CLI:
+
+```bash
+PAJE_CODEX_INTEGRATION=1 \
+  go test -count=1 -run TestCodexOrchestrationIntegration -v \
+  ./internal/workflow
+```
+
+The proof uses the real orchestration path: it retrieves an in-memory context
+record, creates a detached Git worktree, invokes authenticated Codex, extracts
+the terminal response, saves that result back to memory, and verifies worktree
+cleanup.
 
 Start it with all in-memory adapters:
 
@@ -77,15 +91,24 @@ export HATCHET_CLIENT_TLS_STRATEGY="none"
 | `PAJE_RUNNER_ADAPTER` | `mock` | `mock`, `local`, or `codex` |
 | `PAJE_WORKSPACE_ROOT` | OS temp directory | Mirror and worktree storage |
 | `PAJE_RUNNER_COMMAND` | `codex` | Local agent executable |
-| `PAJE_RUNNER_ARGS` | `["exec"]` | JSON array inserted before the task prompt |
+| `PAJE_RUNNER_ARGS` | `["exec"]` | Local-runner arguments inserted before the task prompt |
 | `MEM0_API_KEY` | empty | Required when memory is `mem0` |
 | `MEM0_BASE_URL` | `https://api.mem0.ai` | Optional Mem0 API origin |
 
 The local runner executes the configured binary directly; it does not invoke a
 shell. The task description is appended as the final argument. The Codex
-runner invokes `codex exec --json --ephemeral --ignore-user-config --sandbox
-workspace-write`, preserves its JSONL transcript, and exposes the final
-completed agent message as the workflow output.
+adapter ignores `PAJE_RUNNER_ARGS` and invokes:
+
+```text
+codex exec --json --ephemeral --ignore-user-config \
+  --sandbox workspace-write <task>
+```
+
+It preserves the bounded JSONL transcript, tolerates non-JSON diagnostics,
+returns the last completed agent message, and rejects a successful process that
+emits no terminal agent response. `--ignore-user-config` prevents ambient user
+plugins or hooks from changing an orchestrated run. Authentication can be
+supplied explicitly through the runner environment, including `CODEX_HOME`.
 
 Mem0 operations require at least one entity tag in each workflow input:
 `user_id`, `agent_id`, `app_id`, or `run_id`. Other tags are persisted and
@@ -147,8 +170,31 @@ helm upgrade --install paje charts/paje \
   --set hatchet.tlsStrategy=none
 ```
 
-Use a derived worker image containing the selected agent executable when
-`adapters.runner=local` or `adapters.runner=codex`.
+Use a derived worker image containing an authenticated Codex CLI when
+`adapters.runner=codex`; the base Pajé image intentionally contains only the
+worker and Git tooling.
+
+## Guardrails and known gaps
+
+Pajé currently prevents several recurring orchestration failures:
+
+- Git worktrees isolate parallel agents from one another.
+- Workflow cleanup runs even after cancellation or stage failure, and local
+  runner cancellation terminates the complete agent process group.
+- Mem0 context is retrieved before execution and the final result is saved for
+  later runs.
+- The Codex adapter separates the terminal answer from CLI diagnostics.
+- Configuration fails fast for missing Hatchet and Mem0 credentials.
+- Tests distinguish code readiness from image and Helm packaging readiness.
+
+The following controls are intentionally still open:
+
+- The initial `paje-agent-run` pipeline still saves only the agent result; the
+  durable code-change workflow owns artifact capture, approval, and publication.
+- Slack and CLI approval gateway adapters are not implemented yet.
+- Hatchet provides the durable execution substrate, but task-specific retry and
+  concurrency policies are not configured yet.
+- The base container does not bundle or authenticate Codex.
 
 ## Current scope
 

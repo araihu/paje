@@ -75,13 +75,16 @@ func TestLoadAcceptsCodexRunnerAdapter(t *testing.T) {
 
 	cfg, err := config.Load(environment(map[string]string{
 		"HATCHET_CLIENT_TOKEN": "hatchet-token",
-		"PAJE_RUNNER_ADAPTER":  "CODEX",
+		"PAJE_RUNNER_ADAPTER":  "CoDeX",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if cfg.RunnerAdapter != "codex" {
 		t.Errorf("RunnerAdapter = %q, want codex", cfg.RunnerAdapter)
+	}
+	if cfg.RunnerCommand != "codex" {
+		t.Errorf("RunnerCommand = %q, want codex", cfg.RunnerCommand)
 	}
 }
 
