@@ -379,9 +379,9 @@ func validateTerminalFailureEvidence(current, next Record) error {
 		return invalidRecord("terminal failure evidence is required")
 	}
 	nextLatest, found := latestStage(next.Stages, next.Failure.Stage)
-	if !found || !stageFinished(nextLatest) || nextLatest.Failure == nil ||
+	if !found || nextLatest.Status != StageFailed || nextLatest.Failure == nil ||
 		!reflect.DeepEqual(nextLatest.Failure, next.Failure) {
-		return invalidRecord("terminal failure is not bound to latest finished stage")
+		return invalidRecord("terminal failure is not bound to latest failed stage")
 	}
 	currentLatest, currentFound := latestStage(current.Stages, next.Failure.Stage)
 	if currentFound && stageFinished(currentLatest) && currentLatest.Failure != nil &&

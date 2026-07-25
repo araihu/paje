@@ -452,6 +452,36 @@ func TestPrepareSaveTerminalizesOnlyFromCurrentOrNewLatestFailureEvidence(t *tes
 	}
 }
 
+func TestPrepareSaveRejectsTerminalFailureEvidenceFromNonFailedStages(t *testing.T) {
+	t.Parallel()
+	for _, status := range []StageStatus{StageWarning, StageSucceeded, StageSkipped} {
+		t.Run(string(status), func(t *testing.T) {
+			current := validRecord(StatusExecuting)
+			current.Stages = []StageResult{{
+				Name: "execute", Status: StageRunning, StartedAt: current.CreatedAt, Attempts: 1,
+			}}
+
+			next := CloneRecord(current)
+			failure := Failure{
+				Stage: "execute", Class: FailureAgent, Diagnostic: "failed", CauseCode: "exit",
+			}
+			next.Failure = &failure
+			next.Stages[0].Status = status
+			next.Stages[0].FinishedAt = next.UpdatedAt
+			stageFailure := failure
+			next.Stages[0].Failure = &stageFailure
+			next, err := Transition(next, StatusFailed, next.UpdatedAt.Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := PrepareSave(current, next); err == nil {
+				t.Fatalf("PrepareSave() accepted terminal failure evidence from %q stage", status)
+			}
+		})
+	}
+}
+
 func TestPrepareSaveAllowsFailureBindingOnlyFromNewOrProgressedLatestAttempt(t *testing.T) {
 	t.Parallel()
 	baseFailure := Failure{Stage: "execute", Class: FailureAgent, Diagnostic: "failed", CauseCode: "exit"}
