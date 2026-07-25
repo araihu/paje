@@ -1,6 +1,7 @@
 package codechange
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -406,6 +407,175 @@ func TestExecuteChangePolicyDenialPersistsOnlySafeFindings(t *testing.T) {
 	}
 }
 
+func TestExecutePreservesCanonicalCapturePathsAndPatchAgreement(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	path := "docs/tmp/workspace/file.txt"
+	patch := []byte(
+		"diff --git a/" + path + " b/" + path + "\n" +
+			"new file mode 100644\n--- /dev/null\n+++ b/" + path + "\n" +
+			"@@ -0,0 +1 @@\n+safe\n",
+	)
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return gitcapture.Result{
+			Patch: patch,
+			Changes: []artifact.Change{{
+				Path: path, Status: "A", OldMode: "000000", NewMode: "100644",
+			}},
+			TreeSHA: "tree-sha",
+		}, nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err != nil || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	bundle := fixture.artifacts.Snapshot().Bundles[result.Artifact.Digest]
+	if len(bundle.Manifest.Changes) != 1 || bundle.Manifest.Changes[0].Path != path {
+		t.Fatalf("manifest paths = %#v, want exact capture path %q", bundle.Manifest.Changes, path)
+	}
+	if !bytes.Equal(bundle.ChangesPatch, patch) ||
+		!bytes.Contains(bundle.ChangesPatch, []byte("+++ b/"+bundle.Manifest.Changes[0].Path)) {
+		t.Fatalf("manifest/patch disagreement: change=%#v patch=%q", bundle.Manifest.Changes[0], bundle.ChangesPatch)
+	}
+}
+
+func TestExecuteRejectsNonCanonicalCapturedOldAndNewPaths(t *testing.T) {
+	tests := []artifact.Change{
+		{Path: "../escape.txt", Status: "M"},
+		{Path: "/absolute.txt", Status: "M"},
+		{Path: "dir/../file.txt", Status: "M"},
+		{Path: `dir\file.txt`, Status: "M"},
+		{Path: "new.txt", OldPath: "../old.txt", Status: "R"},
+	}
+	for _, change := range tests {
+		t.Run(change.Path+"-"+change.OldPath, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+				return gitcapture.Result{
+					Patch:   []byte("diff --git a/file.txt b/file.txt\n"),
+					Changes: []artifact.Change{change}, TreeSHA: "tree-sha",
+				}, nil
+			}
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || result.FailureClass != run.FailurePolicy ||
+				result.Retryable || result.Artifact != nil {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
+				t.Fatalf("unsafe path reached artifact store: %#v", saves)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsEphemeralAbsolutePathInPatchWithoutArtifact(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.capturer.capture = func(_ context.Context, request gitcapture.Request) (gitcapture.Result, error) {
+		return gitcapture.Result{
+			Patch: []byte(
+				"diff --git a/location.txt b/location.txt\n" +
+					"new file mode 100644\n--- /dev/null\n+++ b/location.txt\n" +
+					"@@ -0,0 +1 @@\n+" + request.Workspace + "\n",
+			),
+			Changes: []artifact.Change{{
+				Path: "location.txt", Status: "A", OldMode: "000000", NewMode: "100644",
+			}},
+			TreeSHA: "tree-sha",
+		}, nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err == nil || result.Retryable || result.Artifact != nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	if result.FailureClass != run.FailurePolicy && result.FailureClass != run.FailureInternal {
+		t.Fatalf("FailureClass = %q, want safe policy/internal failure", result.FailureClass)
+	}
+	if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
+		t.Fatalf("ephemeral patch reached artifact store: %#v", saves)
+	}
+}
+
+func TestExecuteDoesNotDeriveBroadCommonRuntimePrefix(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.env.build = func(_ context.Context, request environment.Request) (environment.Result, error) {
+		root := "/agent"
+		if request.Stage == environment.StageVerification {
+			root = "/verification"
+		}
+		return environment.Result{Values: map[string]string{
+			"PATH": "/bin", "HOME": root + "/home", "TMPDIR": root + "/tmp",
+			"TMP": root + "/tmp", "TEMP": root + "/tmp", "CODEX_HOME": "/safe/codex/home",
+		}}, nil
+	}
+	fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
+		return runner.ExecutionResult{
+			Output:  "kept /repository/path; used /agent/home/cache",
+			Started: true, Completed: true,
+		}, nil
+	}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err != nil || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	output := string(fixture.artifacts.Snapshot().Bundles[result.Artifact.Digest].AgentOutput)
+	if !strings.Contains(output, "/repository/path") ||
+		strings.Contains(output, "/agent/home") {
+		t.Fatalf("boundary scrubbed output = %q", output)
+	}
+}
+
+func TestExecuteRejectsUnsafeEphemeralScrubPrefixes(t *testing.T) {
+	for _, prefix := range []string{"/", "/tmp", "relative/home"} {
+		t.Run(prefix, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			fixture.env.build = func(context.Context, environment.Request) (environment.Result, error) {
+				return environment.Result{Values: map[string]string{
+					"PATH": "/bin", "HOME": prefix, "TMPDIR": "/safe/runtime/tmp",
+					"TMP": "/safe/runtime/tmp", "TEMP": "/safe/runtime/tmp", "CODEX_HOME": "/safe/codex/home",
+				}}, nil
+			}
+			fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+				return capturedChange(), nil
+			}
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || result.FailureClass != run.FailureInternal ||
+				result.Retryable || result.Artifact != nil {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
+				t.Fatalf("unsafe prefix reached artifact store: %#v", saves)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsDurableEvidenceKeyCollision(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.profile.result.Facts = map[string]string{
+		"/tmp/workspace": "workspace-key",
+		".":              "literal-key",
+	}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err == nil || result.FailureClass != run.FailureInternal ||
+		result.Retryable || result.Artifact != nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
+		t.Fatalf("colliding evidence reached artifact store: %#v", saves)
+	}
+}
+
 func TestExecuteCancellationCleansWithNonCanceledContext(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
 	cleanWorkspace := false
@@ -527,6 +697,92 @@ func TestExecuteCancellationAtFinalSaveIsCompensatedDurably(t *testing.T) {
 	record, _ := fixture.runs.Store.Load(context.Background(), "run-123")
 	if record.Status != run.StatusCanceled || record.Artifact == nil {
 		t.Fatalf("durable record = %#v", record)
+	}
+}
+
+func TestExecuteCancellationWithFinalSaveErrorStillCompensates(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture.runs.saveCalls = 0
+	finalSaveErr := errors.New("final save unavailable")
+	fixture.runs.saveHook = func(call int, _ run.Record) {
+		if call == 3 {
+			cancel()
+		}
+	}
+	fixture.runs.saveErrors = map[int]error{3: finalSaveErr}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(ctx, "run-123")
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, finalSaveErr) ||
+		result.Status != run.StatusCanceled || result.FailureClass != run.FailureCanceled ||
+		result.Retryable || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	record, _ := fixture.runs.Store.Load(context.Background(), "run-123")
+	latest, _ := latestStage(record, "execute")
+	if record.Status != run.StatusCanceled || latest.Attempts != 1 ||
+		latest.Status != run.StageFailed || latest.Failure == nil ||
+		latest.Failure.Class != run.FailureCanceled {
+		t.Fatalf("durable cancellation record = %#v", record)
+	}
+}
+
+func TestExecuteCancellationAfterExhaustedFinalCASStillCompensates(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture.runs.saveCalls = 0
+	fixture.runs.saveHook = func(call int, _ run.Record) {
+		if call == 3 {
+			cancel()
+		}
+	}
+	fixture.runs.saveErrors = map[int]error{
+		3: run.ErrVersionConflict,
+		4: run.ErrVersionConflict,
+		5: run.ErrVersionConflict,
+	}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(ctx, "run-123")
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, run.ErrVersionConflict) ||
+		result.Status != run.StatusCanceled || result.FailureClass != run.FailureCanceled ||
+		result.Retryable || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	record, _ := fixture.runs.Store.Load(context.Background(), "run-123")
+	latest, _ := latestStage(record, "execute")
+	if record.Status != run.StatusCanceled || latest.Attempts != 1 ||
+		latest.Status != run.StageFailed || latest.Failure == nil ||
+		latest.Failure.Class != run.FailureCanceled {
+		t.Fatalf("durable cancellation record = %#v", record)
+	}
+}
+
+func TestExecuteCancellationJoinsFinalAndCompensationSaveErrors(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture.runs.saveCalls = 0
+	finalSaveErr := errors.New("final save unavailable")
+	compensationErr := errors.New("compensation save unavailable")
+	fixture.runs.saveHook = func(call int, _ run.Record) {
+		if call == 3 {
+			cancel()
+		}
+	}
+	fixture.runs.saveErrors = map[int]error{3: finalSaveErr, 4: compensationErr}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(ctx, "run-123")
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, finalSaveErr) ||
+		!errors.Is(err, compensationErr) || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
 	}
 }
 
@@ -727,19 +983,114 @@ func TestExecuteArtifactCheckpointSurvivesFinalPersistenceCrash(t *testing.T) {
 	}
 }
 
-func TestExhaustFinalizesRunningAttemptInsteadOfLeavingItStuck(t *testing.T) {
+func TestExhaustWaitsForFreshRunningAttemptThenFailClosesExpiredLease(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.executeLease = time.Minute
 	if _, started, err := fixture.service.beginStage(context.Background(), "run-123", "execute", run.StatusExecuting); err != nil || !started {
 		t.Fatalf("beginStage() started=%t error=%v", started, err)
 	}
 
-	result, err := fixture.service.Exhaust(context.Background(), "run-123", "execute")
-	if err != nil || result.Status != run.StatusFailed || result.Retryable {
-		t.Fatalf("Exhaust() result=%#v error=%v", result, err)
+	fresh, err := fixture.service.Exhaust(context.Background(), "run-123", "execute")
+	if !errors.Is(err, ErrPhaseInProgress) || fresh.Status != run.StatusExecuting || !fresh.Retryable {
+		t.Fatalf("Exhaust(fresh) result=%#v error=%v", fresh, err)
 	}
 	record, _ := fixture.runs.Load(context.Background(), "run-123")
+	if !runningStageAttempt(record, "execute", 1) {
+		t.Fatalf("fresh Exhaust changed running stage: %#v", record.Stages)
+	}
+
+	clock.Advance(2 * time.Minute)
+	result, err := fixture.service.Exhaust(context.Background(), "run-123", "execute")
+	if err != nil || result.Status != run.StatusFailed || result.Retryable {
+		t.Fatalf("Exhaust(expired) result=%#v error=%v", result, err)
+	}
+	record, _ = fixture.runs.Load(context.Background(), "run-123")
 	if record.Failure == nil || record.Failure.CauseCode != "ambiguous_attempt" {
 		t.Fatalf("Exhaust() failure = %#v", record.Failure)
+	}
+}
+
+func TestExecuteTakeoverDuringAgentFencesStaleWorkerBeforeVerificationAndArtifact(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.executeLease = time.Minute
+	agentStarted := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
+		close(agentStarted)
+		<-releaseAgent
+		return runner.ExecutionResult{Output: "stale", Started: true, Completed: true}, nil
+	}
+	verifyCalls := 0
+	fixture.profile.result.Commands = []verification.Command{{
+		Name: "must-not-run", Directory: "/tmp/workspace", Executable: "git",
+		Timeout: time.Minute, Required: true,
+	}}
+	fixture.verifier.run = func(context.Context, verification.Command, map[string]string) verification.Result {
+		verifyCalls++
+		return verification.Result{Passed: true}
+	}
+	captureCalls := 0
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		captureCalls++
+		return capturedChange(), nil
+	}
+	type response struct {
+		result PhaseResult
+		err    error
+	}
+	done := make(chan response, 1)
+	go func() {
+		result, err := fixture.service.Execute(context.Background(), "run-123")
+		done <- response{result: result, err: err}
+	}()
+	<-agentStarted
+	clock.Advance(2 * time.Minute)
+	taken, err := fixture.service.Exhaust(context.Background(), "run-123", "execute")
+	if err != nil || taken.Status != run.StatusFailed {
+		t.Fatalf("Exhaust(takeover) result=%#v error=%v", taken, err)
+	}
+	close(releaseAgent)
+
+	stale := <-done
+	if stale.err == nil || stale.result.Status != run.StatusFailed {
+		t.Fatalf("stale Execute() result=%#v error=%v", stale.result, stale.err)
+	}
+	if verifyCalls != 0 || captureCalls != 0 || len(fixture.artifacts.Snapshot().Saves) != 0 {
+		t.Fatalf("stale side effects verification=%d capture=%d artifacts=%d",
+			verifyCalls, captureCalls, len(fixture.artifacts.Snapshot().Saves))
+	}
+	record, _ := fixture.runs.Store.Load(context.Background(), "run-123")
+	if record.Failure == nil || record.Failure.CauseCode != "ambiguous_attempt" || record.Artifact != nil {
+		t.Fatalf("terminal takeover record = %#v", record)
+	}
+}
+
+func TestExecuteTakeoverBeforeArtifactSaveProducesNoOrphanArtifact(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.executeLease = time.Minute
+	var takeover PhaseResult
+	var takeoverErr error
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		clock.Advance(2 * time.Minute)
+		takeover, takeoverErr = fixture.service.Exhaust(context.Background(), "run-123", "execute")
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if takeoverErr != nil || takeover.Status != run.StatusFailed {
+		t.Fatalf("Exhaust(takeover) result=%#v error=%v", takeover, takeoverErr)
+	}
+	if err == nil || result.Status != run.StatusFailed {
+		t.Fatalf("stale Execute() result=%#v error=%v", result, err)
+	}
+	if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
+		t.Fatalf("stale Execute persisted orphan artifacts: %#v", saves)
 	}
 }
 
@@ -761,7 +1112,6 @@ func (*workspaceProfile) Inspect(_ context.Context, request repository.ProfileRe
 		Facts: map[string]string{
 			"zeta": "last", "alpha": "first",
 			"workspace": request.Workspace, "runtime_home": request.Environment["HOME"],
-			"runtime_run_root": filepath.Dir(filepath.Dir(request.Environment["HOME"])),
 		},
 		Warnings: []string{"optional dependency unavailable at " + request.Environment["TMPDIR"]},
 		Modules:  []string{"module-a", "module-b"},

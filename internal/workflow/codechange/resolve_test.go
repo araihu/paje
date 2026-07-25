@@ -667,7 +667,7 @@ func (e *fakeEnvironment) Build(ctx context.Context, req environment.Request) (e
 	if e.build != nil {
 		return e.build(ctx, req)
 	}
-	return environment.Result{Values: map[string]string{"PATH": "/bin", "CODEX_HOME": "/codex"}}, nil
+	return environment.Result{Values: map[string]string{"PATH": "/bin", "CODEX_HOME": "/runtime/codex"}}, nil
 }
 func (e *fakeEnvironment) Cleanup(ctx context.Context, runID string) error {
 	e.cleanupCalls++
