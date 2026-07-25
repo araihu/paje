@@ -20,11 +20,18 @@ test("server-renders the Pajé product site", async () => {
 
   const html = await response.text();
   assert.match(html, /<html[^>]*lang="pt-BR"/i);
-  assert.match(html, /<title>Pajé — Orquestração durável para agentes de código<\/title>/i);
+  assert.match(html, /<title>Pajé — Orquestração durável pilotada pelo agente<\/title>/i);
   assert.match(html, /Do pedido ao pull request/);
   assert.match(html, /code-change@v1/);
+  assert.match(html, /pilotado pelo próprio agente via hooks e skills/i);
+  assert.match(html, /Hooks e skills são a superfície de integração pretendida/i);
+  assert.match(html, /Hoje, inicie.*paje-code-change-v1.*no Hatchet/is);
+  assert.match(html, /independente da linguagem/i);
+  assert.match(html, /Codex é o primeiro harness/i);
+  assert.match(html, /Outros harnesses serão suportados no futuro/i);
+  assert.match(html, /profile: generic/i);
   assert.match(html, /Guia rápido/);
   assert.match(html, /https:\/\/github\.com\/araihu\/paje/);
   assert.match(html, /https:\/\/paje\.araihu\.com\/og\.png/);
-  assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
+  assert.doesNotMatch(html, /Go-native|Go de verdade|codex-preview|react-loading-skeleton|Your site is taking shape/i);
 });

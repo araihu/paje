@@ -24,6 +24,13 @@ node --test tests/rendered-html.test.mjs
 The site is intentionally static and read-only. Product and usage claims should
 remain aligned with the root project README and the committed beta design.
 
+The product positioning is deliberately language-neutral: Pajé is implemented
+in Go, but the `generic` repository profile accepts structured checks for any
+language. The product model expects the agent to pilot Pajé through harness
+hooks and skills, but the current beta still starts the workflow through
+Hatchet. Codex is the first supported harness; agent-side integrations and
+additional harnesses are planned behind the same execution boundary.
+
 ## Deploy
 
 Authenticate the official Cloudflare CLI, build, and deploy the Worker with its

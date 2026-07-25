@@ -13,7 +13,16 @@ const workflowInput = `{
       "user_id": "operator@example.com",
       "app_id": "service"
     },
-    "profile": "go",
+    "profile": "generic",
+    "checks": [
+      {
+        "name": "test",
+        "executable": "npm",
+        "args": ["test"],
+        "timeout": "10m",
+        "required": true
+      }
+    ],
     "publication": {
       "mode": "artifact"
     }
@@ -36,39 +45,51 @@ helm upgrade --install paje ./charts/paje \\
 const features = [
   {
     number: "01",
+    title: "Desenhado para o agente pilotar",
+    text: "O modelo de produto coloca hooks e skills do harness na entrada, para o próprio agente acionar o protocolo, acompanhar o run e retomar com contexto.",
+    signal: "product direction",
+  },
+  {
+    number: "02",
+    title: "Linguagem neutra",
+    text: "O profile generic executa checks estruturados para qualquer stack. Go é a implementação do Pajé e um profile opcional, não um requisito do repositório.",
+    signal: "any stack",
+  },
+  {
+    number: "03",
     title: "Execução durável",
     text: "Cada fase persiste seu estado. Retries retomam o trabalho certo, sem relançar o agente ou duplicar efeitos.",
     signal: "restart-safe",
   },
   {
-    number: "02",
+    number: "04",
     title: "Memória com escopo",
     text: "O agente recebe contexto relevante por usuário e aplicação. Credenciais do worker ficam fora da execução.",
     signal: "Mem0 adapter",
   },
   {
-    number: "03",
+    number: "05",
     title: "Artefato verificável",
     text: "Patch, saída, verificações e preflight viram um bundle imutável, autenticado por SHA-256.",
     signal: "content-addressed",
   },
   {
-    number: "04",
+    number: "06",
     title: "Aprovação vinculada",
     text: "A decisão humana vale para um run e um digest exatos. Mudou o artefato? A aprovação deixa de valer.",
     signal: "artifact-bound",
   },
   {
-    number: "05",
+    number: "07",
     title: "PR determinístico",
     text: "Branch, commit e pull request são reutilizados apenas quando todos os vínculos conferem. Sem force-push.",
     signal: "idempotent",
   },
   {
-    number: "06",
-    title: "Go de verdade",
-    text: "Descobre módulos, isola GOWORK e roda checks por módulo. Comandos são estruturados, nunca shell livre.",
-    signal: "multi-module",
+    number: "08",
+    title: "Harness substituível",
+    text: "Codex é o primeiro harness suportado. A fronteira de execução existe para receber outros harnesses sem mudar o protocolo durável.",
+    signal: "Codex first",
   },
 ];
 
@@ -103,8 +124,8 @@ const phases = [
 const docs = [
   {
     eyebrow: "01 / Use",
-    title: "Entrada do workflow",
-    text: "Envelope, campos, profiles, checks e modos de publicação do code-change@v1.",
+    title: "Contrato do agente",
+    text: "Envelope que hooks e skills enviam, com profiles, checks e modos de publicação do code-change@v1.",
     href: `${githubUrl}#workflow-input`,
   },
   {
@@ -155,16 +176,17 @@ export default function Home() {
           <div className="hero-copy">
             <div className="status-pill">
               <span className="status-dot" aria-hidden="true" />
-              Beta disponível · self-hosted
+              Beta disponível · Codex é o primeiro harness
             </div>
-            <p className="kicker">Orquestração durável para agentes de código</p>
+            <p className="kicker">Orquestração durável pilotada pelo agente</p>
             <h1>
               Do pedido ao pull request.
               <span> Sem perder o fio.</span>
             </h1>
             <p className="hero-lead">
-              Pajé transforma mudanças de código em um fluxo verificável: contexto certo, execução isolada,
-              aprovação humana e publicação idempotente — tudo sob seu controle.
+              Pajé foi desenhado para ser pilotado pelo próprio agente via hooks e skills. Ele transforma cada mudança
+              em um fluxo verificável, independente da linguagem: contexto certo, execução isolada, aprovação humana e
+              publicação idempotente.
             </p>
             <div className="hero-actions">
               <a className="primary-button" href="#guia">Começar pelo guia <span aria-hidden="true">↓</span></a>
@@ -172,11 +194,11 @@ export default function Home() {
                 Ler no GitHub <Arrow />
               </a>
             </div>
-            <div className="hero-note" aria-label="Tecnologias principais">
-              <span>Go-native</span><i aria-hidden="true" />
-              <span>Hatchet</span><i aria-hidden="true" />
-              <span>Codex</span><i aria-hidden="true" />
-              <span>Mem0</span>
+            <div className="hero-note" aria-label="Princípios e suporte atual">
+              <span>Agent-piloted design</span><i aria-hidden="true" />
+              <span>Hooks + skills</span><i aria-hidden="true" />
+              <span>Language-neutral</span><i aria-hidden="true" />
+              <span>Codex first</span>
             </div>
           </div>
 
@@ -216,22 +238,22 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="proof-bar" aria-label="Garantias do beta">
+        <section className="proof-bar" aria-label="Princípios e estado do beta">
+          <div><strong>Agent</strong><span>modelo: hooks + skills</span></div>
+          <div><strong>Generic</strong><span>checks para qualquer stack</span></div>
+          <div><strong>Codex</strong><span>primeiro harness</span></div>
           <div><strong>5</strong><span>fases duráveis</span></div>
-          <div><strong>SHA-256</strong><span>artefatos autenticados</span></div>
-          <div><strong>0</strong><span>force-pushes</span></div>
-          <div><strong>1</strong><span>replica no beta</span></div>
         </section>
 
         <section className="section features-section" id="produto">
           <div className="section-heading split-heading">
             <div>
-              <p className="kicker">Controle operacional, não só automação</p>
-              <h2>Agentes rápidos.<br />Processos responsáveis.</h2>
+              <p className="kicker">O agente pilota. Pajé sustenta.</p>
+              <h2>Autonomia sem<br />perder o processo.</h2>
             </div>
             <p>
-              Pajé mantém a inteligência do agente dentro de um sistema previsível. Cada efeito deixa uma prova;
-              cada retry sabe de onde continuar.
+              O harness preserva a autonomia do agente; Pajé oferece o contrato previsível para os efeitos. Hooks e
+              skills são a superfície de integração pretendida. Cada ação deixa uma prova e cada retry sabe de onde continuar.
             </p>
           </div>
           <div className="feature-grid">
@@ -253,8 +275,8 @@ export default function Home() {
             <p className="kicker">code-change@v1</p>
             <h2>Um fluxo que sabe<br />onde está.</h2>
             <p className="section-intro">
-              Hatchet cuida da fila, retries e sinais. Pajé cuida do contrato: estado, contexto, artefatos,
-              política e publicação.
+              O agente inicia e acompanha o trabalho pela integração do harness. Hatchet cuida da fila, retries e sinais;
+              Pajé cuida do contrato: estado, contexto, artefatos, política e publicação.
             </p>
           </div>
           <div className="phase-list">
@@ -275,16 +297,16 @@ export default function Home() {
           <div className="section-heading guide-heading">
             <div>
               <p className="kicker">Guia rápido</p>
-              <h2>Da imagem ao primeiro run.</h2>
+              <h2>Do trigger ao primeiro run.</h2>
             </div>
-            <p>O beta é um worker self-hosted. Você leva Hatchet, credenciais e infraestrutura; Pajé leva o protocolo.</p>
+            <p>O beta é um worker self-hosted. Codex é o primeiro harness; o protocolo foi desenhado para receber outros.</p>
           </div>
 
           <div className="guide-grid">
             <aside className="guide-steps" aria-label="Passos do guia">
               <a href="#preparar"><span>01</span><b>Preparar</b><small>imagem + secrets</small></a>
               <a href="#instalar"><span>02</span><b>Instalar</b><small>Helm + adapters</small></a>
-              <a href="#executar"><span>03</span><b>Executar</b><small>workflow input</small></a>
+              <a href="#executar"><span>03</span><b>Executar</b><small>trigger → workflow</small></a>
               <a href="#aprovar"><span>04</span><b>Aprovar</b><small>quando houver PR</small></a>
             </aside>
 
@@ -295,11 +317,11 @@ export default function Home() {
                   <div><p>Pré-requisitos</p><h3>Prepare o terreno</h3></div>
                 </div>
                 <p>
-                  Você precisa de Go 1.26+ para desenvolver, Docker e Helm 3 para empacotar, uma instalação Hatchet e
-                  autenticação do Codex. Mem0 e GitHub entram apenas quando seus adapters são selecionados.
+                  Go 1.26+ é necessário apenas para desenvolver o Pajé, que é implementado em Go. O repositório atendido
+                  pode usar qualquer linguagem. No beta, prepare Docker, Helm 3, Hatchet e autenticação do Codex.
                 </p>
                 <div className="requirement-list">
-                  <span>Go 1.26+</span><span>Docker</span><span>Helm 3</span><span>Hatchet</span><span>Codex auth</span>
+                  <span>Qualquer stack</span><span>Docker</span><span>Helm 3</span><span>Hatchet</span><span>Codex · primeiro harness</span>
                 </div>
               </article>
 
@@ -324,8 +346,9 @@ export default function Home() {
                   <div><p>Primeira execução</p><h3>Dispare um artifact run</h3></div>
                 </div>
                 <p>
-                  Inicie <code>paje-code-change-v1</code> no Hatchet. Gere o <code>run_id</code> uma vez e reutilize-o em
-                  retries de transporte. No profile Go, checks omitidos viram <code>go test ./...</code> em cada módulo.
+                  Hoje, inicie <code>paje-code-change-v1</code> no Hatchet. A integração pretendida levará esse trigger para
+                  hooks e skills do harness. Use <code>profile: generic</code> com checks explícitos para qualquer linguagem;
+                  o profile <code>go</code> é só uma conveniência para descoberta de módulos e defaults de teste.
                 </p>
                 <div className="code-window code-window-light">
                   <div className="code-title"><span>workflow-input.json</span><code>json</code></div>
@@ -405,15 +428,17 @@ export default function Home() {
           <div className="beta-note">
             <div className="beta-stamp"><span>Beta</span><small>scope</small></div>
             <p>
-              Hoje, Pajé oferece o template tipado <code>code-change@v1</code>, modo artifact ou draft PR no GitHub e uma
-              única replica. Merge automático, YAML arbitrário, releases e múltiplas replicas ficam fora deste beta.
+              Hoje, Pajé oferece o template tipado <code>code-change@v1</code>, o runner do Codex como primeiro harness,
+              disparo pelo Hatchet, modo artifact ou draft PR no GitHub e uma única réplica. Hooks e skills agent-side e
+              outros harnesses serão suportados no futuro. Merge automático, YAML arbitrário, releases e múltiplas réplicas
+              ficam fora deste beta.
             </p>
           </div>
         </section>
 
         <section className="closing-section">
-          <p className="kicker">Seu agente pode ser autônomo.<br />Seu processo não precisa ser opaco.</p>
-          <h2>Pronto para deixar<br />o trabalho durável?</h2>
+          <p className="kicker">O agente pilota via hooks e skills.<br />Pajé torna o percurso durável.</p>
+          <h2>Autonomia para qualquer stack.<br />Codex primeiro, mais harnesses depois.</h2>
           <div className="closing-actions">
             <a className="primary-button inverse" href={githubUrl} target="_blank" rel="noreferrer">
               Ver projeto no GitHub <Arrow />
@@ -425,7 +450,7 @@ export default function Home() {
 
       <footer>
         <a className="brand footer-brand" href="#inicio"><span className="brand-mark">P/</span><span>Pajé</span></a>
-        <p>Orquestração durável para agentes de código.</p>
+        <p>Orquestração durável, pilotada pelo agente e independente da linguagem.</p>
         <div><span>Open source · MIT</span><a href={githubUrl} target="_blank" rel="noreferrer">GitHub <Arrow /></a></div>
       </footer>
     </div>
