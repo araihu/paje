@@ -1,9 +1,31 @@
 Pajé worker {{ include "paje.fullname" . }} has been installed.
 
-The worker connects outbound to Hatchet and does not expose a Kubernetes Service.
+The worker connects outbound to Hatchet and exposes no Kubernetes Service.
 Inspect it with:
 
   kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "paje.fullname" . }} --follow
+
+Beta workflow:
+  Hatchet workflow: paje-code-change-v1
+  Template:         code-change@v1
+  Phases:           resolve -> execute -> approval -> publish -> finalize
+
+Artifact mode is the default and durably skips approval and publication.
+Pull-request mode requires an artifact-bound Hatchet event:
+
+  key: paje:approval:<run-id>
+  body:
+    {
+      "run_id": "<run-id>",
+      "artifact_digest": "<64-hex-digest>",
+      "approved": true,
+      "actor": "<operator>",
+      "decided_at": "<UTC-RFC3339-time>",
+      "reason": "<optional approval reason>"
+    }
+
+  reason is optional when approved is true; it is mandatory and non-empty when
+  approved is false.
 
 Configured adapters:
   memory:    {{ .Values.adapters.memory }}
@@ -15,9 +37,12 @@ Persistence:
   enabled: {{ .Values.persistence.enabled }}
 {{- if .Values.persistence.enabled }}
   claim:   {{ include "paje.pvcName" . }}
+  workspace/repository mirrors: /var/lib/paje/workspace
+  run records:                  /var/lib/paje/runs/runs/<run-id>.json
+  artifacts:                    /var/lib/paje/artifacts/sha256/<prefix>/<digest>.tar.gz
 {{- else }}
-  Runs and artifacts use ephemeral pod storage. Enable persistence before using
-  the beta workflow for durable work.
+  Runs, artifacts, and repository mirrors use ephemeral pod storage. Replacing
+  the pod loses them. Enable persistence before using beta for durable work.
 {{- end }}
 
 Credential Secrets:
@@ -29,8 +54,37 @@ Credential Secrets:
   GitHub:  {{ include "paje.githubSecretName" . }}
 {{- end }}
 {{- if eq .Values.adapters.runner "codex" }}
-  Codex:   {{ .Values.codexAuth.existingSecret }} (read-only seed copied to writable CODEX_HOME)
+  Codex:   {{ .Values.codexAuth.existingSecret }} (read-only auth seed copied to writable CODEX_HOME)
 {{- end }}
 
-The beta uses process-local compare-and-swap and is intentionally limited to
-one replica.
+Hatchet, Mem0, and GitHub must use separate Secrets. The Codex auth Secret must
+contain only Codex authentication seed files, never Hatchet, Mem0, GitHub, Git,
+or SSH credentials. Agent and verification children cannot receive service
+credentials; only the publisher receives GitHub credentials.
+
+Idempotency keys bind code-change@v1 plus the canonical input hash. Exact reuse
+resumes the run; changed input conflicts. GitHub publication uses
+paje/code-change/<run-id>, normal non-force push, and exact run/base/artifact
+trailers. Conflicting remote state fails closed. Pajé never merges or pushes the
+target branch.
+
+Inspect one persisted artifact:
+
+  RUN_ID=<run-id>
+  RUN_FILE=/var/lib/paje/runs/runs/$RUN_ID.json
+  DIGEST=$(jq -r .artifact.digest "$RUN_FILE")
+  ARCHIVE=/var/lib/paje/artifacts/sha256/${DIGEST%${DIGEST#??}}/$DIGEST.tar.gz
+  tar -xOzf "$ARCHIVE" manifest.json | jq .
+  tar -xOzf "$ARCHIVE" verification.json | jq .
+
+Acceptance opt-ins:
+  Codex: PAJE_CODEX_INTEGRATION=1
+  GitHub: PAJE_GITHUB_ACCEPTANCE=1, PAJE_GITHUB_TOKEN,
+          PAJE_GITHUB_TEST_REPOSITORY, PAJE_GITHUB_TEST_BASE_REF,
+          PAJE_GITHUB_TEST_RUN_ID
+  Kubernetes server dry-run: PAJE_KUBE_ACCEPTANCE=1 and an explicitly verified
+          non-production context
+
+Beta is intentionally one replica because filesystem stores use process-local
+compare-and-swap. Non-goals are a YAML DSL, auto-merge, tags/releases,
+GitOps/monitoring, Forgejo, Kubernetes Jobs, and multiple replicas.
