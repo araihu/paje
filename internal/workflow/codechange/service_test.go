@@ -450,19 +450,62 @@ func TestServiceFinalizeCancellationIsTerminalAndDoesNotRetryMemory(t *testing.T
 
 	t.Run("marker CAS persistence", func(t *testing.T) {
 		fixture := completedServiceFixture(t, "artifact")
-		fixture.service.memory = &outcomeMemory{}
+		outcomes := &outcomeMemory{}
+		fixture.service.memory = outcomes
 		ctx, cancel := context.WithCancel(context.Background())
 		fixture.service.runs = &cancelOnEvidenceStore{
 			Store: fixture.runs, cancel: cancel, evidence: "outcome",
 		}
 		result, err := fixture.service.Finalize(ctx, "run-123")
-		if err == nil || result.Status != run.StatusCanceled ||
-			result.Failure == nil || result.Failure.Class != run.FailureCanceled {
+		if err == nil || result.Status != run.StatusExecuting ||
+			result.Failure != nil || outcomes.SaveCount() != 1 {
 			t.Fatalf("Finalize(marker CAS canceled) result=%#v error=%v", result, err)
 		}
 		record, _ := fixture.runs.Load(context.Background(), "run-123")
-		if record.OutcomeMemorySaved {
-			t.Fatalf("canceled marker persistence claimed memory saved: %#v", record)
+		finalize, found := latestStage(record, finalizeStage)
+		if record.OutcomeMemorySaved || record.Terminal() || !found ||
+			finalize.Status != run.StageRunning {
+			t.Fatalf("marker persistence did not remain recoverable: %#v", record)
+		}
+		again, err := fixture.service.Finalize(context.Background(), "run-123")
+		if err != nil || again.Status != run.StatusSucceeded ||
+			outcomes.SaveCount() != 1 {
+			t.Fatalf("Finalize(marker recovery) result=%#v error=%v saves=%d",
+				again, err, outcomes.SaveCount())
+		}
+	})
+
+	t.Run("cancellation after successful outcome save commits marker", func(t *testing.T) {
+		fixture := completedServiceFixture(t, "artifact")
+		outcomes := &outcomeMemory{}
+		ctx, cancel := context.WithCancel(context.Background())
+		fixture.service.memory = memoryFunc{
+			search: outcomes.Search,
+			save: func(
+				saveCtx context.Context,
+				content string,
+				tags map[string]string,
+			) error {
+				err := outcomes.Save(saveCtx, content, tags)
+				cancel()
+				return err
+			},
+		}
+		result, err := fixture.service.Finalize(ctx, "run-123")
+		if err != nil || result.Status != run.StatusSucceeded ||
+			outcomes.SaveCount() != 1 {
+			t.Fatalf("Finalize(save committed) result=%#v error=%v saves=%d",
+				result, err, outcomes.SaveCount())
+		}
+		record, _ := fixture.runs.Load(context.Background(), "run-123")
+		if !record.OutcomeMemorySaved || record.Status != run.StatusSucceeded {
+			t.Fatalf("committed outcome did not finish run: %#v", record)
+		}
+		again, err := fixture.service.Finalize(context.Background(), "run-123")
+		if err != nil || again.Status != run.StatusSucceeded ||
+			outcomes.SaveCount() != 1 {
+			t.Fatalf("Finalize(save recovery) result=%#v error=%v saves=%d",
+				again, err, outcomes.SaveCount())
 		}
 	})
 }
@@ -1849,6 +1892,234 @@ func TestServiceValidateProviderPhaseCompatibility(t *testing.T) {
 	}
 }
 
+func TestServiceValidateFinalizeHistoryForEveryProviderPhase(t *testing.T) {
+	upstreamFailure := func(t *testing.T) *serviceFixture {
+		fixture := newServiceFixture(t)
+		fixture.policy.decision = policy.Decision{
+			Allowed: false,
+			Findings: []policy.Finding{{
+				RuleID: "change-denied", Path: "changed.txt",
+			}},
+		}
+		if _, err := fixture.service.Resolve(
+			context.Background(), validRawInput("change", "finalize-upstream"),
+		); err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+		if _, err := fixture.service.Execute(context.Background(), "run-123"); err == nil {
+			t.Fatal("Execute(failure) error = nil")
+		}
+		return fixture
+	}
+	approvalRunning := func(t *testing.T) *serviceFixture {
+		fixture := completedServiceFixture(t, "pull_request")
+		if _, started, err := fixture.service.beginStage(
+			context.Background(), "run-123", approvalStage, run.StatusAwaitingApproval,
+		); err != nil || !started {
+			t.Fatalf("beginStage(approval) started=%v error=%v", started, err)
+		}
+		return fixture
+	}
+	publishRunning := func(t *testing.T) *serviceFixture {
+		fixture := approvedServiceFixture(t)
+		if _, started, err := fixture.service.beginStage(
+			context.Background(), "run-123", publishStage, run.StatusPublishing,
+		); err != nil || !started {
+			t.Fatalf("beginStage(publish) started=%v error=%v", started, err)
+		}
+		return fixture
+	}
+	tests := []struct {
+		name        string
+		fixture     func(*testing.T) *serviceFixture
+		mutate      func(*run.Record)
+		checkClosed bool
+	}{
+		{
+			name:        "artifact-less upstream failure rejects malformed finalize",
+			fixture:     upstreamFailure,
+			mutate:      installMalformedFinalizeFailure,
+			checkClosed: true,
+		},
+		{
+			name:    "approval running rejects finalize history",
+			fixture: approvalRunning,
+			mutate:  installRunningFinalize,
+		},
+		{
+			name: "approval retryable failure rejects finalize history",
+			fixture: func(t *testing.T) *serviceFixture {
+				return approvalFailedServiceFixture(t, true)
+			},
+			mutate: installRunningFinalize,
+		},
+		{
+			name: "approval terminal failure rejects malformed finalize",
+			fixture: func(t *testing.T) *serviceFixture {
+				return approvalFailedServiceFixture(t, false)
+			},
+			mutate:      installMalformedFinalizeFailure,
+			checkClosed: true,
+		},
+		{
+			name:        "declined approval rejects malformed finalize",
+			fixture:     declinedServiceFixture,
+			mutate:      installMalformedFinalizeFailure,
+			checkClosed: true,
+		},
+		{
+			name:    "publish running rejects finalize history",
+			fixture: publishRunning,
+			mutate:  installRunningFinalize,
+		},
+		{
+			name: "publish retryable failure rejects finalize history",
+			fixture: func(t *testing.T) *serviceFixture {
+				return publishFailedServiceFixture(t, true)
+			},
+			mutate: installRunningFinalize,
+		},
+		{
+			name: "publish terminal failure rejects malformed finalize",
+			fixture: func(t *testing.T) *serviceFixture {
+				return publishFailedServiceFixture(t, false)
+			},
+			mutate:      installMalformedFinalizeFailure,
+			checkClosed: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			record, err := fixture.runs.Load(context.Background(), "run-123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&record)
+			input, err := validateRunBinding(record)
+			if err != nil {
+				t.Fatalf("validateRunBinding() error = %v", err)
+			}
+			if err := fixture.service.validateDurableEvidence(
+				context.Background(), record, input,
+			); err == nil {
+				t.Fatal("validateDurableEvidence() error = nil")
+			}
+			if _, err := fixture.service.resultFromRecord(
+				context.Background(), record,
+			); err == nil {
+				t.Fatal("resultFromRecord() error = nil")
+			}
+			if !test.checkClosed {
+				return
+			}
+
+			outcomes := &outcomeMemory{}
+			fixture.service.memory = outcomes
+			fixture.runs.loadMutate = func(record run.Record) run.Record {
+				test.mutate(&record)
+				return record
+			}
+			if result, err := fixture.service.Finalize(
+				context.Background(), "run-123",
+			); err == nil || result.RunID != "run-123" || outcomes.SaveCount() != 0 {
+				t.Fatalf("Finalize(closed malformed) result=%#v error=%v saves=%d",
+					result, err, outcomes.SaveCount())
+			}
+		})
+	}
+}
+
+func TestServiceValidateFinalizeStartsAfterProviderCompletion(t *testing.T) {
+	tests := []struct {
+		name     string
+		fixture  func(*testing.T) *serviceFixture
+		boundary string
+		reorder  bool
+		mutate   func(*run.Record)
+	}{
+		{
+			name:     "artifact finalize ordered before publish skip",
+			fixture:  artifactReadyServiceFixture,
+			boundary: publishStage,
+			reorder:  true,
+			mutate:   installRunningFinalize,
+		},
+		{
+			name:     "artifact finalize starts when publish skip finishes",
+			fixture:  artifactReadyServiceFixture,
+			boundary: publishStage,
+			mutate:   installRunningFinalize,
+		},
+		{
+			name:     "published finalize ordered before publish success",
+			fixture:  publishedServiceFixture,
+			boundary: publishStage,
+			reorder:  true,
+			mutate:   installRunningFinalize,
+		},
+		{
+			name:     "published finalize starts when publish success finishes",
+			fixture:  publishedServiceFixture,
+			boundary: publishStage,
+			mutate:   installRunningFinalize,
+		},
+		{
+			name: "terminal approval failure finalize starts before approval",
+			fixture: func(t *testing.T) *serviceFixture {
+				return approvalFailedServiceFixture(t, false)
+			},
+			boundary: approvalStage,
+			mutate:   installUpstreamFinalizeFailure,
+		},
+		{
+			name:     "declined finalize starts before approval completion",
+			fixture:  declinedServiceFixture,
+			boundary: approvalStage,
+			mutate:   installRunningFinalize,
+		},
+		{
+			name: "terminal publish failure finalize starts before publish",
+			fixture: func(t *testing.T) *serviceFixture {
+				return publishFailedServiceFixture(t, false)
+			},
+			boundary: publishStage,
+			mutate:   installUpstreamFinalizeFailure,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			record, err := fixture.runs.Load(context.Background(), "run-123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&record)
+			if test.reorder {
+				moveLatestStageBefore(&record, finalizeStage, test.boundary)
+			} else {
+				startFinalizeAtProviderFinish(&record, test.boundary)
+			}
+			input, err := validateRunBinding(record)
+			if err != nil {
+				t.Fatalf("validateRunBinding() error = %v", err)
+			}
+			if err := fixture.service.validateDurableEvidence(
+				context.Background(), record, input,
+			); err == nil {
+				t.Fatal("validateDurableEvidence() error = nil")
+			}
+			if _, err := fixture.service.resultFromRecord(
+				context.Background(), record,
+			); err == nil {
+				t.Fatal("resultFromRecord() error = nil")
+			}
+		})
+	}
+}
+
 func completedServiceFixture(t *testing.T, mode string) *serviceFixture {
 	t.Helper()
 	fixture := newServiceFixture(t)
@@ -2085,6 +2356,87 @@ func installRunningPublish(record *run.Record) {
 		StartedAt: startedAt, Attempts: stageAttempt(*record, publishStage) + 1,
 	})
 	record.UpdatedAt = startedAt
+}
+
+func installRunningFinalize(record *run.Record) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: finalizeStage, Status: run.StageRunning,
+		StartedAt: startedAt, Attempts: stageAttempt(*record, finalizeStage) + 1,
+	})
+	record.UpdatedAt = startedAt
+}
+
+func installMalformedFinalizeFailure(record *run.Record) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	failure := run.Failure{
+		Stage: finalizeStage, Class: run.FailureInternal, Retryable: false,
+		Diagnostic: "malformed finalize bookkeeping", CauseCode: "malformed_finalize",
+	}
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: finalizeStage, Status: run.StageFailed,
+		StartedAt: startedAt, FinishedAt: finishedAt,
+		Attempts: stageAttempt(*record, finalizeStage) + 1, Failure: &failure,
+	})
+	record.UpdatedAt = finishedAt
+}
+
+func installUpstreamFinalizeFailure(record *run.Record) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	failure := finalizeMemoryFailure()
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: finalizeStage, Status: run.StageFailed,
+		StartedAt: startedAt, FinishedAt: finishedAt,
+		Attempts: stageAttempt(*record, finalizeStage) + 1, Failure: &failure,
+	})
+	record.UpdatedAt = finishedAt
+}
+
+func moveLatestStageBefore(record *run.Record, name, boundary string) {
+	stageIndex := -1
+	boundaryIndex := -1
+	highestBoundaryAttempt := 0
+	for index, stage := range record.Stages {
+		if stage.Name == name && (stageIndex == -1 ||
+			stage.Attempts > record.Stages[stageIndex].Attempts) {
+			stageIndex = index
+		}
+		if stage.Name == boundary && stage.Attempts > highestBoundaryAttempt {
+			boundaryIndex = index
+			highestBoundaryAttempt = stage.Attempts
+		}
+	}
+	if stageIndex == -1 || boundaryIndex == -1 {
+		panic("stage or boundary not found")
+	}
+	stage := record.Stages[stageIndex]
+	without := append(
+		append([]run.StageResult(nil), record.Stages[:stageIndex]...),
+		record.Stages[stageIndex+1:]...,
+	)
+	if stageIndex < boundaryIndex {
+		boundaryIndex--
+	}
+	reordered := make([]run.StageResult, 0, len(record.Stages))
+	reordered = append(reordered, without[:boundaryIndex]...)
+	reordered = append(reordered, stage)
+	reordered = append(reordered, without[boundaryIndex:]...)
+	record.Stages = reordered
+}
+
+func startFinalizeAtProviderFinish(record *run.Record, provider string) {
+	providerStage, found := latestStage(*record, provider)
+	if !found {
+		panic("provider stage not found")
+	}
+	finalize := providerStagePointer(record, finalizeStage, 1)
+	duration := finalize.FinishedAt.Sub(finalize.StartedAt)
+	finalize.StartedAt = providerStage.FinishedAt
+	if finalize.Status != run.StageRunning {
+		finalize.FinishedAt = finalize.StartedAt.Add(max(duration, time.Second))
+	}
 }
 
 func finalizeTestFailure(retryable bool) run.Failure {
@@ -2342,7 +2694,10 @@ func (s *cancelOnEvidenceStore) Save(
 			s.cancel()
 		})
 		if fired {
-			return run.Record{}, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return run.Record{}, err
+			}
+			return run.Record{}, context.Canceled
 		}
 	}
 	return s.Store.Save(ctx, record, expected)
