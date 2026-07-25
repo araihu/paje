@@ -40,6 +40,10 @@ const (
 
 func TestCodexArtifactAcceptance(t *testing.T) {
 	requireOptIn(t, "PAJE_CODEX_INTEGRATION", "the authenticated Codex artifact acceptance test")
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Fatal("authenticated Codex acceptance requires codex on PATH")
+	}
+	codexHome := existingCodexHome(t)
 
 	sourceRepository, baseSHA := newCodexAcceptanceRepository(t)
 	sourceTree := gitOutput(t, sourceRepository, "write-tree")
@@ -54,10 +58,6 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 	if err := os.Chmod(codexWrapper, 0o700); err != nil {
 		t.Fatalf("make Codex acceptance wrapper executable: %v", err)
 	}
-	if _, err := exec.LookPath("codex"); err != nil {
-		t.Skip("authenticated Codex acceptance requires codex on PATH")
-	}
-
 	workspaces, err := gitworktree.New(workspaceRoot)
 	if err != nil {
 		t.Fatalf("create Git worktree manager: %v", err)
@@ -87,7 +87,7 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 		RuntimeRoot: runtimeRoot,
 		Source:      sourceEnvironment,
 		Allowed:     []string{"PAJE_ACCEPTANCE_PID_FILE"},
-		CodexHome:   existingCodexHome(t),
+		CodexHome:   codexHome,
 		CodexAgent:  true,
 	})
 	if err != nil {

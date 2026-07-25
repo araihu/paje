@@ -41,23 +41,23 @@ func requireEnvironment(t *testing.T, keys ...string) map[string]string {
 		values[key] = value
 	}
 	if len(missing) != 0 {
-		t.Skipf("set required acceptance variables: %s", strings.Join(missing, ", "))
+		t.Fatalf("set required acceptance variables: %s", strings.Join(missing, ", "))
 	}
 	return values
 }
 
 func existingCodexHome(t *testing.T) string {
 	t.Helper()
-	if configured := strings.TrimSpace(os.Getenv("CODEX_HOME")); configured != "" {
-		return configured
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if codexHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatal("authenticated Codex acceptance requires CODEX_HOME or a user home directory")
+		}
+		codexHome = filepath.Join(home, ".codex")
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("authenticated Codex acceptance requires CODEX_HOME or a user home directory")
-	}
-	codexHome := filepath.Join(home, ".codex")
 	if _, err := os.Stat(filepath.Join(codexHome, "auth.json")); err != nil {
-		t.Skip("authenticated Codex acceptance requires an existing CODEX_HOME auth.json")
+		t.Fatal("authenticated Codex acceptance requires CODEX_HOME auth.json")
 	}
 	return codexHome
 }

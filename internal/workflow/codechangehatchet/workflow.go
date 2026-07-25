@@ -11,7 +11,10 @@ import (
 	hatchet "github.com/hatchet-dev/hatchet/sdks/go"
 )
 
-const workflowName = "paje-code-change-v1"
+const (
+	workflowName           = "paje-code-change-v1"
+	workflowIdempotencyTTL = 30 * 24 * time.Hour
+)
 
 type taskReference interface {
 	GetName() string
@@ -36,7 +39,11 @@ type workflowDeclaration interface {
 }
 
 type workflowFactory interface {
-	newWorkflow(name string) workflowDeclaration
+	newWorkflow(name string, options workflowOptions) workflowDeclaration
+}
+
+type workflowOptions struct {
+	idempotency *hatchet.IdempotencyConfig
 }
 
 // New declares the five-phase code-change workflow on client.
@@ -54,7 +61,13 @@ func New(client *hatchet.Client, service *codechange.Service) (*hatchet.Workflow
 }
 
 func buildWorkflow(factory workflowFactory, service phaseService) {
-	declareWorkflow(factory.newWorkflow(workflowName), service)
+	declareWorkflow(factory.newWorkflow(workflowName, workflowOptions{
+		idempotency: &hatchet.IdempotencyConfig{
+			Expression: "input.run_id",
+			Method:     hatchet.IdempotencyMethodStatus,
+			TTL:        workflowIdempotencyTTL,
+		},
+	}), service)
 }
 
 func declareWorkflow(workflow workflowDeclaration, service phaseService) {
@@ -75,7 +88,7 @@ func declareWorkflow(workflow workflowDeclaration, service phaseService) {
 		parents: []string{"approval"}, retries: publishRetries, retryBackoffFactor: 2,
 		retryMaxBackoffSeconds: 60, executionTimeout: 15 * time.Minute,
 		concurrency: &types.Concurrency{
-			Expression: "input.repository_uri + ':' + input.publication.target_branch",
+			Expression: "input.input.repository_uri + ':' + input.input.publication.target_branch",
 			MaxRuns:    &maxRuns, LimitStrategy: &strategy,
 		},
 	})
@@ -95,8 +108,12 @@ type hatchetWorkflowFactory struct {
 	workflow *hatchet.Workflow
 }
 
-func (f *hatchetWorkflowFactory) newWorkflow(name string) workflowDeclaration {
-	f.workflow = f.client.NewWorkflow(name)
+func (f *hatchetWorkflowFactory) newWorkflow(name string, options workflowOptions) workflowDeclaration {
+	workflowOptions := make([]hatchet.WorkflowOption, 0, 1)
+	if options.idempotency != nil {
+		workflowOptions = append(workflowOptions, hatchet.WithWorkflowIdempotency(*options.idempotency))
+	}
+	f.workflow = f.client.NewWorkflow(name, workflowOptions...)
 	return &hatchetDeclaration{workflow: f.workflow, tasks: make(map[string]*hatchet.Task)}
 }
 

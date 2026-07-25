@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26.1-alpine AS build
+FROM golang:1.26.1-alpine AS revision
+
+ARG PAJE_COMMIT
+RUN printf '%s\n' "${PAJE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
+    || { printf '%s\n' 'PAJE_COMMIT must be a full 40-character lowercase hexadecimal Git commit' >&2; exit 1; }
+
+FROM revision AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -20,7 +26,7 @@ RUN npm install --global "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force \
     && codex --version
 
-ARG PAJE_COMMIT=unknown
+ARG PAJE_COMMIT
 LABEL org.opencontainers.image.revision="${PAJE_COMMIT}" \
     org.opencontainers.image.source="https://github.com/araihu/paje" \
     io.araihu.paje.codex.version="${CODEX_VERSION}"

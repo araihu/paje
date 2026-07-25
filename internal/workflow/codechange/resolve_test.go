@@ -99,6 +99,64 @@ func TestResolveIsCanonicalIdempotentAndFreezesMemory(t *testing.T) {
 	}
 }
 
+func TestResolveWithRunIDEnforcesSingleDurableOwner(t *testing.T) {
+	fixture := newServiceFixture(t)
+	raw := validRawInput("Change docs", "same-key")
+
+	owner, err := fixture.service.ResolveWithRunID(context.Background(), "run-owner", raw)
+	if err != nil {
+		t.Fatalf("ResolveWithRunID(owner) error = %v", err)
+	}
+	if owner.RunID != "run-owner" {
+		t.Fatalf("owner run ID = %q", owner.RunID)
+	}
+	resumed, err := fixture.service.ResolveWithRunID(context.Background(), "run-owner", raw)
+	if err != nil || resumed.RunID != owner.RunID {
+		t.Fatalf("ResolveWithRunID(resume) result=%#v error=%v", resumed, err)
+	}
+	observer, err := fixture.service.ResolveWithRunID(context.Background(), "run-observer", raw)
+	if !errors.Is(err, run.ErrIdempotencyConflict) {
+		t.Fatalf("ResolveWithRunID(observer) result=%#v error=%v, want %v", observer, err, run.ErrIdempotencyConflict)
+	}
+	if observer.RunID != "run-owner" {
+		t.Fatalf("observer conflict run ID = %q, want owner", observer.RunID)
+	}
+	if fixture.resolver.calls != 1 || fixture.mem.calls != 1 {
+		t.Fatalf("observer reached external ports: resolver=%d memory=%d", fixture.resolver.calls, fixture.mem.calls)
+	}
+}
+
+func TestResolveWithRunIDPreservesBlankTemplateIdempotency(t *testing.T) {
+	fixture := newServiceFixture(t)
+	raw := validRawInput("Change docs", "")
+
+	first, err := fixture.service.ResolveWithRunID(context.Background(), "run-first", raw)
+	if err != nil {
+		t.Fatalf("ResolveWithRunID(first) error = %v", err)
+	}
+	retried, err := fixture.service.ResolveWithRunID(context.Background(), "run-first", raw)
+	if err != nil {
+		t.Fatalf("ResolveWithRunID(retry first) error = %v", err)
+	}
+	second, err := fixture.service.ResolveWithRunID(context.Background(), "run-second", raw)
+	if err != nil {
+		t.Fatalf("ResolveWithRunID(second) error = %v", err)
+	}
+	if first.RunID != "run-first" || retried.RunID != first.RunID || second.RunID != "run-second" {
+		t.Fatalf("blank-key run IDs = %q, %q, %q", first.RunID, retried.RunID, second.RunID)
+	}
+}
+
+func TestResolveWithRunIDRejectsBlankOwnerBeforePorts(t *testing.T) {
+	fixture := newServiceFixture(t)
+	if _, err := fixture.service.ResolveWithRunID(context.Background(), "  ", validRawInput("Change docs", "key")); err == nil {
+		t.Fatal("ResolveWithRunID(blank) error = nil")
+	}
+	if fixture.runs.reserveCalls != 0 || fixture.resolver.calls != 0 || fixture.mem.calls != 0 {
+		t.Fatalf("blank owner reached ports: reserve=%d resolver=%d memory=%d", fixture.runs.reserveCalls, fixture.resolver.calls, fixture.mem.calls)
+	}
+}
+
 func TestResolveCanonicalInputPreservesExplicitZeroMemoryLimit(t *testing.T) {
 	fixture := newServiceFixture(t)
 	fixture.mem.result = []memory.Memory{{ID: "must-not-load", Content: "not requested"}}

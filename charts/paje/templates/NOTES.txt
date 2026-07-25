@@ -9,6 +9,11 @@ Beta workflow:
   Hatchet workflow: paje-code-change-v1
   Template:         code-change@v1
   Phases:           resolve -> execute -> approval -> publish -> finalize
+  Input envelope:   {"run_id":"<generated-once>","input":{<code-change@v1>}}
+
+Reuse run_id for transport retries. Hatchet holds it with status-based
+idempotency until the workflow is terminal, with a 30-day fallback cap. The
+nested template input remains provider-neutral and strictly validated.
 
 Artifact mode is the default and durably skips approval and publication.
 Pull-request mode requires an artifact-bound Hatchet event:
@@ -57,7 +62,8 @@ Credential Secrets:
   Codex:   {{ .Values.codexAuth.existingSecret }} (read-only auth seed copied to writable CODEX_HOME)
 {{- end }}
 
-Hatchet, Mem0, and GitHub must use separate Secrets. The Codex auth Secret must
+Every active Hatchet, Mem0, GitHub, and Codex credential must use a distinct
+Secret, including generated service Secret names. The Codex auth Secret must
 contain only Codex authentication seed files, never Hatchet, Mem0, GitHub, Git,
 or SSH credentials. Agent and verification children cannot receive service
 credentials; only the publisher receives GitHub credentials. Before reading
@@ -86,6 +92,7 @@ Acceptance opt-ins:
   GitHub: PAJE_GITHUB_ACCEPTANCE=1, PAJE_GITHUB_TOKEN,
           PAJE_GITHUB_TEST_REPOSITORY, PAJE_GITHUB_TEST_BASE_REF,
           PAJE_GITHUB_TEST_RUN_ID
+  Docker build arguments: PAJE_DOCKER_ACCEPTANCE=1
   Kubernetes server dry-run: PAJE_KUBE_ACCEPTANCE=1 and an explicitly verified
           non-production context
 

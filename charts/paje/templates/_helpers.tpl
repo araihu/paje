@@ -70,6 +70,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if eq .Values.adapters.runner "codex" -}}
+{{- $codex := required "codexAuth.existingSecret is required when adapters.runner=codex" .Values.codexAuth.existingSecret -}}
+{{- if eq $hatchet $codex -}}
+{{- fail (printf "active credentials must use distinct Secrets: Hatchet and Codex both reference %q" $hatchet) -}}
+{{- end -}}
+{{- if eq .Values.adapters.memory "mem0" -}}
+{{- $mem0 := include "paje.mem0SecretName" . -}}
+{{- if eq $mem0 $codex -}}
+{{- fail (printf "active credentials must use distinct Secrets: Mem0 and Codex both reference %q" $mem0) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq .Values.publisher.adapter "github" -}}
+{{- $github := include "paje.githubSecretName" . -}}
+{{- if eq $github $codex -}}
+{{- fail (printf "active credentials must use distinct Secrets: GitHub and Codex both reference %q" $github) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{- define "paje.pvcName" -}}

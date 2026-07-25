@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/araihu/paje/internal/environment"
@@ -20,12 +21,32 @@ var immutableRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Resolve validates and freezes all context needed by later phase retries.
 func (s *Service) Resolve(ctx context.Context, raw json.RawMessage) (PhaseResult, error) {
+	return s.resolve(ctx, s.newID(), raw, false)
+}
+
+// ResolveWithRunID validates and freezes a caller-owned run using a
+// preallocated durable identity. A different owner cannot attach to an
+// existing idempotency binding, even when the same provider-neutral input
+// would otherwise resume it.
+func (s *Service) ResolveWithRunID(ctx context.Context, runID string, raw json.RawMessage) (PhaseResult, error) {
+	if strings.TrimSpace(runID) == "" {
+		return PhaseResult{}, fmt.Errorf("resolve code-change input: run ID is required")
+	}
+	return s.resolve(ctx, runID, raw, true)
+}
+
+func (s *Service) resolve(
+	ctx context.Context,
+	runID string,
+	raw json.RawMessage,
+	requireOwner bool,
+) (PhaseResult, error) {
 	input, canonical, inputHash, err := s.decodeInput(raw)
 	if err != nil {
 		return PhaseResult{}, err
 	}
 	record, created, err := s.runs.Reserve(ctx, run.Reservation{
-		NewRunID: s.newID(), Template: templatecodechange.ID,
+		NewRunID: runID, Template: templatecodechange.ID,
 		IdempotencyKey: input.IdempotencyKey, InputHash: inputHash,
 		Input: canonical, RepositoryURI: input.RepositoryURI,
 		BaseRef: input.BaseRef, PublicationMode: input.Publication.Mode,
@@ -33,6 +54,13 @@ func (s *Service) Resolve(ctx context.Context, raw json.RawMessage) (PhaseResult
 	})
 	if err != nil {
 		return phaseResult(record), err
+	}
+	if requireOwner && !created && record.ID != runID {
+		return phaseResult(record), fmt.Errorf(
+			"resolve code-change input: durable run %q is owned by another trigger: %w",
+			record.ID,
+			run.ErrIdempotencyConflict,
+		)
 	}
 	if !created && (record.BaseSHA != "" || record.Terminal()) {
 		return phaseResult(record), nil

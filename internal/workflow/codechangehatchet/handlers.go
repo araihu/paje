@@ -1,9 +1,12 @@
 package codechangehatchet
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/araihu/paje/internal/approval"
 	"github.com/araihu/paje/internal/run"
@@ -20,7 +23,7 @@ const (
 )
 
 type phaseService interface {
-	Resolve(context.Context, json.RawMessage) (codechange.PhaseResult, error)
+	ResolveWithRunID(context.Context, string, json.RawMessage) (codechange.PhaseResult, error)
 	Execute(context.Context, string) (codechange.PhaseResult, error)
 	Approval(context.Context, string, approval.Gate) (codechange.PhaseResult, error)
 	Publish(context.Context, string) (codechange.PhaseResult, error)
@@ -36,14 +39,53 @@ type taskContext interface {
 
 func resolveHandler(service phaseService) func(taskContext, map[string]any) (codechange.PhaseResult, error) {
 	return func(ctx taskContext, input map[string]any) (codechange.PhaseResult, error) {
-		raw, err := json.Marshal(input)
+		runID, raw, err := decodeWorkflowInput(input)
 		if err != nil {
-			return codechange.PhaseResult{}, fmt.Errorf("encode code-change input: %w", err)
+			return codechange.PhaseResult{}, err
 		}
 		return runPhase(ctx, service, "resolve", resolveRetries, func() (codechange.PhaseResult, error) {
-			return service.Resolve(ctx, raw)
+			return service.ResolveWithRunID(ctx, runID, raw)
 		})
 	}
+}
+
+type workflowInput struct {
+	RunID string          `json:"run_id"`
+	Input json.RawMessage `json:"input"`
+}
+
+func decodeWorkflowInput(input map[string]any) (string, json.RawMessage, error) {
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return "", nil, fmt.Errorf("encode Hatchet workflow input: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	var envelope workflowInput
+	if err := decoder.Decode(&envelope); err != nil {
+		return "", nil, fmt.Errorf("decode Hatchet workflow input: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return "", nil, fmt.Errorf("decode Hatchet workflow input: %w", err)
+	}
+	if strings.TrimSpace(envelope.RunID) == "" {
+		return "", nil, fmt.Errorf("decode Hatchet workflow input: run_id is required")
+	}
+	if len(envelope.Input) == 0 || bytes.Equal(envelope.Input, []byte("null")) {
+		return "", nil, fmt.Errorf("decode Hatchet workflow input: input is required")
+	}
+	return envelope.RunID, envelope.Input, nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func executeHandler(service phaseService) func(taskContext, map[string]any) (codechange.PhaseResult, error) {

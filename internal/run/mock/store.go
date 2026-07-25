@@ -90,7 +90,14 @@ func (s *Store) Reserve(ctx context.Context, reservation run.Reservation) (run.R
 			return run.CloneRecord(record), false, nil
 		}
 	}
-	if _, exists := s.records[reservation.NewRunID]; exists {
+	if existing, exists := s.records[reservation.NewRunID]; exists {
+		if reservation.IdempotencyKey == "" {
+			if existing.Template != reservation.Template || existing.IdempotencyKey != "" ||
+				existing.InputHash != reservation.InputHash {
+				return run.CloneRecord(existing), false, run.ErrIdempotencyConflict
+			}
+			return run.CloneRecord(existing), false, nil
+		}
 		return run.Record{}, false, run.ErrAlreadyExists
 	}
 	record, err := run.NewRecord(reservation)

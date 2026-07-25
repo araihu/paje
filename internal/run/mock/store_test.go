@@ -49,6 +49,25 @@ func TestStoreMatchesReservationCASAndDefensiveCopyBehavior(t *testing.T) {
 	}
 }
 
+func TestBlankKeyReservationRetriesSameCallerRunID(t *testing.T) {
+	t.Parallel()
+	store := runmock.NewStore()
+	request := reservation("run-blank")
+	request.IdempotencyKey = ""
+	first, created, err := store.Reserve(context.Background(), request)
+	if err != nil || !created {
+		t.Fatalf("Reserve(first) created=%v error=%v", created, err)
+	}
+	retried, created, err := store.Reserve(context.Background(), request)
+	if err != nil || created || retried.ID != first.ID {
+		t.Fatalf("Reserve(retry) record=%#v created=%v error=%v", retried, created, err)
+	}
+	request.InputHash = "different"
+	if _, _, err := store.Reserve(context.Background(), request); !errors.Is(err, run.ErrIdempotencyConflict) {
+		t.Fatalf("Reserve(conflict) error=%v, want %v", err, run.ErrIdempotencyConflict)
+	}
+}
+
 func TestConfiguredFailuresAndConcurrency(t *testing.T) {
 	t.Parallel()
 	want := errors.New("unavailable")

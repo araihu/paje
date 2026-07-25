@@ -236,6 +236,15 @@ func TestBlankIdempotencyKeyCreatesDistinctCallerRunIDsWithoutIndex(t *testing.T
 	if _, created, err := store.Reserve(context.Background(), reservation); err != nil || !created {
 		t.Fatalf("Reserve(run-1) created %v err %v", created, err)
 	}
+	retried, created, err := store.Reserve(context.Background(), reservation)
+	if err != nil || created || retried.ID != "run-1" {
+		t.Fatalf("Reserve(run-1 retry) record=%#v created=%v err=%v", retried, created, err)
+	}
+	conflict := reservation
+	conflict.InputHash = "different"
+	if _, _, err := store.Reserve(context.Background(), conflict); !errors.Is(err, run.ErrIdempotencyConflict) {
+		t.Fatalf("Reserve(run-1 conflict) error=%v, want %v", err, run.ErrIdempotencyConflict)
+	}
 	reservation.NewRunID = "run-2"
 	if _, created, err := store.Reserve(context.Background(), reservation); err != nil || !created {
 		t.Fatalf("Reserve(run-2) created %v err %v", created, err)

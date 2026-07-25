@@ -24,6 +24,12 @@ func TestNewNamesWorkflow(t *testing.T) {
 	if factory.name != "paje-code-change-v1" {
 		t.Fatalf("workflow name = %q", factory.name)
 	}
+	if factory.options.idempotency == nil ||
+		factory.options.idempotency.Expression != "input.run_id" ||
+		factory.options.idempotency.Method != hatchet.IdempotencyMethodStatus ||
+		factory.options.idempotency.TTL != workflowIdempotencyTTL {
+		t.Fatalf("workflow idempotency = %#v", factory.options.idempotency)
+	}
 }
 
 func TestNewProducesSDKDeclarationWithoutServer(t *testing.T) {
@@ -54,6 +60,12 @@ func TestNewProducesSDKDeclarationWithoutServer(t *testing.T) {
 	}
 	if len(dump.GetTasks()) != 5 || len(handlers) != 4 || len(durableHandlers) != 1 {
 		t.Fatalf("declaration sizes = tasks:%d handlers:%d durable:%d", len(dump.GetTasks()), len(handlers), len(durableHandlers))
+	}
+	idempotency := dump.GetIdempotency()
+	if idempotency == nil || idempotency.GetExpression() != "input.run_id" ||
+		idempotency.GetMethod().String() != "STATUS" ||
+		idempotency.GetTtlMs() != workflowIdempotencyTTL.Milliseconds() {
+		t.Fatalf("workflow idempotency = %v", idempotency)
 	}
 	wantTasks := map[string]struct {
 		parents []string
@@ -86,7 +98,7 @@ func TestNewProducesSDKDeclarationWithoutServer(t *testing.T) {
 				t.Fatalf("publish concurrency count = %d", len(task.GetConcurrency()))
 			}
 			concurrency := task.GetConcurrency()[0]
-			if concurrency.GetExpression() != "input.repository_uri + ':' + input.publication.target_branch" ||
+			if concurrency.GetExpression() != "input.input.repository_uri + ':' + input.input.publication.target_branch" ||
 				concurrency.GetMaxRuns() != 1 || concurrency.GetLimitStrategy().String() != "GROUP_ROUND_ROBIN" {
 				t.Fatalf("publish concurrency = %v", concurrency)
 			}
@@ -110,7 +122,7 @@ func TestDeclareWorkflowBuildsFivePhaseDAG(t *testing.T) {
 			name: "publish", parents: []string{"approval"}, retries: 2,
 			backoffFactor: 2, maxBackoffSeconds: 60, timeout: 15 * time.Minute,
 			concurrency: &types.Concurrency{
-				Expression: "input.repository_uri + ':' + input.publication.target_branch",
+				Expression: "input.input.repository_uri + ':' + input.input.publication.target_branch",
 				MaxRuns:    pointer(int32(1)), LimitStrategy: pointer(types.GroupRoundRobin),
 			},
 		},
@@ -121,10 +133,13 @@ func TestDeclareWorkflowBuildsFivePhaseDAG(t *testing.T) {
 	}
 }
 
-func TestResolveHandlerPreservesCompleteRawInput(t *testing.T) {
+func TestResolveHandlerUnwrapsExactTemplateInputWithPreallocatedRunID(t *testing.T) {
 	strictError := errors.New("strict input rejected unknown field")
 	service := &fakeService{
-		resolve: func(_ context.Context, raw json.RawMessage) (workflow.PhaseResult, error) {
+		resolve: func(_ context.Context, runID string, raw json.RawMessage) (workflow.PhaseResult, error) {
+			if runID != "01J-HATCHET-OWNER" {
+				t.Fatalf("run ID = %q", runID)
+			}
 			var fields map[string]json.RawMessage
 			if err := json.Unmarshal(raw, &fields); err != nil {
 				t.Fatalf("unmarshal captured input: %v", err)
@@ -139,14 +154,63 @@ func TestResolveHandlerPreservesCompleteRawInput(t *testing.T) {
 		},
 	}
 	input := map[string]any{
-		"task_description": "change it",
-		"repository_uri":   "https://example.test/repo.git",
-		"future_field":     map[string]any{"nested": true},
+		"run_id": "01J-HATCHET-OWNER",
+		"input": map[string]any{
+			"task_description": "change it",
+			"repository_uri":   "https://example.test/repo.git",
+			"future_field":     map[string]any{"nested": true},
+		},
 	}
 
 	_, err := resolveHandler(service)(testTaskContext{}, input)
 	if !errors.Is(err, strictError) {
 		t.Fatalf("error = %v, want strict rejection", err)
+	}
+}
+
+func TestResolveHandlerRejectsInvalidHatchetEnvelopeBeforeService(t *testing.T) {
+	tests := []struct {
+		name  string
+		input map[string]any
+	}{
+		{name: "missing run ID", input: map[string]any{"input": map[string]any{"task_description": "change"}}},
+		{name: "blank run ID", input: map[string]any{"run_id": "  ", "input": map[string]any{"task_description": "change"}}},
+		{name: "missing input", input: map[string]any{"run_id": "01J-HATCHET-OWNER"}},
+		{name: "unknown envelope field", input: map[string]any{"run_id": "01J-HATCHET-OWNER", "input": map[string]any{}, "extra": true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeService{}
+			if _, err := resolveHandler(service)(testTaskContext{}, test.input); err == nil {
+				t.Fatal("resolve handler error = nil")
+			}
+			if len(service.calls) != 0 {
+				t.Fatalf("invalid envelope reached service: %#v", service.calls)
+			}
+		})
+	}
+}
+
+func TestDuplicateHatchetObserverCannotExhaustOwnerOnLastRetry(t *testing.T) {
+	service := &fakeService{
+		resolve: func(_ context.Context, _ string, _ json.RawMessage) (workflow.PhaseResult, error) {
+			return workflow.PhaseResult{RunID: "run-owner", Status: run.StatusExecuting}, run.ErrIdempotencyConflict
+		},
+	}
+	input := map[string]any{
+		"run_id": "run-observer",
+		"input":  map[string]any{"task_description": "same durable request"},
+	}
+
+	result, err := resolveHandler(service)(testTaskContext{retryCount: resolveRetries}, input)
+	if !errors.Is(err, run.ErrIdempotencyConflict) {
+		t.Fatalf("observer error = %v, want %v", err, run.ErrIdempotencyConflict)
+	}
+	if result != (workflow.PhaseResult{}) {
+		t.Fatalf("observer result = %#v, want no owner result exposed downstream", result)
+	}
+	if got, want := service.calls, []serviceCall{{method: "resolve", runID: "run-observer"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("observer calls = %#v, want %#v", got, want)
 	}
 }
 
@@ -320,11 +384,13 @@ type recordingDeclaration struct{ tasks []recordedTask }
 
 type recordingWorkflowFactory struct {
 	name        string
+	options     workflowOptions
 	declaration workflowDeclaration
 }
 
-func (f *recordingWorkflowFactory) newWorkflow(name string) workflowDeclaration {
+func (f *recordingWorkflowFactory) newWorkflow(name string, options workflowOptions) workflowDeclaration {
 	f.name = name
+	f.options = options
 	return f.declaration
 }
 
@@ -368,7 +434,7 @@ type serviceCall struct {
 
 type fakeService struct {
 	calls    []serviceCall
-	resolve  func(context.Context, json.RawMessage) (workflow.PhaseResult, error)
+	resolve  func(context.Context, string, json.RawMessage) (workflow.PhaseResult, error)
 	execute  func(context.Context, string) (workflow.PhaseResult, error)
 	approval func(context.Context, string, approval.Gate) (workflow.PhaseResult, error)
 	publish  func(context.Context, string) (workflow.PhaseResult, error)
@@ -376,12 +442,12 @@ type fakeService struct {
 	exhaust  func(context.Context, string, string) (workflow.PhaseResult, error)
 }
 
-func (s *fakeService) Resolve(ctx context.Context, raw json.RawMessage) (workflow.PhaseResult, error) {
-	s.calls = append(s.calls, serviceCall{method: "resolve"})
+func (s *fakeService) ResolveWithRunID(ctx context.Context, runID string, raw json.RawMessage) (workflow.PhaseResult, error) {
+	s.calls = append(s.calls, serviceCall{method: "resolve", runID: runID})
 	if s.resolve != nil {
-		return s.resolve(ctx, raw)
+		return s.resolve(ctx, runID, raw)
 	}
-	return workflow.PhaseResult{RunID: "run-123"}, nil
+	return workflow.PhaseResult{RunID: runID}, nil
 }
 
 func (s *fakeService) Execute(ctx context.Context, runID string) (workflow.PhaseResult, error) {

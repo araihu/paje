@@ -111,6 +111,17 @@ func (s *Store) Reserve(ctx context.Context, reservation run.Reservation) (run.R
 	}
 	runPath := s.runPath(record.ID)
 	if _, err := os.Lstat(runPath); err == nil {
+		if reservation.IdempotencyKey == "" {
+			existing, loadErr := s.loadLocked(record.ID)
+			if loadErr != nil {
+				return run.Record{}, false, fmt.Errorf("reserve existing unkeyed run: %w", loadErr)
+			}
+			if existing.Template != reservation.Template || existing.IdempotencyKey != "" ||
+				existing.InputHash != reservation.InputHash {
+				return existing, false, run.ErrIdempotencyConflict
+			}
+			return existing, false, nil
+		}
 		return run.Record{}, false, run.ErrAlreadyExists
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return run.Record{}, false, fmt.Errorf("reserve inspect run: %w", err)

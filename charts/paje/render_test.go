@@ -225,6 +225,62 @@ func TestChartRejectsSharedActiveCredentialSecrets(t *testing.T) {
 				"--set", "secrets.github.existingSecret=shared-credentials",
 			},
 		},
+		{
+			name: "Codex and existing Hatchet",
+			args: []string{
+				"--set", "adapters.runner=codex",
+				"--set", "secrets.hatchet.existingSecret=shared-credentials",
+				"--set", "codexAuth.existingSecret=shared-credentials",
+			},
+		},
+		{
+			name: "Codex and generated Hatchet",
+			args: []string{
+				"--set", "adapters.runner=codex",
+				"--set", "secrets.hatchet.value=hatchet-value",
+				"--set", "codexAuth.existingSecret=paje-hatchet",
+			},
+		},
+		{
+			name: "Codex and existing Mem0",
+			args: []string{
+				"--set", "adapters.runner=codex",
+				"--set", "adapters.memory=mem0",
+				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
+				"--set", "secrets.mem0.existingSecret=shared-credentials",
+				"--set", "codexAuth.existingSecret=shared-credentials",
+			},
+		},
+		{
+			name: "Codex and generated Mem0",
+			args: []string{
+				"--set", "adapters.runner=codex",
+				"--set", "adapters.memory=mem0",
+				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
+				"--set", "secrets.mem0.value=mem0-value",
+				"--set", "codexAuth.existingSecret=paje-mem0",
+			},
+		},
+		{
+			name: "Codex and existing GitHub",
+			args: []string{
+				"--set", "adapters.runner=codex",
+				"--set", "publisher.adapter=github",
+				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
+				"--set", "secrets.github.existingSecret=shared-credentials",
+				"--set", "codexAuth.existingSecret=shared-credentials",
+			},
+		},
+		{
+			name: "Codex and generated GitHub",
+			args: []string{
+				"--set", "adapters.runner=codex",
+				"--set", "publisher.adapter=github",
+				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
+				"--set", "secrets.github.value=github-value",
+				"--set", "codexAuth.existingSecret=paje-github",
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

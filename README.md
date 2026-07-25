@@ -28,30 +28,36 @@ adds artifact-bound approval and idempotent draft GitHub publication.
 
 ## Workflow input
 
-Start Hatchet workflow `paje-code-change-v1` with a `code-change@v1` JSON
-object. Unknown fields, unsupported versions, arbitrary environment values, and
-shell command fragments are rejected. `tags.user_id` and `tags.app_id` are
-required. A Go profile with no explicit `checks` discovers every tracked
-`go.mod` and runs `go test ./...` in each module with `GOWORK=off`.
+Start Hatchet workflow `paje-code-change-v1` with a thin outer envelope. Generate
+`run_id` once for the logical trigger and reuse it for transport retries. The
+nested `input` is the exact `code-change@v1` JSON object; it is unwrapped before
+provider-neutral validation. Unknown envelope or template fields, unsupported
+versions, arbitrary environment values, and shell command fragments are
+rejected. `tags.user_id` and `tags.app_id` are required. A Go profile with no
+explicit `checks` discovers every tracked `go.mod` and runs `go test ./...` in
+each module with `GOWORK=off`.
 
 Artifact example:
 
 ```json
 {
-  "idempotency_key": "change-api-timeout-20260725",
-  "task_description": "Raise the client timeout and update its tests.",
-  "repository_uri": "https://github.com/example/service.git",
-  "base_ref": "main",
-  "memory_query": "service client timeout conventions",
-  "memory_limit": 5,
-  "tags": {
-    "user_id": "operator@example.com",
-    "app_id": "service"
-  },
-  "profile": "go",
-  "environment_keys": [],
-  "publication": {
-    "mode": "artifact"
+  "run_id": "73f659b2-eaee-4c37-8784-48fab274b3e8",
+  "input": {
+    "idempotency_key": "change-api-timeout-20260725",
+    "task_description": "Raise the client timeout and update its tests.",
+    "repository_uri": "https://github.com/example/service.git",
+    "base_ref": "main",
+    "memory_query": "service client timeout conventions",
+    "memory_limit": 5,
+    "tags": {
+      "user_id": "operator@example.com",
+      "app_id": "service"
+    },
+    "profile": "go",
+    "environment_keys": [],
+    "publication": {
+      "mode": "artifact"
+    }
   }
 }
 ```
@@ -60,24 +66,27 @@ Draft pull-request example:
 
 ```json
 {
-  "idempotency_key": "change-api-timeout-pr-20260725",
-  "task_description": "Raise the client timeout and update its tests.",
-  "repository_uri": "https://github.com/example/service.git",
-  "base_ref": "main",
-  "memory_query": "service client timeout conventions",
-  "memory_limit": 5,
-  "tags": {
-    "user_id": "operator@example.com",
-    "app_id": "service"
-  },
-  "profile": "go",
-  "environment_keys": [],
-  "publication": {
-    "mode": "pull_request",
-    "provider": "github",
-    "target_branch": "main",
-    "title": "Raise the API client timeout",
-    "draft": true
+  "run_id": "c7319354-a3d5-4734-a15d-c91a3b4a00ba",
+  "input": {
+    "idempotency_key": "change-api-timeout-pr-20260725",
+    "task_description": "Raise the client timeout and update its tests.",
+    "repository_uri": "https://github.com/example/service.git",
+    "base_ref": "main",
+    "memory_query": "service client timeout conventions",
+    "memory_limit": 5,
+    "tags": {
+      "user_id": "operator@example.com",
+      "app_id": "service"
+    },
+    "profile": "go",
+    "environment_keys": [],
+    "publication": {
+      "mode": "pull_request",
+      "provider": "github",
+      "target_branch": "main",
+      "title": "Raise the API client timeout",
+      "draft": true
+    }
   }
 }
 ```
@@ -160,10 +169,18 @@ finishes as `declined`; Pajé does not call the publisher.
 
 ## Idempotency and conflict behavior
 
-`idempotency_key` is scoped to `code-change@v1` and bound to a canonical hash of
-the complete validated input. Reusing the same key and input resumes the same
-run. Reusing the key with different input returns an idempotency conflict.
-Omitting the key allocates a new run.
+Hatchet uses the outer `run_id` as status-based trigger idempotency. The key is
+held until the workflow becomes terminal, with a 30-day fallback cap for the
+maximum supported beta run lifetime. The first resolve preallocates that exact
+durable Pajé run ID; a different Hatchet owner cannot attach to or exhaust its
+active stages.
+
+The nested `idempotency_key` remains scoped to `code-change@v1` and bound to a
+canonical hash of the complete validated input. Reusing the same outer
+`run_id`, key, and input resumes the same run. Reusing a nested key with a
+different outer owner or changed input returns an idempotency conflict.
+Omitting the nested key preserves the provider-neutral behavior: each newly
+generated outer `run_id` allocates a distinct run.
 
 Artifacts are immutable and content addressed. GitHub publication uses branch
 `paje/code-change/<run-id>` and a deterministic commit containing these
@@ -246,23 +263,26 @@ The beta Helm values are:
 | `extraEnv` | `[]` | additional worker variables; child access still requires the allowlist |
 
 See `charts/paje/values.yaml` and `charts/paje/values.schema.json` for the exact
-shape and schema constraints. Active Hatchet, Mem0, and GitHub credentials must
-use distinct Secrets.
+shape and schema constraints. Every active Hatchet, Mem0, GitHub, and Codex
+credential must use a distinct Secret, including generated service Secret
+names.
 
 ## Kubernetes deployment
 
 Build the beta image with an auditable source revision:
 
 ```bash
+PAJE_COMMIT="$(git rev-parse --verify 'HEAD^{commit}')"
 docker build \
   --build-arg CODEX_VERSION=0.144.5 \
-  --build-arg PAJE_COMMIT="$(git rev-parse HEAD)" \
+  --build-arg PAJE_COMMIT="$PAJE_COMMIT" \
   -t paje:beta .
 ```
 
-The image includes Codex CLI 0.144.5 and runs as UID/GID 65532. The chart
-supports a read-only root filesystem by mounting writable data, runtime, temp,
-and Codex-home volumes.
+`PAJE_COMMIT` has no fallback: the build rejects a missing value or anything
+other than a full 40-character lowercase hexadecimal commit. The image includes
+Codex CLI 0.144.5 and runs as UID/GID 65532. The chart supports a read-only root
+filesystem by mounting writable data, runtime, temp, and Codex-home volumes.
 
 Create separate worker credentials without putting values in shell history or
 process arguments. This example reads values silently, stores them only in a
@@ -316,7 +336,7 @@ repository and tag below are placeholders for an operator-owned registry:
 
 ```bash
 PAJE_IMAGE_REPOSITORY='<registry>/paje'
-PAJE_IMAGE_TAG="$(git rev-parse HEAD)"
+PAJE_IMAGE_TAG="$PAJE_COMMIT"
 docker tag paje:beta "$PAJE_IMAGE_REPOSITORY:$PAJE_IMAGE_TAG"
 docker push "$PAJE_IMAGE_REPOSITORY:$PAJE_IMAGE_TAG"
 
@@ -400,6 +420,10 @@ Acceptance tests skip with explicit messages unless opted in:
 go test ./internal/acceptance -v
 ```
 
+After either live opt-in is set, every missing executable, authentication file,
+or required variable is a fatal failure; an opted-in acceptance test never
+silently skips.
+
 Authenticated Codex acceptance uses the existing `CODEX_HOME` (or
 `$HOME/.codex`) through the explicit agent-stage policy:
 
@@ -426,6 +450,15 @@ The test creates or reuses only
 `paje/code-change/$PAJE_GITHUB_TEST_RUN_ID`, its deterministic commit, and one
 open draft pull request. It verifies the base ref is unchanged and never
 merges, closes, deletes, or force-pushes.
+
+Docker build-argument validation is separately opt-in and exercises the real
+Dockerfile validation stage:
+
+```bash
+PAJE_DOCKER_ACCEPTANCE=1 \
+  go test ./internal/acceptance \
+  -run TestDockerRevisionBuildArgumentValidation -v -count=1
+```
 
 Optional Kubernetes API validation requires an explicitly verified
 non-production context:
