@@ -1248,9 +1248,33 @@ func TestServicePublishClassifiesConflictAndRetriesTypedOutage(t *testing.T) {
 		fixture.service.publisher = pub
 		result, err := fixture.service.Publish(context.Background(), "run-123")
 		if err == nil || result.Status != run.StatusFailed ||
-			result.FailureClass != run.FailurePublication ||
+			result.FailureClass != run.FailureApproval ||
 			result.Retryable || pub.CallCount() != 0 {
 			t.Fatalf("Publish() result=%#v error=%v calls=%d", result, err, pub.CallCount())
+		}
+		record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		approvalAttempt, found := latestStage(record, approvalStage)
+		if !found || approvalAttempt.Status != run.StageFailed ||
+			approvalAttempt.Failure == nil ||
+			approvalAttempt.Failure.Class != run.FailureApproval ||
+			approvalAttempt.Failure.CauseCode != "publication_requires_approval" ||
+			record.Approval != nil || record.Publication != nil ||
+			len(providerStages(record, publishStage)) != 0 {
+			t.Fatalf("Publish() durable precondition failure = %#v", record)
+		}
+
+		outcomes := &outcomeMemory{}
+		fixture.service.memory = outcomes
+		final, finalizeErr := fixture.service.Finalize(context.Background(), "run-123")
+		if finalizeErr != nil || final.Status != run.StatusFailed ||
+			final.Failure == nil || final.Failure.Class != run.FailureApproval ||
+			final.Failure.CauseCode != "publication_requires_approval" ||
+			final.Publication != nil || outcomes.SaveCount() != 1 {
+			t.Fatalf("Finalize(precondition failure) result=%#v error=%v saves=%d",
+				final, finalizeErr, outcomes.SaveCount())
 		}
 	})
 	t.Run("conflict is terminal", func(t *testing.T) {
@@ -1463,29 +1487,30 @@ func TestServiceFinalizeRetriesRecoversVisibleMemoryAndExhaustsSafely(t *testing
 	})
 
 	t.Run("terminal upstream failure records finalize exhaustion bookkeeping", func(t *testing.T) {
-		terminal := completedServiceFixture(t, "artifact")
+		terminal := newServiceFixture(t)
+		terminal.policy.decision = policy.Decision{
+			Allowed: false,
+			Findings: []policy.Finding{{
+				RuleID: "change-denied", Path: "changed.txt",
+			}},
+		}
+		if _, err := terminal.service.Resolve(
+			context.Background(), validRawInput("change", "terminal-finalize"),
+		); err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+		if _, err := terminal.service.Execute(context.Background(), "run-123"); err == nil {
+			t.Fatal("Execute(failure) error = nil")
+		}
 		record, _ := terminal.runs.Load(context.Background(), "run-123")
 		now := record.UpdatedAt
 		terminal.service.clock = func() time.Time {
 			now = now.Add(time.Second)
 			return now
 		}
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailureAgent, Retryable: false,
-			Diagnostic: "agent failed", CauseCode: "agent_exit",
-		}
-		record.Failure = &failure
-		stage := run.StageResult{
-			Name: "execute-failure", Status: run.StageFailed,
-			StartedAt: terminal.service.clock(), FinishedAt: terminal.service.clock(),
-			Attempts: 1, Failure: &failure,
-		}
-		stage.Name = failure.Stage
-		stage.Attempts = stageAttempt(record, failure.Stage) + 1
-		record, _ = run.UpsertStage(record, stage)
-		record, _ = run.Transition(record, run.StatusFailed, terminal.service.clock())
-		if _, err := terminal.runs.Save(context.Background(), record, record.Version); err != nil {
-			t.Fatal(err)
+		if record.Status != run.StatusFailed || record.Failure == nil ||
+			record.Failure.Class != run.FailurePolicy || record.Artifact != nil {
+			t.Fatalf("terminal upstream fixture = %#v", record)
 		}
 		if _, err := terminal.service.Exhaust(context.Background(), "run-123", "finalize"); err != nil {
 			t.Fatalf("Exhaust(terminal without finalize failure) error = %v", err)
@@ -1506,7 +1531,7 @@ func TestServiceFinalizeRetriesRecoversVisibleMemoryAndExhaustsSafely(t *testing
 		finalize, found := latestStage(record, "finalize")
 		if !found || finalize.Failure == nil || finalize.Failure.Retryable ||
 			finalize.Failure.CauseCode != "retries_exhausted" ||
-			record.OutcomeMemorySaved || record.Failure.Class != run.FailureAgent {
+			record.OutcomeMemorySaved || record.Failure.Class != run.FailurePolicy {
 			t.Fatalf("terminal exhausted record = %#v", record)
 		}
 		before := terminal.service.memory.(*outcomeMemory).SaveCount()
@@ -1549,6 +1574,278 @@ func TestServiceConcurrentFinalizeSavesOneOutcome(t *testing.T) {
 	}
 	if outcomes.SaveCount() != 1 {
 		t.Fatalf("outcome saves = %d, want 1", outcomes.SaveCount())
+	}
+}
+
+func TestServiceValidateProviderPhaseCompatibility(t *testing.T) {
+	finalizedArtifact := func(t *testing.T) *serviceFixture {
+		fixture := artifactReadyServiceFixture(t)
+		fixture.service.memory = &outcomeMemory{}
+		if _, err := fixture.service.Finalize(context.Background(), "run-123"); err != nil {
+			t.Fatalf("Finalize(artifact) error = %v", err)
+		}
+		return fixture
+	}
+	finalizedPublication := func(t *testing.T) *serviceFixture {
+		fixture := publishedServiceFixture(t)
+		fixture.service.memory = &outcomeMemory{}
+		if _, err := fixture.service.Finalize(context.Background(), "run-123"); err != nil {
+			t.Fatalf("Finalize(publication) error = %v", err)
+		}
+		return fixture
+	}
+	tests := []struct {
+		name         string
+		fixture      func(*testing.T) *serviceFixture
+		mutate       func(*run.Record)
+		wantErr      bool
+		skipFinalize bool
+	}{
+		{
+			name:    "artifact skips remain in immediate pre-finalize state",
+			fixture: artifactReadyServiceFixture,
+		},
+		{
+			name:    "artifact skips progress to succeeded",
+			fixture: finalizedArtifact,
+		},
+		{
+			name:    "artifact skips reject awaiting-approval regression",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "artifact skips allow retryable finalize failure",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeFailure(record, run.StatusExecuting, true)
+			},
+		},
+		{
+			name:    "artifact skips allow exhausted finalize failure",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeFailure(record, run.StatusFailed, false)
+			},
+		},
+		{
+			name:    "artifact skips allow finalize cancellation",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeCancellation(record, run.StatusCanceled)
+			},
+		},
+		{
+			name:    "artifact skips reject earlier terminal failure",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				installEarlierFailure(record, run.StatusFailed)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approved pull request remains awaiting approval before publish",
+			fixture: approvedServiceFixture,
+		},
+		{
+			name:    "approved pull request rejects executing regression",
+			fixture: approvedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusExecuting
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approved pull request may have running publish attempt",
+			fixture: approvedServiceFixture,
+			mutate: func(record *run.Record) {
+				installRunningPublish(record)
+			},
+		},
+		{
+			name:    "approved pull request cannot publish without attempt history",
+			fixture: approvedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusPublishing
+			},
+			wantErr: true,
+		},
+		{
+			name: "retryable publish failure remains publishing",
+			fixture: func(t *testing.T) *serviceFixture {
+				return publishFailedServiceFixture(t, true)
+			},
+		},
+		{
+			name: "terminal publish failure remains failed",
+			fixture: func(t *testing.T) *serviceFixture {
+				return publishFailedServiceFixture(t, false)
+			},
+		},
+		{
+			name:    "completed publication remains publishing before finalize",
+			fixture: publishedServiceFixture,
+		},
+		{
+			name:    "completed publication progresses to succeeded",
+			fixture: finalizedPublication,
+		},
+		{
+			name:    "completed publication rejects awaiting-approval regression",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "completed publication rejects executing regression",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusExecuting
+			},
+			wantErr: true,
+		},
+		{
+			name:    "completed publication rejects stale earlier active failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				installEarlierFailure(record, run.StatusPublishing)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "completed publication rejects earlier terminal failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				installEarlierFailure(record, run.StatusFailed)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "completed publication rejects terminal failure without finalize evidence",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				failure := finalizeTestFailure(false)
+				record.Status = run.StatusFailed
+				record.Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "completed publication rejects unbound retryable finalize failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeFailure(record, run.StatusPublishing, true)
+				record.Failure = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "completed publication allows exhausted finalize failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeFailure(record, run.StatusFailed, false)
+			},
+		},
+		{
+			name:    "completed publication allows finalize cancellation",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeCancellation(record, run.StatusCanceled)
+			},
+		},
+		{
+			name:    "succeeded publication rejects stale earlier failure",
+			fixture: finalizedPublication,
+			mutate: func(record *run.Record) {
+				installEarlierFailure(record, run.StatusSucceeded)
+			},
+			wantErr:      true,
+			skipFinalize: true,
+		},
+		{
+			name:    "completed publication rejects finalize failure after success",
+			fixture: finalizedPublication,
+			mutate: func(record *run.Record) {
+				installFinalizeFailure(record, run.StatusFailed, false)
+			},
+			wantErr:      true,
+			skipFinalize: true,
+		},
+		{
+			name:    "succeeded publication requires canonical finalize evidence",
+			fixture: finalizedPublication,
+			mutate: func(record *run.Record) {
+				record.Stages = withoutStage(record.Stages, finalizeStage)
+			},
+			wantErr:      true,
+			skipFinalize: true,
+		},
+		{
+			name:    "succeeded pull request requires completed publication",
+			fixture: approvedServiceFixture,
+			mutate: func(record *run.Record) {
+				installFinalizeSuccess(record)
+				record.Status = run.StatusSucceeded
+				record.OutcomeMemorySaved = true
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			record, err := fixture.runs.Load(context.Background(), "run-123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.mutate != nil {
+				test.mutate(&record)
+			}
+			input, err := validateRunBinding(record)
+			if err != nil {
+				t.Fatalf("validateRunBinding() error = %v", err)
+			}
+			err = fixture.service.validateDurableEvidence(context.Background(), record, input)
+			if test.wantErr && err == nil {
+				t.Fatal("validateDurableEvidence() error = nil")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validateDurableEvidence() error = %v", err)
+			}
+			_, resultErr := fixture.service.resultFromRecord(context.Background(), record)
+			if test.wantErr && resultErr == nil {
+				t.Fatal("resultFromRecord() error = nil")
+			}
+			if !test.wantErr && resultErr != nil {
+				t.Fatalf("resultFromRecord() error = %v", resultErr)
+			}
+			if !test.wantErr || test.skipFinalize {
+				return
+			}
+
+			finalizeFixture := test.fixture(t)
+			outcomes := &outcomeMemory{}
+			finalizeFixture.service.memory = outcomes
+			finalizeFixture.service.runs = &mutateSaveResultStore{
+				Store: finalizeFixture.runs,
+				mutate: func(record run.Record) run.Record {
+					test.mutate(&record)
+					return record
+				},
+			}
+			if _, err := finalizeFixture.service.Finalize(
+				context.Background(), "run-123",
+			); err == nil || outcomes.SaveCount() != 0 {
+				t.Fatalf("Finalize() error=%v memory saves=%d, want rejection before memory",
+					err, outcomes.SaveCount())
+			}
+		})
 	}
 }
 
@@ -1767,6 +2064,92 @@ func providerFailure(stage string, class run.FailureClass, retryable bool) run.F
 		Stage: stage, Class: class, Retryable: retryable,
 		Diagnostic: "provider failed", CauseCode: "provider_failed",
 	}
+}
+
+func providerStages(record run.Record, name string) []run.StageResult {
+	result := make([]run.StageResult, 0)
+	for _, stage := range record.Stages {
+		if stage.Name == name {
+			result = append(result, stage)
+		}
+	}
+	return result
+}
+
+func installRunningPublish(record *run.Record) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	record.Status = run.StatusPublishing
+	record.Failure = nil
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: publishStage, Status: run.StageRunning,
+		StartedAt: startedAt, Attempts: stageAttempt(*record, publishStage) + 1,
+	})
+	record.UpdatedAt = startedAt
+}
+
+func finalizeTestFailure(retryable bool) run.Failure {
+	causeCode := "retries_exhausted"
+	if retryable {
+		causeCode = outcomeFailureReason
+	}
+	return run.Failure{
+		Stage: finalizeStage, Class: run.FailureInternal, Retryable: retryable,
+		Diagnostic: outcomeFailureReason, CauseCode: causeCode,
+	}
+}
+
+func installFinalizeFailure(record *run.Record, status run.Status, retryable bool) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	failure := finalizeTestFailure(retryable)
+	record.Status = status
+	record.Failure = &failure
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: finalizeStage, Status: run.StageFailed,
+		StartedAt: startedAt, FinishedAt: finishedAt,
+		Attempts: stageAttempt(*record, finalizeStage) + 1, Failure: &failure,
+	})
+	record.UpdatedAt = finishedAt
+}
+
+func installFinalizeCancellation(record *run.Record, status run.Status) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	failure := canceledFailure(finalizeStage)
+	record.Status = status
+	record.Failure = &failure
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: finalizeStage, Status: run.StageFailed,
+		StartedAt: startedAt, FinishedAt: finishedAt,
+		Attempts: stageAttempt(*record, finalizeStage) + 1, Failure: &failure,
+	})
+	record.UpdatedAt = finishedAt
+}
+
+func installFinalizeSuccess(record *run.Record) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: finalizeStage, Status: run.StageSucceeded,
+		StartedAt: startedAt, FinishedAt: finishedAt,
+		Attempts: stageAttempt(*record, finalizeStage) + 1,
+		Evidence: map[string]string{"outcome_memory_saved": "true"},
+	})
+	record.UpdatedAt = finishedAt
+}
+
+func installEarlierFailure(record *run.Record, status run.Status) {
+	startedAt := record.UpdatedAt.Add(time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	failure := providerFailure("execute", run.FailureAgent, false)
+	record.Status = status
+	record.Failure = &failure
+	record.Stages = append(record.Stages, run.StageResult{
+		Name: "execute", Status: run.StageFailed,
+		StartedAt: startedAt, FinishedAt: finishedAt,
+		Attempts: stageAttempt(*record, "execute") + 1, Failure: &failure,
+	})
+	record.UpdatedAt = finishedAt
 }
 
 func (f *serviceFixture) publisherCalls() int {

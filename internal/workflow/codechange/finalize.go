@@ -585,6 +585,9 @@ func (s *Service) validateDurableEvidence(
 		if err := validateProviderChronology(history); err != nil {
 			return fmt.Errorf("%w: provider chronology: %v", ErrRunBinding, err)
 		}
+		if err := validateProviderPhaseCompatibility(record, history); err != nil {
+			return fmt.Errorf("%w: provider phase: %v", ErrRunBinding, err)
+		}
 		return nil
 	}
 	if input.Publication.Mode != "pull_request" {
@@ -600,6 +603,9 @@ func (s *Service) validateDurableEvidence(
 		record, input, history,
 	); err != nil {
 		return fmt.Errorf("%w: publication evidence: %v", ErrRunBinding, err)
+	}
+	if err := validateProviderPhaseCompatibility(record, history); err != nil {
+		return fmt.Errorf("%w: provider phase: %v", ErrRunBinding, err)
 	}
 	return nil
 }
@@ -914,6 +920,225 @@ func validatePullRequestPublicationEvidence(
 		return errors.New("publication binding evidence is missing or changed")
 	}
 	return nil
+}
+
+func validateProviderPhaseCompatibility(
+	record run.Record,
+	history providerStageHistory,
+) error {
+	if record.Status == run.StatusSucceeded && record.Failure != nil {
+		return errors.New("succeeded run retains top-level failure")
+	}
+	switch record.PublicationMode {
+	case "artifact":
+		return validateCompletedProviderPhase(record, run.StatusExecuting)
+	case "pull_request":
+		return validatePullRequestProviderPhase(record, history)
+	default:
+		return errors.New("unsupported publication mode")
+	}
+}
+
+func validatePullRequestProviderPhase(
+	record run.Record,
+	history providerStageHistory,
+) error {
+	if len(history.approval) == 0 {
+		if record.Status != run.StatusExecuting || record.Failure != nil {
+			return errors.New("run without approval history has invalid phase state")
+		}
+		return nil
+	}
+	approval := history.approval[len(history.approval)-1].stage
+	switch approval.Status {
+	case run.StageRunning, run.StageFailed:
+		if len(history.publish) != 0 {
+			return errors.New("publication began before approval completed")
+		}
+		return nil
+	case run.StageSucceeded:
+	default:
+		return errors.New("pull-request approval has invalid completed state")
+	}
+	if record.Approval == nil {
+		return errors.New("completed approval lacks decision")
+	}
+	if !record.Approval.Approved {
+		if record.Status != run.StatusDeclined || record.Failure != nil ||
+			len(history.publish) != 0 {
+			return errors.New("declined approval has invalid phase state")
+		}
+		return nil
+	}
+	if len(history.publish) == 0 {
+		if record.Status != run.StatusAwaitingApproval || record.Failure != nil {
+			return errors.New("approved run without publication has invalid phase state")
+		}
+		return nil
+	}
+	publish := history.publish[len(history.publish)-1].stage
+	switch publish.Status {
+	case run.StageRunning, run.StageFailed:
+		return nil
+	case run.StageSucceeded:
+		return validateCompletedProviderPhase(record, run.StatusPublishing)
+	default:
+		return errors.New("pull-request publication has invalid completed state")
+	}
+}
+
+func validateCompletedProviderPhase(record run.Record, immediate run.Status) error {
+	switch record.Status {
+	case immediate:
+		if record.Failure != nil {
+			return validateCanonicalFinalizeFailure(record, true)
+		}
+		return validateOpenFinalizeHistory(record)
+	case run.StatusSucceeded:
+		if record.Failure != nil {
+			return errors.New("succeeded run retains failure")
+		}
+		return validateCanonicalFinalizeSuccess(record)
+	case run.StatusFailed, run.StatusCanceled:
+		return validateCanonicalFinalizeFailure(record, false)
+	default:
+		return fmt.Errorf(
+			"completed provider history cannot have run status %q", record.Status,
+		)
+	}
+}
+
+func validateOpenFinalizeHistory(record run.Record) error {
+	history, err := validateFinalizeHistory(record)
+	if err != nil {
+		return err
+	}
+	if record.OutcomeMemorySaved {
+		return errors.New("pre-finalize run retains outcome memory marker")
+	}
+	if len(history) == 0 {
+		return nil
+	}
+	if history[len(history)-1].Status != run.StageRunning {
+		return errors.New("open finalize history is not running")
+	}
+	return nil
+}
+
+func validateCanonicalFinalizeFailure(record run.Record, active bool) error {
+	if record.Failure == nil || record.Failure.Stage != finalizeStage {
+		return errors.New("completed provider history requires finalize top-level failure")
+	}
+	history, err := validateFinalizeHistory(record)
+	if err != nil {
+		return err
+	}
+	if record.OutcomeMemorySaved {
+		return errors.New("failed finalize history retains outcome memory marker")
+	}
+	if len(history) == 0 {
+		return errors.New("finalize failure evidence is missing")
+	}
+	latest := history[len(history)-1]
+	if latest.Status != run.StageFailed || latest.Failure == nil ||
+		!reflect.DeepEqual(latest.Failure, record.Failure) ||
+		len(latest.Evidence) != 0 {
+		return errors.New("finalize failure evidence is missing or changed")
+	}
+	var expected run.Failure
+	switch {
+	case active:
+		expected = finalizeMemoryFailure()
+	case record.Status == run.StatusCanceled:
+		expected = canceledFailure(finalizeStage)
+	case record.Status == run.StatusFailed:
+		expected = finalizeMemoryFailure()
+		expected.Retryable = false
+		expected.CauseCode = "retries_exhausted"
+	default:
+		return errors.New("finalize failure has invalid run status")
+	}
+	if !reflect.DeepEqual(*record.Failure, expected) {
+		return errors.New("finalize failure is not canonical for run status")
+	}
+	return nil
+}
+
+func validateCanonicalFinalizeSuccess(record run.Record) error {
+	if !record.OutcomeMemorySaved {
+		return errors.New("succeeded run lacks outcome memory marker")
+	}
+	history, err := validateFinalizeHistory(record)
+	if err != nil {
+		return err
+	}
+	if len(history) == 0 {
+		return errors.New("succeeded run lacks finalize evidence")
+	}
+	latest := history[len(history)-1]
+	if latest.Status != run.StageSucceeded || latest.Failure != nil ||
+		!sameStringMap(
+			latest.Evidence,
+			map[string]string{"outcome_memory_saved": "true"},
+		) {
+		return errors.New("succeeded run lacks canonical finalize evidence")
+	}
+	return nil
+}
+
+func validateFinalizeHistory(record run.Record) ([]run.StageResult, error) {
+	history := make([]run.StageResult, 0)
+	for _, stage := range record.Stages {
+		if stage.Name != finalizeStage {
+			continue
+		}
+		if stage.Attempts != len(history)+1 {
+			return nil, errors.New("finalize attempts are not contiguous")
+		}
+		switch stage.Status {
+		case run.StageRunning:
+			if stage.Failure != nil || len(stage.Evidence) != 0 {
+				return nil, errors.New("running finalize attempt carries completion state")
+			}
+		case run.StageFailed:
+			if stage.Failure == nil || stage.Failure.Stage != finalizeStage ||
+				len(stage.Evidence) != 0 || !canonicalFinalizeFailure(*stage.Failure) {
+				return nil, errors.New("failed finalize attempt is not canonical")
+			}
+		case run.StageSucceeded:
+			if stage.Failure != nil || !sameStringMap(
+				stage.Evidence,
+				map[string]string{"outcome_memory_saved": "true"},
+			) {
+				return nil, errors.New("succeeded finalize attempt is not canonical")
+			}
+		default:
+			return nil, errors.New("finalize attempt has invalid status")
+		}
+		if len(history) != 0 {
+			previous := history[len(history)-1]
+			if previous.Status != run.StageFailed || previous.Failure == nil ||
+				!previous.Failure.Retryable {
+				return nil, errors.New("finalize continued after a closed attempt")
+			}
+			if !previous.FinishedAt.Before(stage.StartedAt) {
+				return nil, errors.New("finalize attempts overlap")
+			}
+		}
+		history = append(history, stage)
+	}
+	return history, nil
+}
+
+func canonicalFinalizeFailure(failure run.Failure) bool {
+	if reflect.DeepEqual(failure, finalizeMemoryFailure()) ||
+		reflect.DeepEqual(failure, canceledFailure(finalizeStage)) {
+		return true
+	}
+	exhausted := finalizeMemoryFailure()
+	exhausted.Retryable = false
+	exhausted.CauseCode = "retries_exhausted"
+	return reflect.DeepEqual(failure, exhausted)
 }
 
 type keyedMutex struct {

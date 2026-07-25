@@ -25,16 +25,21 @@ func (s *Service) Publish(ctx context.Context, runID string) (PhaseResult, error
 	if input.Publication.Mode == "artifact" {
 		return s.skipStage(ctx, record, publishStage)
 	}
-	request, err := buildPublisherRequest(record, input)
-	if err != nil {
-		return s.recordPublishFailure(ctx, record, publishBindingFailure(), err)
-	}
 	approvalRequest := buildApprovalRequest(record, input, bundle)
 	if err := validatePersistedApproval(record, approvalRequest); err != nil ||
 		record.Approval == nil || !record.Approval.Approved {
 		if err == nil {
 			err = errors.New("approval decision is not approved")
 		}
+		if record.Approval == nil {
+			return s.recordPublishApprovalPreconditionFailure(ctx, record, err)
+		}
+		return phaseResult(record), fmt.Errorf(
+			"%w: publication approval binding is invalid", ErrRunBinding,
+		)
+	}
+	request, err := buildPublisherRequest(record, input)
+	if err != nil {
 		return s.recordPublishFailure(ctx, record, publishBindingFailure(), err)
 	}
 	if record.Publication != nil {
@@ -200,6 +205,76 @@ func (s *Service) persistPublication(
 	return phaseResult(record), err
 }
 
+func (s *Service) recordPublishApprovalPreconditionFailure(
+	ctx context.Context,
+	record run.Record,
+	cause error,
+) (PhaseResult, error) {
+	if latest, found := latestStage(record, approvalStage); found {
+		switch latest.Status {
+		case run.StageRunning:
+			return phaseInProgress(record)
+		case run.StageFailed:
+			if latest.Failure == nil {
+				return phaseResult(record), fmt.Errorf(
+					"%w: failed approval precondition lacks failure", ErrRunBinding,
+				)
+			}
+			return phaseResult(record), newPhaseError(*latest.Failure, cause)
+		default:
+			return phaseResult(record), fmt.Errorf(
+				"%w: approval result is missing from completed stage", ErrRunBinding,
+			)
+		}
+	}
+	failure := publishApprovalPreconditionFailure()
+	failed, err := s.mutate(ctx, record.ID, func(current run.Record) (run.Record, bool, error) {
+		if current.Terminal() {
+			return current, false, nil
+		}
+		if current.Approval != nil || len(providerStageEntries(current, approvalStage)) != 0 {
+			return run.Record{}, false, fmt.Errorf(
+				"%w: approval state changed before publication precondition failure",
+				ErrRunBinding,
+			)
+		}
+		if current.Status != run.StatusExecuting {
+			return run.Record{}, false, fmt.Errorf(
+				"%w: publication approval precondition has status %q",
+				ErrRunBinding, current.Status,
+			)
+		}
+		now := s.clock()
+		failureCopy := failure
+		next := run.CloneRecord(current)
+		next.Failure = &failureCopy
+		stage := run.StageResult{
+			Name: approvalStage, Status: run.StageFailed,
+			StartedAt: now, FinishedAt: now, Attempts: 1,
+			Failure: &failureCopy,
+		}
+		var err error
+		next, err = run.UpsertStage(next, stage)
+		if err != nil {
+			return run.Record{}, false, err
+		}
+		next.UpdatedAt = now
+		next, err = run.Transition(next, run.StatusFailed, now)
+		return next, true, err
+	})
+	return phaseResult(failed), errors.Join(newPhaseError(failure, cause), err)
+}
+
+func providerStageEntries(record run.Record, name string) []run.StageResult {
+	entries := make([]run.StageResult, 0)
+	for _, stage := range record.Stages {
+		if stage.Name == name {
+			entries = append(entries, stage)
+		}
+	}
+	return entries
+}
+
 func validatePersistedPublication(
 	record run.Record,
 	request publisher.Request,
@@ -313,5 +388,13 @@ func publishBindingFailure() run.Failure {
 		Stage: publishStage, Class: run.FailurePublication, Retryable: false,
 		Diagnostic: "publication approval binding is invalid",
 		CauseCode:  "publication_binding_mismatch",
+	}
+}
+
+func publishApprovalPreconditionFailure() run.Failure {
+	return run.Failure{
+		Stage: approvalStage, Class: run.FailureApproval, Retryable: false,
+		Diagnostic: "publication requires an approved decision",
+		CauseCode:  "publication_requires_approval",
 	}
 }
