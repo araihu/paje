@@ -1,12 +1,18 @@
 package run
 
 import (
+	"bytes"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 )
 
 func Validate(record Record) error {
+	canonicalInput, err := CanonicalInput(record.Input)
+	if err != nil {
+		return err
+	}
 	switch {
 	case !runIDPattern.MatchString(record.ID):
 		return invalidRecord("run ID is invalid")
@@ -18,6 +24,8 @@ func Validate(record Record) error {
 		return invalidRecord("input hash is required")
 	case len(record.Input) == 0:
 		return invalidRecord("input is required")
+	case !bytes.Equal(record.Input, canonicalInput):
+		return invalidRecord("input is not canonical JSON")
 	case strings.TrimSpace(record.RepositoryURI) == "":
 		return invalidRecord("repository URI is required")
 	case strings.TrimSpace(record.BaseRef) == "":
@@ -76,8 +84,13 @@ func Validate(record Record) error {
 		if !record.OutcomeMemorySaved {
 			return invalidRecord("successful run requires saved outcome memory")
 		}
-		if record.PublicationMode == "pull_request" && record.Publication == nil {
-			return invalidRecord("successful pull request run requires publication")
+		if record.PublicationMode == "pull_request" {
+			if record.Approval == nil || !record.Approval.Approved {
+				return invalidRecord("successful pull request run requires approved decision")
+			}
+			if record.Publication == nil {
+				return invalidRecord("successful pull request run requires publication")
+			}
 		}
 	case StatusFailed, StatusCanceled:
 		if record.Failure == nil {
@@ -92,11 +105,21 @@ func Validate(record Record) error {
 		if err := validateFailure(*record.Failure); err != nil {
 			return err
 		}
+		if record.Terminal() && record.Failure.Retryable {
+			return invalidRecord("terminal run cannot be retryable")
+		}
+	}
+	if record.Status == StatusCanceled &&
+		(record.Failure == nil || record.Failure.Class != FailureCanceled || record.Failure.Retryable) {
+		return invalidRecord("canceled run requires non-retryable canceled failure")
 	}
 	return nil
 }
 
 func Transition(record Record, next Status, now time.Time) (Record, error) {
+	if err := Validate(record); err != nil {
+		return Record{}, fmt.Errorf("transition source: %w", err)
+	}
 	if record.Terminal() {
 		return Record{}, fmt.Errorf("%w: terminal status %q cannot change", ErrInvalidTransition, record.Status)
 	}
@@ -125,6 +148,12 @@ func PrepareSave(current, next Record) (Record, error) {
 	if !SameImmutableIdentity(current, next) {
 		return Record{}, invalidRecord("immutable identity or input changed")
 	}
+	if current.Terminal() && !reflect.DeepEqual(current, next) {
+		return Record{}, invalidRecord("terminal record is immutable")
+	}
+	if err := validateMonotonicEvidence(current, next); err != nil {
+		return Record{}, err
+	}
 	if next.UpdatedAt.Before(current.UpdatedAt) {
 		return Record{}, invalidRecord("updated time moved backward")
 	}
@@ -149,15 +178,25 @@ func UpsertStage(record Record, result StageResult) (Record, error) {
 		return Record{}, err
 	}
 	cloned := CloneRecord(record)
+	highestAttempt := 0
 	for index := range cloned.Stages {
 		existing := cloned.Stages[index]
 		if existing.Name != result.Name {
 			continue
 		}
-		if result.Attempts < existing.Attempts {
-			return Record{}, invalidRecord("stage attempt moved backward")
+		if existing.Attempts > highestAttempt {
+			highestAttempt = existing.Attempts
 		}
-		if result.Attempts == existing.Attempts && stageFinished(existing) && !stageFinished(result) {
+	}
+	if result.Attempts < highestAttempt {
+		return Record{}, invalidRecord("stage attempt moved backward")
+	}
+	for index := range cloned.Stages {
+		existing := cloned.Stages[index]
+		if existing.Name != result.Name || existing.Attempts != result.Attempts {
+			continue
+		}
+		if stageFinished(existing) && !stageFinished(result) {
 			return Record{}, invalidRecord("finished stage cannot become unfinished")
 		}
 		cloned.Stages[index] = cloneStage(result)
@@ -165,6 +204,67 @@ func UpsertStage(record Record, result StageResult) (Record, error) {
 	}
 	cloned.Stages = append(cloned.Stages, cloneStage(result))
 	return cloned, nil
+}
+
+func validateMonotonicEvidence(current, next Record) error {
+	switch {
+	case current.BaseSHA != "" && next.BaseSHA != current.BaseSHA:
+		return invalidRecord("base SHA is write-once")
+	case (current.BaseSHA != "" || current.MemorySnapshot != nil) &&
+		!reflect.DeepEqual(current.MemorySnapshot, next.MemorySnapshot):
+		return invalidRecord("memory snapshot is write-once")
+	case current.Artifact != nil && !reflect.DeepEqual(current.Artifact, next.Artifact):
+		return invalidRecord("artifact is write-once")
+	case current.Approval != nil && !reflect.DeepEqual(current.Approval, next.Approval):
+		return invalidRecord("approval is write-once")
+	case current.Publication != nil && !reflect.DeepEqual(current.Publication, next.Publication):
+		return invalidRecord("publication is write-once")
+	case current.OutcomeMemorySaved && !next.OutcomeMemorySaved:
+		return invalidRecord("outcome memory marker cannot regress")
+	}
+	return validateMonotonicStages(current.Stages, next.Stages)
+}
+
+func validateMonotonicStages(current, next []StageResult) error {
+	nextByKey := make(map[string]StageResult, len(next))
+	for _, stage := range next {
+		nextByKey[stageKey(stage)] = stage
+	}
+	for _, existing := range current {
+		candidate, ok := nextByKey[stageKey(existing)]
+		if !ok {
+			return invalidRecord("stage history cannot be removed")
+		}
+		if stageFinished(existing) && !reflect.DeepEqual(existing, candidate) &&
+			!isRetryExhaustion(existing, candidate) {
+			return invalidRecord("finished stage evidence is immutable")
+		}
+		if !stageFinished(existing) &&
+			(candidate.Name != existing.Name || candidate.Attempts != existing.Attempts ||
+				!candidate.StartedAt.Equal(existing.StartedAt)) {
+			return invalidRecord("running stage identity is immutable")
+		}
+	}
+	return nil
+}
+
+func isRetryExhaustion(current, next StageResult) bool {
+	if current.Failure == nil || next.Failure == nil ||
+		!current.Failure.Retryable || next.Failure.Retryable ||
+		next.Failure.CauseCode != "retries_exhausted" ||
+		current.Failure.Stage != next.Failure.Stage ||
+		current.Failure.Class != next.Failure.Class {
+		return false
+	}
+	currentWithoutFailure := current
+	currentWithoutFailure.Failure = nil
+	nextWithoutFailure := next
+	nextWithoutFailure.Failure = nil
+	return reflect.DeepEqual(currentWithoutFailure, nextWithoutFailure)
+}
+
+func stageKey(stage StageResult) string {
+	return fmt.Sprintf("%s\x00%d", stage.Name, stage.Attempts)
 }
 
 func validateEdge(current, next Status, record Record) error {

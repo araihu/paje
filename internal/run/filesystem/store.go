@@ -96,6 +96,13 @@ func (s *Store) Reserve(ctx context.Context, reservation run.Reservation) (run.R
 		case !errors.Is(err, os.ErrNotExist):
 			return run.Record{}, false, fmt.Errorf("reserve read idempotency binding: %w", err)
 		}
+		reconciled, found, reconcileErr := s.reconcileLocked(ctx, reservation, indexPath)
+		if reconcileErr != nil {
+			return run.Record{}, false, reconcileErr
+		}
+		if found {
+			return reconciled, false, nil
+		}
 	}
 
 	record, err := run.NewRecord(reservation)
@@ -121,6 +128,52 @@ func (s *Store) Reserve(ctx context.Context, reservation run.Reservation) (run.R
 		}
 	}
 	return run.CloneRecord(record), true, nil
+}
+
+func (s *Store) reconcileLocked(
+	ctx context.Context,
+	reservation run.Reservation,
+	indexPath string,
+) (run.Record, bool, error) {
+	entries, err := os.ReadDir(s.runsDirectory)
+	if err != nil {
+		return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: read runs: %w", err)
+	}
+	var match *run.Record
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return run.Record{}, false, err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if !validRunID(id) {
+			return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: %w: invalid run filename", run.ErrInvalidRecord)
+		}
+		candidate, err := s.loadLocked(id)
+		if err != nil {
+			return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: %w", err)
+		}
+		if candidate.Template != reservation.Template || candidate.IdempotencyKey != reservation.IdempotencyKey {
+			continue
+		}
+		if match != nil {
+			return run.Record{}, false, fmt.Errorf("%w: duplicate stored runs for template and key", run.ErrIdempotencyConflict)
+		}
+		candidateCopy := run.CloneRecord(candidate)
+		match = &candidateCopy
+	}
+	if match == nil {
+		return run.Record{}, false, nil
+	}
+	if match.InputHash != reservation.InputHash {
+		return run.Record{}, false, run.ErrIdempotencyConflict
+	}
+	if err := atomicWriteJSON(ctx, indexPath, binding{RunID: match.ID, InputHash: match.InputHash}); err != nil {
+		return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: write binding: %w", err)
+	}
+	return run.CloneRecord(*match), true, nil
 }
 
 func (s *Store) Load(ctx context.Context, id string) (run.Record, error) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -139,7 +140,7 @@ func (r Record) Terminal() bool {
 }
 
 func (r Record) Retryable() bool {
-	return r.Failure != nil && r.Failure.Retryable
+	return !r.Terminal() && r.Failure != nil && r.Failure.Retryable
 }
 
 func SafeDiagnostic(value string) string {
@@ -169,10 +170,14 @@ func NewRecord(reservation Reservation) (Record, error) {
 	if err := ValidateReservation(reservation); err != nil {
 		return Record{}, err
 	}
+	canonical, err := CanonicalInput(reservation.Input)
+	if err != nil {
+		return Record{}, err
+	}
 	record := Record{
 		ID: reservation.NewRunID, Version: 1, Template: reservation.Template,
 		IdempotencyKey: reservation.IdempotencyKey, InputHash: reservation.InputHash,
-		Input: append(json.RawMessage(nil), reservation.Input...), Status: StatusPending,
+		Input: canonical, Status: StatusPending,
 		PublicationMode: reservation.PublicationMode, RepositoryURI: reservation.RepositoryURI,
 		BaseRef: reservation.BaseRef, Stages: []StageResult{},
 		CreatedAt: reservation.CreatedAt, UpdatedAt: reservation.CreatedAt,
@@ -184,6 +189,9 @@ func NewRecord(reservation Reservation) (Record, error) {
 }
 
 func ValidateReservation(reservation Reservation) error {
+	if _, err := CanonicalInput(reservation.Input); err != nil {
+		return err
+	}
 	switch {
 	case !runIDPattern.MatchString(reservation.NewRunID):
 		return invalidRecord("run ID is invalid")
@@ -191,8 +199,6 @@ func ValidateReservation(reservation Reservation) error {
 		return invalidRecord("template is invalid")
 	case strings.TrimSpace(reservation.InputHash) == "":
 		return invalidRecord("input hash is required")
-	case len(reservation.Input) == 0 || !json.Valid(reservation.Input):
-		return invalidRecord("input must be valid JSON")
 	case strings.TrimSpace(reservation.RepositoryURI) == "":
 		return invalidRecord("repository URI is required")
 	case strings.TrimSpace(reservation.BaseRef) == "":
@@ -204,6 +210,29 @@ func ValidateReservation(reservation Reservation) error {
 	default:
 		return nil
 	}
+}
+
+// CanonicalInput returns deterministic JSON with insignificant whitespace and
+// object-key ordering normalized without converting numbers through float64.
+func CanonicalInput(input json.RawMessage) (json.RawMessage, error) {
+	if len(input) == 0 {
+		return nil, invalidRecord("input must be valid JSON")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, invalidRecord("input must be valid JSON")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, invalidRecord("input must contain one JSON value")
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, invalidRecord("input cannot be canonicalized")
+	}
+	return json.RawMessage(canonical), nil
 }
 
 func CloneRecord(source Record) Record {
