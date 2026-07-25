@@ -1163,6 +1163,13 @@ func validateFinalizeWithoutCompletedProvider(
 	if !record.Terminal() {
 		return validateNoFinalizeBookkeeping(record, history)
 	}
+	if boundary == nil {
+		upstream, err := validateUpstreamTerminalFailure(record)
+		if err != nil {
+			return err
+		}
+		boundary = &upstream
+	}
 	if err := validateFinalizeAfterProvider(record, history, boundary); err != nil {
 		return err
 	}
@@ -1186,6 +1193,35 @@ func validateFinalizeWithoutCompletedProvider(
 		return errors.New("finalize bookkeeping has invalid latest status")
 	}
 	return nil
+}
+
+func validateUpstreamTerminalFailure(
+	record run.Record,
+) (providerStageEntry, error) {
+	if record.Failure == nil {
+		return providerStageEntry{}, errors.New("terminal upstream failure is missing")
+	}
+	if record.Failure.Stage == finalizeStage {
+		return providerStageEntry{}, errors.New("finalize failure replaced upstream failure")
+	}
+	var boundary providerStageEntry
+	found := false
+	for index, stage := range record.Stages {
+		if stage.Name != record.Failure.Stage ||
+			(found && stage.Attempts <= boundary.stage.Attempts) {
+			continue
+		}
+		boundary = providerStageEntry{stage: stage, index: index}
+		found = true
+	}
+	if !found || boundary.stage.Status != run.StageFailed ||
+		boundary.stage.Failure == nil ||
+		!reflect.DeepEqual(boundary.stage.Failure, record.Failure) {
+		return providerStageEntry{}, errors.New(
+			"terminal upstream failure evidence is missing or changed",
+		)
+	}
+	return boundary, nil
 }
 
 func validateFinalizeAfterProvider(

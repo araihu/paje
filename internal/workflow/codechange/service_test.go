@@ -2120,6 +2120,175 @@ func TestServiceValidateFinalizeStartsAfterProviderCompletion(t *testing.T) {
 	}
 }
 
+func TestServiceValidateFinalizeStartsAfterUpstreamFailure(t *testing.T) {
+	fixtures := []struct {
+		name  string
+		stage string
+		build func(*testing.T) *serviceFixture
+	}{
+		{name: "resolve", stage: "resolve", build: resolveFailedServiceFixture},
+		{name: "execute", stage: "execute", build: executeFailedServiceFixture},
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*run.Record, string)
+	}{
+		{
+			name: "reordered",
+			mutate: func(record *run.Record, stage string) {
+				moveLatestStageBefore(record, finalizeStage, stage)
+			},
+		},
+		{
+			name: "equal finish",
+			mutate: func(record *run.Record, stage string) {
+				startFinalizeRelativeToStage(record, stage, "equal")
+			},
+		},
+		{
+			name: "overlap",
+			mutate: func(record *run.Record, stage string) {
+				startFinalizeRelativeToStage(record, stage, "overlap")
+			},
+		},
+		{
+			name: "reversed",
+			mutate: func(record *run.Record, stage string) {
+				startFinalizeRelativeToStage(record, stage, "reversed")
+			},
+		},
+	}
+
+	for _, fixtureTest := range fixtures {
+		for _, mutation := range mutations {
+			t.Run(fixtureTest.name+"/"+mutation.name, func(t *testing.T) {
+				fixture := fixtureTest.build(t)
+				record, err := fixture.runs.Load(context.Background(), "run-123")
+				if err != nil {
+					t.Fatal(err)
+				}
+				installUpstreamFinalizeFailure(&record)
+				mutation.mutate(&record, fixtureTest.stage)
+				input, err := validateRunBinding(record)
+				if err != nil {
+					t.Fatalf("validateRunBinding() error = %v", err)
+				}
+				if err := fixture.service.validateDurableEvidence(
+					context.Background(), record, input,
+				); err == nil {
+					t.Fatal("validateDurableEvidence() error = nil")
+				}
+				if _, err := fixture.service.resultFromRecord(
+					context.Background(), record,
+				); err == nil {
+					t.Fatal("resultFromRecord() error = nil")
+				}
+			})
+		}
+	}
+}
+
+func TestServiceValidateFinalizePreservesUpstreamFailure(t *testing.T) {
+	fixtures := []struct {
+		name  string
+		stage string
+		build func(*testing.T) *serviceFixture
+	}{
+		{name: "resolve", stage: "resolve", build: resolveFailedServiceFixture},
+		{name: "execute", stage: "execute", build: executeFailedServiceFixture},
+	}
+	mutations := []struct {
+		name        string
+		mutate      func(*run.Record, string)
+		checkClosed bool
+	}{
+		{
+			name: "finalize replaces top failure",
+			mutate: func(record *run.Record, _ string) {
+				finalize := providerStagePointer(record, finalizeStage, 1)
+				failure := finalizeTestFailure(false)
+				finalize.Failure = &failure
+				record.Failure = &failure
+			},
+			checkClosed: true,
+		},
+		{
+			name: "upstream top failure is missing",
+			mutate: func(record *run.Record, _ string) {
+				record.Failure = nil
+			},
+		},
+		{
+			name: "upstream top failure differs from stage",
+			mutate: func(record *run.Record, _ string) {
+				failure := *record.Failure
+				failure.CauseCode = "different_upstream_failure"
+				record.Failure = &failure
+			},
+		},
+		{
+			name: "upstream failure stage is missing",
+			mutate: func(record *run.Record, stage string) {
+				record.Stages = withoutStage(record.Stages, stage)
+			},
+		},
+		{
+			name: "upstream failure stage is not failed",
+			mutate: func(record *run.Record, stage string) {
+				upstream := providerStagePointer(
+					record, stage, stageAttempt(*record, stage),
+				)
+				upstream.Status = run.StageSucceeded
+			},
+		},
+	}
+
+	for _, fixtureTest := range fixtures {
+		for _, mutation := range mutations {
+			t.Run(fixtureTest.name+"/"+mutation.name, func(t *testing.T) {
+				fixture := fixtureTest.build(t)
+				record, err := fixture.runs.Load(context.Background(), "run-123")
+				if err != nil {
+					t.Fatal(err)
+				}
+				installUpstreamFinalizeFailure(&record)
+				mutation.mutate(&record, fixtureTest.stage)
+				input, err := validateRunBinding(record)
+				if err != nil {
+					t.Fatalf("validateRunBinding() error = %v", err)
+				}
+				if err := fixture.service.validateDurableEvidence(
+					context.Background(), record, input,
+				); err == nil {
+					t.Fatal("validateDurableEvidence() error = nil")
+				}
+				if _, err := fixture.service.resultFromRecord(
+					context.Background(), record,
+				); err == nil {
+					t.Fatal("resultFromRecord() error = nil")
+				}
+				if !mutation.checkClosed {
+					return
+				}
+				outcomes := &outcomeMemory{}
+				fixture.service.memory = outcomes
+				fixture.runs.loadMutate = func(record run.Record) run.Record {
+					installUpstreamFinalizeFailure(&record)
+					mutation.mutate(&record, fixtureTest.stage)
+					return record
+				}
+				if result, err := fixture.service.Finalize(
+					context.Background(), "run-123",
+				); err == nil || result.RunID != "run-123" ||
+					outcomes.SaveCount() != 0 {
+					t.Fatalf("Finalize(finalize-only failure) result=%#v error=%v saves=%d",
+						result, err, outcomes.SaveCount())
+				}
+			})
+		}
+	}
+}
+
 func completedServiceFixture(t *testing.T, mode string) *serviceFixture {
 	t.Helper()
 	fixture := newServiceFixture(t)
@@ -2172,6 +2341,50 @@ func completedServiceFixture(t *testing.T, mode string) *serviceFixture {
 		if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
 			t.Fatalf("Publish(artifact) error = %v", err)
 		}
+	}
+	return fixture
+}
+
+func resolveFailedServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	fixture := newServiceFixture(t)
+	fixture.resolver.revision.SourceDirty = true
+	if _, err := fixture.service.Resolve(
+		context.Background(), validRawInput("change", "resolve-failure"),
+	); err == nil {
+		t.Fatal("Resolve(source dirty) error = nil")
+	}
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil || record.Status != run.StatusFailed ||
+		record.Failure == nil || record.Failure.Stage != "resolve" ||
+		record.Artifact != nil {
+		t.Fatalf("resolve failure fixture = %#v error=%v", record, err)
+	}
+	return fixture
+}
+
+func executeFailedServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	fixture := newServiceFixture(t)
+	fixture.policy.decision = policy.Decision{
+		Allowed: false,
+		Findings: []policy.Finding{{
+			RuleID: "change-denied", Path: "changed.txt",
+		}},
+	}
+	if _, err := fixture.service.Resolve(
+		context.Background(), validRawInput("change", "execute-failure"),
+	); err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if _, err := fixture.service.Execute(context.Background(), "run-123"); err == nil {
+		t.Fatal("Execute(policy failure) error = nil")
+	}
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil || record.Status != run.StatusFailed ||
+		record.Failure == nil || record.Failure.Stage != "execute" ||
+		record.Artifact != nil {
+		t.Fatalf("execute failure fixture = %#v error=%v", record, err)
 	}
 	return fixture
 }
@@ -2437,6 +2650,26 @@ func startFinalizeAtProviderFinish(record *run.Record, provider string) {
 	if finalize.Status != run.StageRunning {
 		finalize.FinishedAt = finalize.StartedAt.Add(max(duration, time.Second))
 	}
+}
+
+func startFinalizeRelativeToStage(record *run.Record, stageName, relation string) {
+	upstream, found := latestStage(*record, stageName)
+	if !found {
+		panic("upstream stage not found")
+	}
+	finalize := providerStagePointer(record, finalizeStage, 1)
+	duration := finalize.FinishedAt.Sub(finalize.StartedAt)
+	switch relation {
+	case "equal":
+		finalize.StartedAt = upstream.FinishedAt
+	case "overlap":
+		finalize.StartedAt = upstream.FinishedAt.Add(-time.Nanosecond)
+	case "reversed":
+		finalize.StartedAt = upstream.StartedAt.Add(-time.Second)
+	default:
+		panic("unknown finalize relation")
+	}
+	finalize.FinishedAt = finalize.StartedAt.Add(max(duration, time.Second))
 }
 
 func finalizeTestFailure(retryable bool) run.Failure {
