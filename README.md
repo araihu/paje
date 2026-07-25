@@ -441,6 +441,12 @@ Do not run the server-side dry-run merely because a current context exists.
 
 ## Security boundary
 
+- Before reading configuration, the worker installs an OS process-inspection
+  guard: the packaged Linux worker becomes non-dumpable. Together with the
+  chart's dropped capabilities and `noNewPrivileges`, this prevents same-UID
+  agent and verification descendants from reading the credential-bearing
+  parent through process inspection. The worker fails closed on non-Linux
+  platforms or if the guard cannot be installed.
 - Codex receives a minimal platform environment, a fresh per-attempt home/temp
   tree, explicit `CODEX_HOME`, and operator-approved non-secret keys only.
 - Verification receives neither Codex auth nor Hatchet, Mem0, GitHub, Git, or

@@ -28,6 +28,7 @@ import (
 	"github.com/araihu/paje/internal/memory/mem0"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
 	"github.com/araihu/paje/internal/policy"
+	"github.com/araihu/paje/internal/processguard"
 	"github.com/araihu/paje/internal/publisher"
 	githubpublisher "github.com/araihu/paje/internal/publisher/github"
 	"github.com/araihu/paje/internal/publisher/gitpr"
@@ -73,9 +74,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.Getenv); err != nil {
+	if err := runHardened(ctx, os.Getenv, processguard.Harden); err != nil {
 		log.Fatalf("paje: %v", err)
 	}
+}
+
+func runHardened(ctx context.Context, getenv func(string) string, harden func() error) error {
+	if harden == nil {
+		return fmt.Errorf("harden worker credential boundary: guard is required")
+	}
+	if err := harden(); err != nil {
+		return fmt.Errorf("harden worker credential boundary: %w", err)
+	}
+	return run(ctx, getenv)
 }
 
 func run(ctx context.Context, getenv func(string) string) error {

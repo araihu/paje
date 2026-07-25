@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -27,6 +28,37 @@ import (
 	workspacemock "github.com/araihu/paje/internal/workspace/mock"
 	hatchet "github.com/hatchet-dev/hatchet/sdks/go"
 )
+
+func TestRunHardenedFailsBeforeReadingConfiguration(t *testing.T) {
+	want := errors.New("guard unavailable")
+	getenvCalled := false
+	err := runHardened(context.Background(), func(string) string {
+		getenvCalled = true
+		return ""
+	}, func() error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("runHardened() error = %v, want %v", err, want)
+	}
+	if getenvCalled {
+		t.Fatal("runHardened() read credential-bearing configuration before installing the process guard")
+	}
+}
+
+func TestRunHardenedInstallsGuardBeforeReadingConfiguration(t *testing.T) {
+	guardInstalled := false
+	err := runHardened(context.Background(), func(string) string {
+		if !guardInstalled {
+			t.Fatal("runHardened() read configuration before installing the process guard")
+		}
+		return ""
+	}, func() error {
+		guardInstalled = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "HATCHET_CLIENT_TOKEN is required") {
+		t.Fatalf("runHardened() error = %v, want post-guard configuration error", err)
+	}
+}
 
 func TestBuildDependenciesUsesMocksByDefault(t *testing.T) {
 	t.Parallel()

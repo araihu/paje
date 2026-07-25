@@ -60,7 +60,11 @@ Credential Secrets:
 Hatchet, Mem0, and GitHub must use separate Secrets. The Codex auth Secret must
 contain only Codex authentication seed files, never Hatchet, Mem0, GitHub, Git,
 or SSH credentials. Agent and verification children cannot receive service
-credentials; only the publisher receives GitHub credentials.
+credentials; only the publisher receives GitHub credentials. Before reading
+configuration, the worker makes itself non-dumpable; combined with the chart's
+dropped capabilities and noNewPrivileges setting, same-UID children cannot
+inspect the credential-bearing parent. Startup fails if the guard cannot be
+installed.
 
 Idempotency keys bind code-change@v1 plus the canonical input hash. Exact reuse
 resumes the run; changed input conflicts. GitHub publication uses
