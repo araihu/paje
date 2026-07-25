@@ -716,6 +716,477 @@ func TestServiceFinalizeRejectsFalseProviderStatusBeforeMemory(t *testing.T) {
 	}
 }
 
+func TestServiceValidateDurableProviderHistoryShapeAndChronology(t *testing.T) {
+	approvalFailed := func(t *testing.T) *serviceFixture {
+		return approvalFailedServiceFixture(t, false)
+	}
+	approvalRetryable := func(t *testing.T) *serviceFixture {
+		return approvalFailedServiceFixture(t, true)
+	}
+	publishFailed := func(t *testing.T) *serviceFixture {
+		return publishFailedServiceFixture(t, false)
+	}
+	publishRetryable := func(t *testing.T) *serviceFixture {
+		return publishFailedServiceFixture(t, true)
+	}
+	pullRequestReady := func(t *testing.T) *serviceFixture {
+		return completedServiceFixture(t, "pull_request")
+	}
+	tests := []struct {
+		name         string
+		fixture      func(*testing.T) *serviceFixture
+		mutate       func(*run.Record)
+		wantErr      bool
+		skipFinalize bool
+	}{
+		{name: "canonical artifact skips", fixture: artifactReadyServiceFixture},
+		{name: "canonical pull request success", fixture: publishedServiceFixture},
+		{name: "canonical decline", fixture: declinedServiceFixture},
+		{name: "canonical terminal approval failure", fixture: approvalFailed},
+		{name: "canonical retryable approval failure", fixture: approvalRetryable},
+		{name: "canonical terminal publish failure", fixture: publishFailed},
+		{name: "canonical retryable publish failure", fixture: publishRetryable},
+		{name: "canonical approval retry history", fixture: approvalRetriedPublishedServiceFixture},
+		{name: "canonical publish retry history", fixture: publishRetriedServiceFixture},
+		{
+			name:    "provider stages without artifact",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Artifact = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "failed publish stage without artifact",
+			fixture: publishFailed,
+			mutate: func(record *run.Record) {
+				record.Artifact = nil
+				record.Approval = nil
+				record.Stages = withoutStage(record.Stages, approvalStage)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "skipped stage carries failure",
+			fixture: artifactReadyServiceFixture,
+			mutate: func(record *run.Record) {
+				failure := providerFailure(approvalStage, run.FailureApproval, false)
+				providerStagePointer(record, approvalStage, 1).Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "succeeded approval carries failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				failure := providerFailure(approvalStage, run.FailureApproval, false)
+				providerStagePointer(record, approvalStage, 1).Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "succeeded publish carries failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				failure := providerFailure(publishStage, run.FailurePublication, false)
+				providerStagePointer(record, publishStage, 1).Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "failed approval lacks failure",
+			fixture: approvalFailed,
+			mutate: func(record *run.Record) {
+				providerStagePointer(record, approvalStage, 1).Failure = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "failed publish carries success evidence",
+			fixture: publishFailed,
+			mutate: func(record *run.Record) {
+				providerStagePointer(record, publishStage, 1).Evidence =
+					map[string]string{"provider": "github"}
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish failure names approval",
+			fixture: publishFailed,
+			mutate: func(record *run.Record) {
+				failure := *providerStagePointer(record, publishStage, 1).Failure
+				failure.Stage = approvalStage
+				providerStagePointer(record, publishStage, 1).Failure = &failure
+				record.Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval failure has publication class",
+			fixture: approvalFailed,
+			mutate: func(record *run.Record) {
+				failure := *providerStagePointer(record, approvalStage, 1).Failure
+				failure.Class = run.FailurePublication
+				providerStagePointer(record, approvalStage, 1).Failure = &failure
+				record.Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "latest failed stage differs from top level failure",
+			fixture: publishFailed,
+			mutate: func(record *run.Record) {
+				failure := *record.Failure
+				failure.CauseCode = "different_failure"
+				record.Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "provider failure lacks stage",
+			fixture: pullRequestReady,
+			mutate: func(record *run.Record) {
+				failure := providerFailure(approvalStage, run.FailureApproval, true)
+				record.Failure = &failure
+			},
+			wantErr:      true,
+			skipFinalize: true,
+		},
+		{
+			name:    "succeeded publish retains stale provider failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				failure := providerFailure(publishStage, run.FailurePublication, false)
+				record.Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "failed stage retains result pointer",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				stage := providerStagePointer(record, publishStage, 1)
+				failure := providerFailure(publishStage, run.FailurePublication, false)
+				stage.Status = run.StageFailed
+				stage.Failure = &failure
+				record.Failure = &failure
+				record.Status = run.StatusFailed
+			},
+			wantErr: true,
+		},
+		{
+			name:    "retryable approval failure has executing status",
+			fixture: approvalRetryable,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusExecuting
+			},
+			wantErr:      true,
+			skipFinalize: true,
+		},
+		{
+			name:    "nonretryable approval failure has canceled status",
+			fixture: approvalFailed,
+			mutate: func(record *run.Record) {
+				record.Status = run.StatusCanceled
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval running in executing status",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+				stage := providerStagePointer(record, approvalStage, 1)
+				stage.Status = run.StageRunning
+				stage.FinishedAt = time.Time{}
+				stage.Evidence = nil
+				record.Status = run.StatusExecuting
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval running carries failure",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+				stage := providerStagePointer(record, approvalStage, 1)
+				failure := providerFailure(approvalStage, run.FailureApproval, true)
+				stage.Status = run.StageRunning
+				stage.FinishedAt = time.Time{}
+				stage.Evidence = nil
+				stage.Failure = &failure
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval running carries evidence",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+				stage := providerStagePointer(record, approvalStage, 1)
+				stage.Status = run.StageRunning
+				stage.FinishedAt = time.Time{}
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "terminal record retains running approval",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+				stage := providerStagePointer(record, approvalStage, 1)
+				stage.Status = run.StageRunning
+				stage.FinishedAt = time.Time{}
+				stage.Evidence = nil
+				failure := providerFailure("execute", run.FailureAgent, false)
+				record.Failure = &failure
+				record.Status = run.StatusFailed
+			},
+			wantErr: true,
+		},
+		{
+			name:    "running publish has finished timestamp",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Publication = nil
+				stage := providerStagePointer(record, publishStage, 1)
+				stage.Status = run.StageRunning
+				stage.Evidence = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish running in awaiting approval status",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Publication = nil
+				stage := providerStagePointer(record, publishStage, 1)
+				stage.Status = run.StageRunning
+				stage.FinishedAt = time.Time{}
+				stage.Evidence = nil
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval warning",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Approval = nil
+				record.Publication = nil
+				record.Stages = withoutStage(record.Stages, publishStage)
+				providerStagePointer(record, approvalStage, 1).Status = run.StageWarning
+				record.Status = run.StatusAwaitingApproval
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish warning",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				record.Publication = nil
+				providerStagePointer(record, publishStage, 1).Status = run.StageWarning
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish starts before approval finishes",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				approval := providerStagePointer(record, approvalStage, 1)
+				publish := providerStagePointer(record, publishStage, 1)
+				publish.StartedAt = approval.FinishedAt.Add(-time.Nanosecond)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish starts when approval finishes",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				approval := providerStagePointer(record, approvalStage, 1)
+				providerStagePointer(record, publishStage, 1).StartedAt = approval.FinishedAt
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish has zero start",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				providerStagePointer(record, publishStage, 1).StartedAt = time.Time{}
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish is ordered before approval",
+			fixture: publishedServiceFixture,
+			mutate: func(record *run.Record) {
+				approvalIndex, publishIndex := -1, -1
+				for index, stage := range record.Stages {
+					if stage.Name == approvalStage {
+						approvalIndex = index
+					}
+					if stage.Name == publishStage {
+						publishIndex = index
+					}
+				}
+				record.Stages[approvalIndex], record.Stages[publishIndex] =
+					record.Stages[publishIndex], record.Stages[approvalIndex]
+			},
+			wantErr: true,
+		},
+		{
+			name:    "historical approval failure lacks failure",
+			fixture: approvalRetriedPublishedServiceFixture,
+			mutate: func(record *run.Record) {
+				providerStagePointer(record, approvalStage, 1).Failure = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "historical approval warning",
+			fixture: approvalRetriedPublishedServiceFixture,
+			mutate: func(record *run.Record) {
+				stage := providerStagePointer(record, approvalStage, 1)
+				stage.Status = run.StageWarning
+				stage.Failure = nil
+			},
+			wantErr: true,
+		},
+		{
+			name:    "duplicate historical approval attempt",
+			fixture: approvalRetriedPublishedServiceFixture,
+			mutate: func(record *run.Record) {
+				duplicate := *providerStagePointer(record, approvalStage, 1)
+				record.Stages = append(record.Stages, duplicate)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval attempt gap",
+			fixture: approvalRetriedPublishedServiceFixture,
+			mutate: func(record *run.Record) {
+				providerStagePointer(record, approvalStage, 2).Attempts = 3
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval retry starts when failure finishes",
+			fixture: approvalRetriedPublishedServiceFixture,
+			mutate: func(record *run.Record) {
+				first := providerStagePointer(record, approvalStage, 1)
+				providerStagePointer(record, approvalStage, 2).StartedAt = first.FinishedAt
+			},
+			wantErr: true,
+		},
+		{
+			name:    "approval succeeds before later success",
+			fixture: approvalRetriedPublishedServiceFixture,
+			mutate: func(record *run.Record) {
+				first := providerStagePointer(record, approvalStage, 1)
+				latest := providerStagePointer(record, approvalStage, 2)
+				first.Status = run.StageSucceeded
+				first.Failure = nil
+				first.Evidence = cloneStringMap(latest.Evidence)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "historical publish has approval class",
+			fixture: publishRetriedServiceFixture,
+			mutate: func(record *run.Record) {
+				first := providerStagePointer(record, publishStage, 1)
+				failure := *first.Failure
+				failure.Class = run.FailureApproval
+				first.Failure = &failure
+			},
+			wantErr: true,
+		},
+		{
+			name:    "publish retry overlaps prior attempt",
+			fixture: publishRetriedServiceFixture,
+			mutate: func(record *run.Record) {
+				first := providerStagePointer(record, publishStage, 1)
+				providerStagePointer(record, publishStage, 2).StartedAt =
+					first.FinishedAt.Add(-time.Nanosecond)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "decline retains publish stage",
+			fixture: declinedServiceFixture,
+			mutate: func(record *run.Record) {
+				approval := providerStagePointer(record, approvalStage, 1)
+				record.Stages = append(record.Stages, run.StageResult{
+					Name: publishStage, Status: run.StageRunning,
+					StartedAt: approval.FinishedAt.Add(time.Second), Attempts: 1,
+				})
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			record, err := fixture.runs.Load(context.Background(), "run-123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.mutate != nil {
+				test.mutate(&record)
+			}
+			input, err := validateRunBinding(record)
+			if err != nil {
+				t.Fatalf("validateRunBinding() error = %v", err)
+			}
+			err = fixture.service.validateDurableEvidence(context.Background(), record, input)
+			if test.wantErr && err == nil {
+				t.Fatal("validateDurableEvidence() error = nil")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validateDurableEvidence() error = %v", err)
+			}
+			_, resultErr := fixture.service.resultFromRecord(context.Background(), record)
+			if test.wantErr && resultErr == nil {
+				t.Fatal("resultFromRecord() error = nil")
+			}
+			if !test.wantErr && resultErr != nil {
+				t.Fatalf("resultFromRecord() error = %v", resultErr)
+			}
+			if !test.wantErr || test.skipFinalize {
+				return
+			}
+
+			finalizeFixture := test.fixture(t)
+			outcomes := &outcomeMemory{}
+			finalizeFixture.service.memory = outcomes
+			finalizeFixture.service.runs = &mutateSaveResultStore{
+				Store: finalizeFixture.runs,
+				mutate: func(record run.Record) run.Record {
+					test.mutate(&record)
+					return record
+				},
+			}
+			if _, err := finalizeFixture.service.Finalize(
+				context.Background(), "run-123",
+			); err == nil || outcomes.SaveCount() != 0 {
+				t.Fatalf("Finalize() error=%v memory saves=%d, want rejection before memory",
+					err, outcomes.SaveCount())
+			}
+		})
+	}
+}
+
 func TestServiceRejectsUnsafePullRequestRepositoryBeforePorts(t *testing.T) {
 	for _, repositoryURI := range []string{
 		"/tmp/repository", "git@github.com:owner/repo.git",
@@ -993,12 +1464,12 @@ func TestServiceFinalizeRetriesRecoversVisibleMemoryAndExhaustsSafely(t *testing
 
 	t.Run("terminal upstream failure records finalize exhaustion bookkeeping", func(t *testing.T) {
 		terminal := completedServiceFixture(t, "artifact")
-		now := time.Unix(100, 0).UTC()
+		record, _ := terminal.runs.Load(context.Background(), "run-123")
+		now := record.UpdatedAt
 		terminal.service.clock = func() time.Time {
 			now = now.Add(time.Second)
 			return now
 		}
-		record, _ := terminal.runs.Load(context.Background(), "run-123")
 		failure := run.Failure{
 			Stage: "execute", Class: run.FailureAgent, Retryable: false,
 			Diagnostic: "agent failed", CauseCode: "agent_exit",
@@ -1114,6 +1585,15 @@ func completedServiceFixture(t *testing.T, mode string) *serviceFixture {
 	if _, err := fixture.service.Execute(context.Background(), "run-123"); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
+	var providerClockMu sync.Mutex
+	providerNow := time.Unix(199, 0).UTC()
+	fixture.service.clock = func() time.Time {
+		providerClockMu.Lock()
+		defer providerClockMu.Unlock()
+		current := providerNow
+		providerNow = providerNow.Add(time.Second)
+		return current
+	}
 	if mode == "artifact" {
 		if _, err := fixture.service.Approval(
 			context.Background(), "run-123",
@@ -1178,6 +1658,77 @@ func declinedServiceFixture(t *testing.T) *serviceFixture {
 	return fixture
 }
 
+func approvalFailedServiceFixture(t *testing.T, retryable bool) *serviceFixture {
+	t.Helper()
+	fixture := completedServiceFixture(t, "pull_request")
+	providerErr := error(errors.New("approval unavailable"))
+	if retryable {
+		providerErr = retryableTestError{providerErr}
+	}
+	if _, err := fixture.service.Approval(
+		context.Background(), "run-123",
+		approvalmock.NewGate(approval.Result{}, providerErr),
+	); err == nil {
+		t.Fatal("Approval(failure) error = nil")
+	}
+	return fixture
+}
+
+func publishFailedServiceFixture(t *testing.T, retryable bool) *serviceFixture {
+	t.Helper()
+	fixture := approvedServiceFixture(t)
+	providerErr := error(errors.New("publisher unavailable"))
+	if retryable {
+		providerErr = retryableTestError{providerErr}
+	}
+	fixture.service.publisher = &sequencePublisher{errors: []error{providerErr}}
+	if _, err := fixture.service.Publish(context.Background(), "run-123"); err == nil {
+		t.Fatal("Publish(failure) error = nil")
+	}
+	return fixture
+}
+
+func approvalRetriedPublishedServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	fixture := approvalFailedServiceFixture(t, true)
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := gateFunc(func(context.Context, approval.Request) (approval.Result, error) {
+		return approval.Result{
+			RunID: record.ID, ArtifactDigest: record.Artifact.Digest, Approved: true,
+			Actor: "reviewer", DecidedAt: fixture.service.clock(),
+		}, nil
+	})
+	if _, err := fixture.service.Approval(context.Background(), "run-123", gate); err != nil {
+		t.Fatalf("Approval(retry) error = %v", err)
+	}
+	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
+		Provider: "github", Branch: "paje/code-change/run-123",
+		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
+		PullRequestURL: "https://example.test/pull/42",
+	}}}
+	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	return fixture
+}
+
+func publishRetriedServiceFixture(t *testing.T) *serviceFixture {
+	t.Helper()
+	fixture := publishFailedServiceFixture(t, true)
+	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
+		Provider: "github", Branch: "paje/code-change/run-123",
+		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
+		PullRequestURL: "https://example.test/pull/42",
+	}}}
+	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
+		t.Fatalf("Publish(retry) error = %v", err)
+	}
+	return fixture
+}
+
 func withoutStage(stages []run.StageResult, name string) []run.StageResult {
 	result := make([]run.StageResult, 0, len(stages))
 	for _, stage := range stages {
@@ -1198,6 +1749,23 @@ func setLatestStageStatus(record *run.Record, name string, status run.StageStatu
 			record.Stages[index].Attempts == latest.Attempts {
 			record.Stages[index].Status = status
 		}
+	}
+}
+
+func providerStagePointer(record *run.Record, name string, attempt int) *run.StageResult {
+	for index := range record.Stages {
+		stage := &record.Stages[index]
+		if stage.Name == name && stage.Attempts == attempt {
+			return stage
+		}
+	}
+	panic("provider stage not found")
+}
+
+func providerFailure(stage string, class run.FailureClass, retryable bool) run.Failure {
+	return run.Failure{
+		Stage: stage, Class: class, Retryable: retryable,
+		Diagnostic: "provider failed", CauseCode: "provider_failed",
 	}
 }
 

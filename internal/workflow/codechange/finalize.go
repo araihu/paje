@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -551,11 +552,7 @@ func (s *Service) validateDurableEvidence(
 	record run.Record,
 	input templatecodechange.Input,
 ) error {
-	approvalStageResult, approvalFound, err := uniqueLatestProviderStage(record, approvalStage)
-	if err != nil {
-		return err
-	}
-	publishStageResult, publishFound, err := uniqueLatestProviderStage(record, publishStage)
+	history, err := validateProviderHistoryShape(record)
 	if err != nil {
 		return err
 	}
@@ -563,9 +560,8 @@ func (s *Service) validateDurableEvidence(
 		if record.Approval != nil || record.Publication != nil {
 			return fmt.Errorf("%w: durable decision lacks artifact", ErrRunBinding)
 		}
-		if (approvalFound && approvalStageResult.Status == run.StageSucceeded) ||
-			(publishFound && publishStageResult.Status == run.StageSucceeded) {
-			return fmt.Errorf("%w: provider success lacks artifact", ErrRunBinding)
+		if len(history.approval) != 0 || len(history.publish) != 0 {
+			return fmt.Errorf("%w: provider stage lacks artifact", ErrRunBinding)
 		}
 		return nil
 	}
@@ -580,11 +576,14 @@ func (s *Service) validateDurableEvidence(
 		if record.Approval != nil || record.Publication != nil {
 			return fmt.Errorf("%w: artifact-only run contains publication evidence", ErrRunBinding)
 		}
-		if err := validateArtifactSkipStage(approvalStageResult, approvalFound); err != nil {
+		if err := validateArtifactSkipHistory(history.approval); err != nil {
 			return fmt.Errorf("%w: approval evidence: %v", ErrRunBinding, err)
 		}
-		if err := validateArtifactSkipStage(publishStageResult, publishFound); err != nil {
+		if err := validateArtifactSkipHistory(history.publish); err != nil {
 			return fmt.Errorf("%w: publication evidence: %v", ErrRunBinding, err)
+		}
+		if err := validateProviderChronology(history); err != nil {
+			return fmt.Errorf("%w: provider chronology: %v", ErrRunBinding, err)
 		}
 		return nil
 	}
@@ -593,50 +592,195 @@ func (s *Service) validateDurableEvidence(
 	}
 	approvalRequest := buildApprovalRequest(record, input, bundle)
 	if err := validatePullRequestApprovalEvidence(
-		record, approvalRequest, approvalStageResult, approvalFound,
+		record, approvalRequest, history.approval,
 	); err != nil {
 		return fmt.Errorf("%w: approval evidence: %v", ErrRunBinding, err)
 	}
 	if err := validatePullRequestPublicationEvidence(
-		record, input, publishStageResult, publishFound,
+		record, input, history,
 	); err != nil {
 		return fmt.Errorf("%w: publication evidence: %v", ErrRunBinding, err)
 	}
 	return nil
 }
 
-func uniqueLatestProviderStage(
-	record run.Record,
-	name string,
-) (run.StageResult, bool, error) {
-	var latest run.StageResult
-	found := false
-	count := 0
-	for _, stage := range record.Stages {
-		if stage.Name != name {
-			continue
-		}
-		switch {
-		case !found || stage.Attempts > latest.Attempts:
-			latest = stage
-			found = true
-			count = 1
-		case stage.Attempts == latest.Attempts:
-			count++
-		}
-	}
-	if count > 1 {
-		return run.StageResult{}, false, fmt.Errorf(
-			"%w: %s stage has ambiguous latest evidence", ErrRunBinding, name,
-		)
-	}
-	return latest, found, nil
+type providerStageEntry struct {
+	stage run.StageResult
+	index int
 }
 
-func validateArtifactSkipStage(stage run.StageResult, found bool) error {
-	if !found {
-		return errors.New("skipped stage is missing")
+type providerStageHistory struct {
+	approval []providerStageEntry
+	publish  []providerStageEntry
+}
+
+func validateProviderHistoryShape(record run.Record) (providerStageHistory, error) {
+	if err := run.Validate(record); err != nil {
+		return providerStageHistory{}, fmt.Errorf("%w: invalid durable run: %v", ErrRunBinding, err)
 	}
+	var history providerStageHistory
+	seenPublish := false
+	for index, stage := range record.Stages {
+		var target *[]providerStageEntry
+		switch stage.Name {
+		case approvalStage:
+			if seenPublish {
+				return providerStageHistory{}, fmt.Errorf(
+					"%w: approval stage follows publication history", ErrRunBinding,
+				)
+			}
+			target = &history.approval
+		case publishStage:
+			seenPublish = true
+			target = &history.publish
+		default:
+			continue
+		}
+		if err := validateProviderStageShape(stage); err != nil {
+			return providerStageHistory{}, fmt.Errorf(
+				"%w: %s attempt %d: %v", ErrRunBinding, stage.Name, stage.Attempts, err,
+			)
+		}
+		if stage.Attempts != len(*target)+1 {
+			return providerStageHistory{}, fmt.Errorf(
+				"%w: %s stage attempts are not contiguous", ErrRunBinding, stage.Name,
+			)
+		}
+		if len(*target) != 0 {
+			previous := (*target)[len(*target)-1].stage
+			if previous.Status != run.StageFailed || previous.Failure == nil ||
+				!previous.Failure.Retryable {
+				return providerStageHistory{}, fmt.Errorf(
+					"%w: %s stage continued after a closed attempt", ErrRunBinding, stage.Name,
+				)
+			}
+			if !previous.FinishedAt.Before(stage.StartedAt) {
+				return providerStageHistory{}, fmt.Errorf(
+					"%w: %s stage attempts overlap", ErrRunBinding, stage.Name,
+				)
+			}
+		}
+		*target = append(*target, providerStageEntry{stage: stage, index: index})
+	}
+	if err := validateLatestProviderState(
+		record, approvalStage, history.approval, record.Approval != nil,
+		run.StatusAwaitingApproval,
+	); err != nil {
+		return providerStageHistory{}, err
+	}
+	if err := validateLatestProviderState(
+		record, publishStage, history.publish, record.Publication != nil,
+		run.StatusPublishing,
+	); err != nil {
+		return providerStageHistory{}, err
+	}
+	return history, nil
+}
+
+func validateProviderStageShape(stage run.StageResult) error {
+	switch stage.Status {
+	case run.StageWarning:
+		return errors.New("warning status is not valid for provider stages")
+	case run.StageRunning:
+		if stage.Failure != nil {
+			return errors.New("running stage carries failure")
+		}
+		if len(stage.Evidence) != 0 {
+			return errors.New("running stage carries completion evidence")
+		}
+	case run.StageSucceeded, run.StageSkipped:
+		if stage.Failure != nil {
+			return errors.New("successful or skipped stage carries failure")
+		}
+	case run.StageFailed:
+		if stage.Failure == nil {
+			return errors.New("failed stage lacks failure")
+		}
+		if stage.Failure.Stage != stage.Name {
+			return errors.New("failure names a different stage")
+		}
+		if !validProviderFailureClass(stage.Name, *stage.Failure) {
+			return errors.New("failure class does not match provider stage")
+		}
+		if stage.Failure.Class == run.FailureCanceled && stage.Failure.Retryable {
+			return errors.New("canceled provider failure cannot be retryable")
+		}
+		if len(stage.Evidence) != 0 {
+			return errors.New("failed stage carries success evidence")
+		}
+	default:
+		return errors.New("provider stage status is invalid")
+	}
+	return nil
+}
+
+func validProviderFailureClass(name string, failure run.Failure) bool {
+	switch failure.Class {
+	case run.FailureCanceled, run.FailureInternal:
+		return true
+	case run.FailureApproval:
+		return name == approvalStage
+	case run.FailurePublication:
+		return name == publishStage
+	default:
+		return false
+	}
+}
+
+func validateLatestProviderState(
+	record run.Record,
+	name string,
+	history []providerStageEntry,
+	pointerPresent bool,
+	activeStatus run.Status,
+) error {
+	if len(history) == 0 {
+		if record.Failure != nil && record.Failure.Stage == name {
+			return fmt.Errorf("%w: %s top-level failure lacks stage", ErrRunBinding, name)
+		}
+		return nil
+	}
+	latest := history[len(history)-1].stage
+	switch latest.Status {
+	case run.StageRunning:
+		if pointerPresent {
+			return fmt.Errorf("%w: %s running stage has durable result", ErrRunBinding, name)
+		}
+		if record.Terminal() || record.Status != activeStatus || record.Failure != nil {
+			return fmt.Errorf("%w: %s running stage has invalid run state", ErrRunBinding, name)
+		}
+	case run.StageFailed:
+		if pointerPresent {
+			return fmt.Errorf("%w: %s failed stage has durable result", ErrRunBinding, name)
+		}
+		if record.Failure == nil || !reflect.DeepEqual(record.Failure, latest.Failure) {
+			return fmt.Errorf("%w: %s failed stage differs from top-level failure", ErrRunBinding, name)
+		}
+		switch {
+		case latest.Failure.Retryable:
+			if record.Terminal() || record.Status != activeStatus {
+				return fmt.Errorf("%w: %s retryable failure has invalid status", ErrRunBinding, name)
+			}
+		case latest.Failure.Class == run.FailureCanceled:
+			if record.Status != run.StatusCanceled {
+				return fmt.Errorf("%w: %s canceled failure has invalid status", ErrRunBinding, name)
+			}
+		case record.Status != run.StatusFailed:
+			return fmt.Errorf("%w: %s terminal failure has invalid status", ErrRunBinding, name)
+		}
+	case run.StageSucceeded, run.StageSkipped:
+		if record.Failure != nil && record.Failure.Stage == name {
+			return fmt.Errorf("%w: %s closed stage retains stale failure", ErrRunBinding, name)
+		}
+	}
+	return nil
+}
+
+func validateArtifactSkipHistory(history []providerStageEntry) error {
+	if len(history) != 1 {
+		return errors.New("artifact mode requires exactly one skipped attempt")
+	}
+	stage := history[0].stage
 	if stage.Status != run.StageSkipped {
 		return fmt.Errorf("stage status is %q, want %q", stage.Status, run.StageSkipped)
 	}
@@ -646,19 +790,41 @@ func validateArtifactSkipStage(stage run.StageResult, found bool) error {
 	return nil
 }
 
+func validateProviderChronology(history providerStageHistory) error {
+	if len(history.approval) == 0 || len(history.publish) == 0 {
+		return errors.New("approval and publication history are required")
+	}
+	approval := history.approval[len(history.approval)-1]
+	publish := history.publish[0]
+	if approval.index >= publish.index || !approval.stage.FinishedAt.Before(publish.stage.StartedAt) {
+		return errors.New("publication does not follow completed approval")
+	}
+	return nil
+}
+
 func validatePullRequestApprovalEvidence(
 	record run.Record,
 	request approval.Request,
-	stage run.StageResult,
-	found bool,
+	history []providerStageEntry,
 ) error {
-	if found && stage.Status == run.StageSkipped {
+	if len(history) == 0 {
+		if record.Approval != nil {
+			return errors.New("approval decision lacks stage")
+		}
+		if record.Status == run.StatusPublishing || record.Status == run.StatusSucceeded ||
+			record.Status == run.StatusDeclined {
+			return errors.New("run status requires approval evidence")
+		}
+		return nil
+	}
+	stage := history[len(history)-1].stage
+	if stage.Status == run.StageSkipped {
 		return errors.New("pull-request approval cannot be skipped")
 	}
 	switch {
-	case found && stage.Status == run.StageSucceeded && record.Approval == nil:
+	case stage.Status == run.StageSucceeded && record.Approval == nil:
 		return errors.New("succeeded approval stage lacks decision")
-	case record.Approval != nil && (!found || stage.Status != run.StageSucceeded):
+	case record.Approval != nil && stage.Status != run.StageSucceeded:
 		return errors.New("approval decision lacks succeeded stage")
 	case record.Status == run.StatusDeclined &&
 		(record.Approval == nil || record.Approval.Approved):
@@ -688,22 +854,42 @@ func validatePullRequestApprovalEvidence(
 func validatePullRequestPublicationEvidence(
 	record run.Record,
 	input templatecodechange.Input,
-	stage run.StageResult,
-	found bool,
+	history providerStageHistory,
 ) error {
 	if record.Status == run.StatusDeclined {
-		if record.Publication != nil || found {
+		if record.Publication != nil || len(history.publish) != 0 {
 			return errors.New("declined run contains publication evidence")
 		}
 		return nil
 	}
-	if found && stage.Status == run.StageSkipped {
+	if len(history.publish) == 0 {
+		if record.Publication != nil {
+			return errors.New("publication result lacks stage")
+		}
+		if record.Status == run.StatusPublishing || record.Status == run.StatusSucceeded {
+			return errors.New("run status requires publication evidence")
+		}
+		return nil
+	}
+	if len(history.approval) == 0 {
+		return errors.New("publication lacks approval stage")
+	}
+	approval := history.approval[len(history.approval)-1].stage
+	if approval.Status != run.StageSucceeded ||
+		record.Approval == nil || !record.Approval.Approved {
+		return errors.New("publication lacks completed approved decision")
+	}
+	if err := validateProviderChronology(history); err != nil {
+		return err
+	}
+	stage := history.publish[len(history.publish)-1].stage
+	if stage.Status == run.StageSkipped {
 		return errors.New("pull-request publication cannot be skipped")
 	}
 	switch {
-	case found && stage.Status == run.StageSucceeded && record.Publication == nil:
+	case stage.Status == run.StageSucceeded && record.Publication == nil:
 		return errors.New("succeeded publish stage lacks result")
-	case record.Publication != nil && (!found || stage.Status != run.StageSucceeded):
+	case record.Publication != nil && stage.Status != run.StageSucceeded:
 		return errors.New("publication result lacks succeeded stage")
 	}
 	if record.Publication == nil {
