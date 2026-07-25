@@ -153,11 +153,31 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 		return publisher.Result{}, err
 	}
 
+	commitSHA, err := p.git.commit(ctx, prepared.Path(), commitMessage(req))
+	if err != nil {
+		return publisher.Result{}, fmt.Errorf("create publication commit: %w", err)
+	}
+	trusted, err := p.git.importTrusted(ctx, prepared.Path(), commitSHA)
+	if err != nil {
+		return publisher.Result{}, fmt.Errorf("import publication commit into trusted repository: %w", err)
+	}
+	defer func() {
+		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		returnErr = errors.Join(returnErr, trusted.Cleanup(cleanupContext))
+	}()
+	if err := p.git.verifyLocalCommit(ctx, trusted.path, commitSHA, req, bundle.Manifest.TreeSHA); err != nil {
+		return publisher.Result{}, err
+	}
+
 	pushURL, err := p.pushURL(req.Repository)
 	if err != nil {
 		return publisher.Result{}, fmt.Errorf("resolve publication push URL: %w", err)
 	}
 	if err := validatePushURL(pushURL); err != nil {
+		return publisher.Result{}, err
+	}
+	if err := p.git.validateEffectiveURL(ctx, trusted, pushURL); err != nil {
 		return publisher.Result{}, err
 	}
 	credentialEnvironment, cleanupCredentials, err := p.credentials.Prepare(ctx)
@@ -176,41 +196,39 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 		return publisher.Result{}, err
 	}
 
-	commitSHA, exists, err := p.git.remoteBranch(ctx, prepared.Path(), pushURL, req.Branch, credentialEnvironment)
+	remoteCommit, exists, err := p.git.remoteBranch(ctx, trusted, pushURL, req.Branch, credentialEnvironment)
 	if err != nil {
-		return publisher.Result{}, markRetryable(fmt.Errorf("inspect publication branch: %w", err))
+		return publisher.Result{}, retryRemoteError(fmt.Errorf("inspect publication branch: %w", err))
 	}
 	if exists {
+		if remoteCommit != commitSHA {
+			return publisher.Result{}, fmt.Errorf("%w: deterministic publication commit does not match existing branch", publisher.ErrConflict)
+		}
 		if err := p.git.verifyRemoteCommit(
-			ctx, prepared.Path(), pushURL, req.Branch, commitSHA,
+			ctx, trusted, pushURL, req.Branch, remoteCommit,
 			req, bundle.Manifest.TreeSHA, credentialEnvironment,
 		); err != nil {
 			return publisher.Result{}, err
 		}
 	} else {
-		commitSHA, err = p.git.commit(ctx, prepared.Path(), commitMessage(req))
-		if err != nil {
-			return publisher.Result{}, fmt.Errorf("create publication commit: %w", err)
-		}
-		if err := p.git.verifyLocalCommit(ctx, prepared.Path(), commitSHA, req, bundle.Manifest.TreeSHA); err != nil {
-			return publisher.Result{}, err
-		}
-		if err := p.git.push(ctx, prepared.Path(), pushURL, req.Branch, credentialEnvironment); err != nil {
+		if err := p.git.push(ctx, trusted, pushURL, req.Branch, credentialEnvironment); err != nil {
+			if cancellationError(err) {
+				return publisher.Result{}, err
+			}
 			inspectContext, cancelInspect := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 			winner, winnerExists, inspectErr := p.git.remoteBranch(
-				inspectContext, prepared.Path(), pushURL, req.Branch, credentialEnvironment,
+				inspectContext, trusted, pushURL, req.Branch, credentialEnvironment,
 			)
 			cancelInspect()
 			if inspectErr != nil {
-				return publisher.Result{}, markRetryable(errors.Join(fmt.Errorf("push publication branch: %w", err), inspectErr))
+				return publisher.Result{}, retryRemoteError(errors.Join(fmt.Errorf("push publication branch: %w", err), inspectErr))
 			}
 			if !winnerExists {
-				return publisher.Result{}, markRetryable(fmt.Errorf("push publication branch: %w", err))
+				return publisher.Result{}, retryRemoteError(fmt.Errorf("push publication branch: %w", err))
 			}
 			if winner != commitSHA {
 				return publisher.Result{}, fmt.Errorf("%w: publication branch won by commit %s", publisher.ErrConflict, winner)
 			}
-			commitSHA = winner
 		}
 	}
 
@@ -452,6 +470,17 @@ func markRetryable(err error) error {
 		return err
 	}
 	return retryableError{error: err}
+}
+
+func retryRemoteError(err error) error {
+	if cancellationError(err) {
+		return err
+	}
+	return markRetryable(err)
+}
+
+func cancellationError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // IsRetryable reports whether err explicitly permits a publication retry.

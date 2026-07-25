@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -176,6 +179,110 @@ func TestPublisherRejectsMultilineTitleBeforeArtifactSideEffects(t *testing.T) {
 	}
 }
 
+func TestPublisherNeverUsesAgentRepositoryConfigWithCredentials(t *testing.T) {
+	fixture := newPublicationFixture(t)
+	var redirectedRequests atomic.Int64
+	redirected := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedRequests.Add(1)
+		w.Header().Set("WWW-Authenticate", `Basic realm="hostile"`)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+	}))
+	defer redirected.Close()
+
+	hostileHelper := filepath.Join(t.TempDir(), "hostile-credential-helper")
+	helperMarker := hostileHelper + ".executed"
+	writeFile(t, hostileHelper, "#!/bin/sh\nprintf invoked >"+helperMarker+"\nexit 0\n")
+	if err := os.Chmod(hostileHelper, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fixture.verifier.afterRun = func(workspace string) {
+		runGit(t, workspace, "config", "--local", "credential.helper", hostileHelper)
+		runGit(t, workspace, "config", "--local", "url."+redirected.URL+".insteadOf", fixture.remote)
+		runGit(t, workspace, "config", "--local", "http.proxy", "http://127.0.0.1:1")
+		runGit(t, workspace, "config", "--local", "http."+redirected.URL+".proxy", "")
+		runGit(t, workspace, "config", "--local", "http.sslVerify", "false")
+	}
+	const token = "round-one-token-must-remain-private"
+	fixture.publisher.credentials = newTokenCredentials(t, token)
+
+	result, err := fixture.publisher.Publish(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if redirectedRequests.Load() != 0 {
+		t.Fatalf("hostile redirected endpoint requests = %d, want 0", redirectedRequests.Load())
+	}
+	if _, err := os.Stat(helperMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repository credential helper executed: %v", err)
+	}
+	if strings.Contains(fmt.Sprintf("%#v", result), token) ||
+		strings.Contains(fmt.Sprintf("%#v", fixture.pullRequests.LastRequest()), token) {
+		t.Fatal("publication evidence disclosed credential")
+	}
+	if got := fixture.git("--git-dir", fixture.remote, "rev-parse", "refs/heads/"+fixture.request.Branch); got != result.CommitSHA {
+		t.Fatalf("intended remote branch = %q, want %q", got, result.CommitSHA)
+	}
+}
+
+func TestGitClientRunPreservesCancellationIdentity(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	runGit(t, "", "init", "--bare", repository)
+	blocker := filepath.Join(root, "blocking-git")
+	writeFile(t, blocker, "#!/bin/sh\nsleep 10\n")
+	if err := os.Chmod(blocker, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	client := &gitClient{command: blocker, baseEnv: map[string]string{"PATH": os.Getenv("PATH")}}
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "remote inspection", args: []string{"ls-remote", "--heads", "remote", "refs/heads/main"}},
+		{name: "fetch import", args: []string{"fetch", "--no-tags", "source", "HEAD:refs/heads/candidate"}},
+		{name: "commit", args: []string{"commit", "-m", "message"}},
+		{name: "push", args: []string{"push", "remote", "HEAD:refs/heads/main"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			result := client.run(ctx, repository, nil, test.args...)
+			if !errors.Is(result.err, context.DeadlineExceeded) {
+				t.Fatalf("run() error = %v, want DeadlineExceeded identity", result.err)
+			}
+			classified := retryRemoteError(fmt.Errorf("remote operation: %w", result.err))
+			if !errors.Is(classified, context.DeadlineExceeded) ||
+				errors.Is(classified, publisher.ErrConflict) || IsRetryable(classified) {
+				t.Fatalf("canceled run misclassified: %v", classified)
+			}
+		})
+	}
+}
+
+func TestCommitVerificationCancellationIsNotConflict(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	runGit(t, "", "init", "--bare", repository)
+	blocker := filepath.Join(root, "blocking-git")
+	writeFile(t, blocker, "#!/bin/sh\nsleep 10\n")
+	if err := os.Chmod(blocker, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	client := &gitClient{command: blocker, baseEnv: map[string]string{"PATH": os.Getenv("PATH")}}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := client.verifyLocalCommit(
+		ctx, repository, strings.Repeat("a", 40),
+		publisher.Request{BaseSHA: strings.Repeat("b", 40)},
+		strings.Repeat("c", 40),
+	)
+	if !errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, publisher.ErrConflict) || IsRetryable(err) {
+		t.Fatalf("verifyLocalCommit() cancellation misclassified: %v", err)
+	}
+}
+
 type publicationFixture struct {
 	t            *testing.T
 	remote       string
@@ -324,6 +431,7 @@ type recordingVerifier struct {
 	delegate     verification.Runner
 	calls        int
 	forceFailure bool
+	afterRun     func(workspace string)
 }
 
 func (v *recordingVerifier) Run(ctx context.Context, command verification.Command, environment map[string]string) verification.Result {
@@ -337,7 +445,11 @@ func (v *recordingVerifier) Run(ctx context.Context, command verification.Comman
 	if forceFailure {
 		return verification.Result{Command: command, ExitCode: 1, Passed: false, FailureClass: "verification", CauseCode: "nonzero_exit"}
 	}
-	return v.delegate.Run(ctx, command, environment)
+	result := v.delegate.Run(ctx, command, environment)
+	if result.Passed && v.afterRun != nil {
+		v.afterRun(command.Directory)
+	}
+	return result
 }
 
 func (v *recordingVerifier) CallCount() int {
@@ -406,6 +518,32 @@ type partialCredentials struct{}
 
 func (partialCredentials) Prepare(context.Context) (map[string]string, func(context.Context) error, error) {
 	return map[string]string{"GIT_TERMINAL_PROMPT": "0"}, func(context.Context) error { return nil }, nil
+}
+
+type tokenCredentials struct {
+	helper string
+	token  string
+}
+
+func newTokenCredentials(t *testing.T, token string) tokenCredentials {
+	t.Helper()
+	helper := filepath.Join(t.TempDir(), "askpass")
+	writeFile(t, helper, "#!/bin/sh\ncase \"$1\" in\n*Username*|*username*) printf '%s\\n' \"$PAJE_GIT_USERNAME\" ;;\n*) printf '%s\\n' \"$PAJE_GIT_PASSWORD\" ;;\nesac\n")
+	if err := os.Chmod(helper, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return tokenCredentials{helper: helper, token: token}
+}
+
+func (c tokenCredentials) Prepare(context.Context) (map[string]string, func(context.Context) error, error) {
+	environment := map[string]string{
+		"GIT_ASKPASS": c.helper, "GIT_TERMINAL_PROMPT": "0",
+		"PAJE_GIT_USERNAME": "x-access-token", "PAJE_GIT_PASSWORD": c.token,
+	}
+	return environment, func(context.Context) error {
+		environment["PAJE_GIT_PASSWORD"] = ""
+		return nil
+	}, nil
 }
 
 func (c *recordingCredentials) CleanupCount() int {

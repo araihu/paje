@@ -1,11 +1,13 @@
 package gitpr
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,20 @@ import (
 
 const gitDiagnosticLimit int64 = 4096
 
+const trustedRepositoryConfig = `[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+	logallrefupdates = false
+	hooksPath = /dev/null
+[credential]
+	helper =
+[http]
+	proxy =
+`
+
+const trustedRepositoryHead = "ref: refs/heads/paje-candidate\n"
+
 type gitClient struct {
 	command string
 	baseEnv map[string]string
@@ -25,6 +41,12 @@ type gitResult struct {
 	output   string
 	exitCode int
 	err      error
+}
+
+type trustedRepository struct {
+	root   string
+	path   string
+	parent string
 }
 
 func newGitClient() (*gitClient, error) {
@@ -61,16 +83,26 @@ func newGitClient() (*gitClient, error) {
 
 func (g *gitClient) remoteBranch(
 	ctx context.Context,
-	workspace, pushURL, branch string,
+	repository *trustedRepository,
+	pushURL, branch string,
 	credentials map[string]string,
 ) (string, bool, error) {
+	if err := repository.validate(); err != nil {
+		return "", false, err
+	}
 	ref := "refs/heads/" + branch
-	result := g.run(ctx, workspace, credentials, "ls-remote", "--heads", "--exit-code", "--", pushURL, ref)
+	result := g.run(ctx, repository.path, credentials, trustedRemoteArguments(
+		"ls-remote", "--heads", "--exit-code", "--", pushURL, ref,
+	)...)
+	postValidation := repository.validate()
 	if result.exitCode == 2 {
-		return "", false, nil
+		return "", false, postValidation
 	}
 	if result.err != nil {
-		return "", false, result.err
+		return "", false, errors.Join(result.err, postValidation)
+	}
+	if postValidation != nil {
+		return "", false, postValidation
 	}
 	lines := strings.Split(strings.TrimSpace(result.output), "\n")
 	if len(lines) != 1 {
@@ -93,6 +125,8 @@ func (g *gitClient) commit(ctx context.Context, workspace, message string) (stri
 		"-c", "user.name=Pajé",
 		"-c", "user.email=paje@invalid",
 		"-c", "core.hooksPath=/dev/null",
+		"-c", "commit.gpgSign=false",
+		"-c", "core.fsmonitor=false",
 		"commit", "-m", message,
 	)
 	if result.err != nil {
@@ -111,42 +145,163 @@ func (g *gitClient) commit(ctx context.Context, workspace, message string) (stri
 
 func (g *gitClient) push(
 	ctx context.Context,
-	workspace, pushURL, branch string,
+	repository *trustedRepository,
+	pushURL, branch string,
 	credentials map[string]string,
 ) error {
+	if err := repository.validate(); err != nil {
+		return err
+	}
 	result := g.run(
-		ctx, workspace, credentials,
-		"-c", "core.hooksPath=/dev/null",
-		"push", pushURL, "HEAD:refs/heads/"+branch,
+		ctx, repository.path, credentials,
+		trustedRemoteArguments("push", pushURL, "HEAD:refs/heads/"+branch)...,
 	)
-	return result.err
+	return errors.Join(result.err, repository.validate())
 }
 
 func (g *gitClient) verifyRemoteCommit(
 	ctx context.Context,
-	workspace, pushURL, branch, commitSHA string,
+	repository *trustedRepository,
+	pushURL, branch, commitSHA string,
 	req publisher.Request,
 	treeSHA string,
 	credentials map[string]string,
 ) error {
+	if err := repository.validate(); err != nil {
+		return err
+	}
 	verificationRef := "refs/paje/verify/" + req.RunID
 	fetch := g.run(
-		ctx, workspace, credentials,
-		"-c", "core.hooksPath=/dev/null",
-		"fetch", "--no-tags", "--force", pushURL,
-		"refs/heads/"+branch+":"+verificationRef,
+		ctx, repository.path, credentials,
+		trustedRemoteArguments(
+			"fetch", "--no-tags", "--force", pushURL,
+			"refs/heads/"+branch+":"+verificationRef,
+		)...,
 	)
 	if fetch.err != nil {
-		return markRetryable(fmt.Errorf("fetch existing publication branch: %w", fetch.err))
+		return retryRemoteError(errors.Join(
+			fmt.Errorf("fetch existing publication branch: %w", fetch.err),
+			repository.validate(),
+		))
 	}
-	fetched := g.run(ctx, workspace, nil, "rev-parse", verificationRef+"^{commit}")
+	if err := repository.validate(); err != nil {
+		return err
+	}
+	fetched := g.run(ctx, repository.path, nil, "rev-parse", verificationRef+"^{commit}")
 	if fetched.err != nil {
-		return fmt.Errorf("%w: inspect existing publication commit: %v", publisher.ErrConflict, fetched.err)
+		return conflictUnlessCanceled("inspect existing publication commit", fetched.err)
 	}
 	if strings.TrimSpace(fetched.output) != commitSHA {
 		return fmt.Errorf("%w: publication branch changed during inspection", publisher.ErrConflict)
 	}
-	return g.verifyLocalCommit(ctx, workspace, commitSHA, req, treeSHA)
+	return g.verifyLocalCommit(ctx, repository.path, commitSHA, req, treeSHA)
+}
+
+func (g *gitClient) importTrusted(
+	ctx context.Context,
+	source string,
+	expectedCommit string,
+) (_ *trustedRepository, returnErr error) {
+	if !filepath.IsAbs(source) || !gitObjectPattern.MatchString(expectedCommit) {
+		return nil, fmt.Errorf("create trusted publication repository: invalid import")
+	}
+	root, err := os.MkdirTemp("", "paje-publisher-")
+	if err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: %w", err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		_ = os.RemoveAll(root)
+		return nil, fmt.Errorf("create trusted publication repository: canonicalize root: %w", err)
+	}
+	repository := &trustedRepository{
+		root: canonicalRoot, path: filepath.Join(canonicalRoot, "repository.git"),
+		parent: filepath.Dir(canonicalRoot),
+	}
+	defer func() {
+		if returnErr != nil {
+			returnErr = errors.Join(returnErr, repository.Cleanup(context.WithoutCancel(ctx)))
+		}
+	}()
+	canonicalSource, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: canonicalize source: %w", err)
+	}
+	if containsFilesystemPath(canonicalSource, canonicalRoot) {
+		return nil, fmt.Errorf("create trusted publication repository: trusted root is inside source workspace")
+	}
+	if err := os.Chmod(repository.root, 0o700); err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: secure root: %w", err)
+	}
+	if err := os.Mkdir(repository.path, 0o700); err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: create repository: %w", err)
+	}
+	if result := g.run(ctx, repository.path, nil, "init", "--bare"); result.err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: initialize: %w", result.err)
+	}
+	if err := os.Chmod(repository.path, 0o700); err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: secure repository: %w", err)
+	}
+	if err := os.RemoveAll(filepath.Join(repository.path, "hooks")); err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: remove hooks: %w", err)
+	}
+	if err := writePrivateFile(filepath.Join(repository.path, "config"), []byte(trustedRepositoryConfig)); err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: write config: %w", err)
+	}
+	if err := writePrivateFile(filepath.Join(repository.path, "HEAD"), []byte(trustedRepositoryHead)); err != nil {
+		return nil, fmt.Errorf("create trusted publication repository: write HEAD: %w", err)
+	}
+	if err := repository.validate(); err != nil {
+		return nil, err
+	}
+	importResult := g.run(
+		ctx, repository.path, nil,
+		trustedRemoteArguments(
+			"fetch", "--no-tags", "--force", "--", source,
+			"HEAD:refs/heads/paje-candidate",
+		)...,
+	)
+	if importResult.err != nil {
+		return nil, errors.Join(importResult.err, repository.validate())
+	}
+	if err := repository.validate(); err != nil {
+		return nil, err
+	}
+	imported := g.run(ctx, repository.path, nil, "rev-parse", "HEAD^{commit}")
+	if imported.err != nil {
+		return nil, imported.err
+	}
+	if strings.TrimSpace(imported.output) != expectedCommit {
+		return nil, fmt.Errorf("%w: trusted import commit does not match candidate", publisher.ErrConflict)
+	}
+	return repository, nil
+}
+
+func containsFilesystemPath(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func (g *gitClient) validateEffectiveURL(
+	ctx context.Context,
+	repository *trustedRepository,
+	pushURL string,
+) error {
+	if err := repository.validate(); err != nil {
+		return err
+	}
+	result := g.run(
+		ctx, repository.path, nil,
+		trustedRemoteArguments("ls-remote", "--get-url", "--", pushURL)...,
+	)
+	if result.err != nil {
+		return fmt.Errorf("validate publication URL: %w", result.err)
+	}
+	if strings.TrimSpace(result.output) != pushURL {
+		return fmt.Errorf("%w: effective publication URL was rewritten", publisher.ErrConflict)
+	}
+	return repository.validate()
 }
 
 func (g *gitClient) verifyLocalCommit(
@@ -157,7 +312,7 @@ func (g *gitClient) verifyLocalCommit(
 ) error {
 	parent := g.run(ctx, workspace, nil, "show", "-s", "--format=%P", commitSHA)
 	if parent.err != nil {
-		return fmt.Errorf("%w: inspect publication parent: %v", publisher.ErrConflict, parent.err)
+		return conflictUnlessCanceled("inspect publication parent", parent.err)
 	}
 	parents := strings.Fields(parent.output)
 	if len(parents) != 1 || parents[0] != req.BaseSHA {
@@ -165,19 +320,26 @@ func (g *gitClient) verifyLocalCommit(
 	}
 	tree := g.run(ctx, workspace, nil, "show", "-s", "--format=%T", commitSHA)
 	if tree.err != nil {
-		return fmt.Errorf("%w: inspect publication tree: %v", publisher.ErrConflict, tree.err)
+		return conflictUnlessCanceled("inspect publication tree", tree.err)
 	}
 	if strings.TrimSpace(tree.output) != treeSHA {
 		return fmt.Errorf("%w: publication commit tree does not match artifact", publisher.ErrConflict)
 	}
 	message := g.run(ctx, workspace, nil, "show", "-s", "--format=%B", commitSHA)
 	if message.err != nil {
-		return fmt.Errorf("%w: inspect publication message: %v", publisher.ErrConflict, message.err)
+		return conflictUnlessCanceled("inspect publication message", message.err)
 	}
 	if strings.TrimRight(message.output, "\r\n") != commitMessage(req) {
 		return fmt.Errorf("%w: publication commit trailers do not match immutable request", publisher.ErrConflict)
 	}
 	return nil
+}
+
+func conflictUnlessCanceled(operation string, err error) error {
+	if cancellationError(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %s: %v", publisher.ErrConflict, operation, err)
 }
 
 func (g *gitClient) run(
@@ -220,8 +382,89 @@ func (g *gitClient) run(
 	if diagnostic == "" {
 		diagnostic = "no diagnostic"
 	}
-	result.err = fmt.Errorf("git %s failed (exit %s): %s", safeGitOperation(args), strconv.Itoa(result.exitCode), diagnostic)
+	result.err = errors.Join(
+		ctx.Err(),
+		fmt.Errorf("git %s failed (exit %s): %s", safeGitOperation(args), strconv.Itoa(result.exitCode), diagnostic),
+	)
 	return result
+}
+
+func trustedRemoteArguments(arguments ...string) []string {
+	return append([]string{
+		"-c", "credential.helper=",
+		"-c", "http.proxy=",
+		"-c", "core.hooksPath=/dev/null",
+	}, arguments...)
+}
+
+func writePrivateFile(path string, contents []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := file.Write(contents); err != nil {
+		file.Close()
+		return err
+	}
+	return errors.Join(file.Sync(), file.Close())
+}
+
+func (r *trustedRepository) validate() error {
+	if r == nil || r.root == "" || r.path != filepath.Join(r.root, "repository.git") ||
+		filepath.Dir(r.root) != r.parent || !strings.HasPrefix(filepath.Base(r.root), "paje-publisher-") {
+		return fmt.Errorf("validate trusted publication repository: invalid identity")
+	}
+	for _, path := range []string{r.root, r.path} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("validate trusted publication repository: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("validate trusted publication repository: unsafe directory")
+		}
+	}
+	for path, expected := range map[string][]byte{
+		filepath.Join(r.path, "config"): []byte(trustedRepositoryConfig),
+		filepath.Join(r.path, "HEAD"):   []byte(trustedRepositoryHead),
+	} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("validate trusted publication repository: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return fmt.Errorf("validate trusted publication repository: unsafe control file")
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(contents, expected) {
+			return fmt.Errorf("validate trusted publication repository: control file changed")
+		}
+	}
+	return nil
+}
+
+func (r *trustedRepository) Cleanup(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r == nil || r.root == "" || filepath.Dir(r.root) != r.parent ||
+		!strings.HasPrefix(filepath.Base(r.root), "paje-publisher-") {
+		return fmt.Errorf("cleanup trusted publication repository: invalid identity")
+	}
+	info, err := os.Lstat(r.root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cleanup trusted publication repository: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("cleanup trusted publication repository: unsafe root")
+	}
+	return os.RemoveAll(r.root)
 }
 
 func gitEnvironment(base, extra map[string]string) []string {
