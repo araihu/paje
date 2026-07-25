@@ -128,6 +128,34 @@ func TestReserveRejectsDuplicateOrCorruptReconciliationCandidates(t *testing.T) 
 			t.Fatal("Reserve() silently ignored corrupt reconciliation candidate")
 		}
 	})
+
+	t.Run("directory shaped like committed run", func(t *testing.T) {
+		root := t.TempDir()
+		store, err := runfilesystem.New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, "runs", "run-directory.json"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.Reserve(context.Background(), validReservation("run-new", "hash")); !errors.Is(err, run.ErrInvalidRecord) {
+			t.Fatalf("directory reconciliation error = %v, want ErrInvalidRecord", err)
+		}
+	})
+
+	t.Run("unexpected committed entry", func(t *testing.T) {
+		root := t.TempDir()
+		store, err := runfilesystem.New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "runs", "unexpected"), []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.Reserve(context.Background(), validReservation("run-new", "hash")); !errors.Is(err, run.ErrInvalidRecord) {
+			t.Fatalf("unexpected entry error = %v, want ErrInvalidRecord", err)
+		}
+	})
 }
 
 func TestSaveUsesCompareAndSwapAndReopensNestedRecord(t *testing.T) {

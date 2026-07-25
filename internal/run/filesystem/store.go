@@ -145,7 +145,14 @@ func (s *Store) reconcileLocked(
 			return run.Record{}, false, err
 		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+			return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: %w: unexpected run entry %q", run.ErrInvalidRecord, entry.Name())
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: inspect %q: %w", entry.Name(), err)
+		}
+		if !info.Mode().IsRegular() {
+			return run.Record{}, false, fmt.Errorf("reconcile idempotency binding: %w: run entry %q is not regular", run.ErrInvalidRecord, entry.Name())
 		}
 		id := strings.TrimSuffix(entry.Name(), ".json")
 		if !validRunID(id) {

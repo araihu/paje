@@ -148,11 +148,14 @@ func PrepareSave(current, next Record) (Record, error) {
 	if !SameImmutableIdentity(current, next) {
 		return Record{}, invalidRecord("immutable identity or input changed")
 	}
-	if current.Terminal() && !reflect.DeepEqual(current, next) {
-		return Record{}, invalidRecord("terminal record is immutable")
-	}
-	if err := validateMonotonicEvidence(current, next); err != nil {
-		return Record{}, err
+	if current.Terminal() {
+		if err := validateTerminalUpdate(current, next); err != nil {
+			return Record{}, err
+		}
+	} else {
+		if err := validateMonotonicEvidence(current, next); err != nil {
+			return Record{}, err
+		}
 	}
 	if next.UpdatedAt.Before(current.UpdatedAt) {
 		return Record{}, invalidRecord("updated time moved backward")
@@ -222,11 +225,20 @@ func validateMonotonicEvidence(current, next Record) error {
 	case current.OutcomeMemorySaved && !next.OutcomeMemorySaved:
 		return invalidRecord("outcome memory marker cannot regress")
 	}
+	if err := validateMonotonicFailure(current, next); err != nil {
+		return err
+	}
 	return validateMonotonicStages(current.Stages, next.Stages)
 }
 
 func validateMonotonicStages(current, next []StageResult) error {
 	nextByKey := make(map[string]StageResult, len(next))
+	latestAttempt := make(map[string]int, len(current))
+	for _, stage := range current {
+		if stage.Attempts > latestAttempt[stage.Name] {
+			latestAttempt[stage.Name] = stage.Attempts
+		}
+	}
 	for _, stage := range next {
 		nextByKey[stageKey(stage)] = stage
 	}
@@ -236,7 +248,7 @@ func validateMonotonicStages(current, next []StageResult) error {
 			return invalidRecord("stage history cannot be removed")
 		}
 		if stageFinished(existing) && !reflect.DeepEqual(existing, candidate) &&
-			!isRetryExhaustion(existing, candidate) {
+			!(existing.Attempts == latestAttempt[existing.Name] && isRetryExhaustion(existing, candidate)) {
 			return invalidRecord("finished stage evidence is immutable")
 		}
 		if !stageFinished(existing) &&
@@ -249,11 +261,7 @@ func validateMonotonicStages(current, next []StageResult) error {
 }
 
 func isRetryExhaustion(current, next StageResult) bool {
-	if current.Failure == nil || next.Failure == nil ||
-		!current.Failure.Retryable || next.Failure.Retryable ||
-		next.Failure.CauseCode != "retries_exhausted" ||
-		current.Failure.Stage != next.Failure.Stage ||
-		current.Failure.Class != next.Failure.Class {
+	if current.Failure == nil || next.Failure == nil || !isRetryExhaustionFailure(*current.Failure, *next.Failure) {
 		return false
 	}
 	currentWithoutFailure := current
@@ -261,6 +269,112 @@ func isRetryExhaustion(current, next StageResult) bool {
 	nextWithoutFailure := next
 	nextWithoutFailure.Failure = nil
 	return reflect.DeepEqual(currentWithoutFailure, nextWithoutFailure)
+}
+
+func isRetryExhaustionFailure(current, next Failure) bool {
+	if !current.Retryable || next.Retryable || next.CauseCode != "retries_exhausted" {
+		return false
+	}
+	current.Retryable = false
+	current.CauseCode = "retries_exhausted"
+	return reflect.DeepEqual(current, next)
+}
+
+func validateMonotonicFailure(current, next Record) error {
+	if reflect.DeepEqual(current.Failure, next.Failure) {
+		return nil
+	}
+	if current.Failure == nil {
+		if next.Failure == nil {
+			return nil
+		}
+		latest, found := latestStage(next.Stages, next.Failure.Stage)
+		if !found || latest.Failure == nil || !reflect.DeepEqual(latest.Failure, next.Failure) {
+			return invalidRecord("new top-level failure is not bound to latest stage attempt")
+		}
+		return nil
+	}
+	currentLatest, currentFound := latestStage(current.Stages, current.Failure.Stage)
+	if !currentFound || currentLatest.Failure == nil || !reflect.DeepEqual(currentLatest.Failure, current.Failure) {
+		return invalidRecord("top-level failure is not bound to latest stage attempt")
+	}
+	if next.Failure != nil && isRetryExhaustionFailure(*current.Failure, *next.Failure) {
+		nextLatest, found := latestStage(next.Stages, next.Failure.Stage)
+		if !found || nextLatest.Attempts != currentLatest.Attempts ||
+			nextLatest.Failure == nil || !reflect.DeepEqual(nextLatest.Failure, next.Failure) ||
+			!isRetryExhaustion(currentLatest, nextLatest) {
+			return invalidRecord("retry exhaustion is not bound to latest stage attempt")
+		}
+		return nil
+	}
+
+	stageName := current.Failure.Stage
+	if next.Failure != nil {
+		stageName = next.Failure.Stage
+	}
+	nextLatest, found := latestStage(next.Stages, stageName)
+	if !found {
+		return invalidRecord("failure change lacks a new stage attempt")
+	}
+	if stageName == current.Failure.Stage && nextLatest.Attempts <= currentLatest.Attempts {
+		return invalidRecord("failure changed without a newer stage attempt")
+	}
+	if next.Failure == nil {
+		if nextLatest.Failure != nil {
+			return invalidRecord("cleared top-level failure differs from latest stage")
+		}
+		return nil
+	}
+	if nextLatest.Failure == nil || !reflect.DeepEqual(nextLatest.Failure, next.Failure) {
+		return invalidRecord("top-level failure differs from latest stage")
+	}
+	return nil
+}
+
+func latestStage(stages []StageResult, name string) (StageResult, bool) {
+	var latest StageResult
+	found := false
+	for _, stage := range stages {
+		if stage.Name == name && (!found || stage.Attempts > latest.Attempts) {
+			latest = stage
+			found = true
+		}
+	}
+	return latest, found
+}
+
+func validateTerminalUpdate(current, next Record) error {
+	switch {
+	case current.Status != next.Status:
+		return invalidRecord("terminal status is immutable")
+	case current.BaseSHA != next.BaseSHA:
+		return invalidRecord("terminal base SHA is immutable")
+	case !reflect.DeepEqual(current.MemorySnapshot, next.MemorySnapshot):
+		return invalidRecord("terminal memory snapshot is immutable")
+	case !reflect.DeepEqual(current.Artifact, next.Artifact):
+		return invalidRecord("terminal artifact is immutable")
+	case !reflect.DeepEqual(current.Approval, next.Approval):
+		return invalidRecord("terminal approval is immutable")
+	case !reflect.DeepEqual(current.Publication, next.Publication):
+		return invalidRecord("terminal publication is immutable")
+	case !reflect.DeepEqual(current.Failure, next.Failure):
+		return invalidRecord("terminal failure is immutable")
+	case current.OutcomeMemorySaved && !next.OutcomeMemorySaved:
+		return invalidRecord("terminal outcome memory marker cannot regress")
+	case !reflect.DeepEqual(nonFinalizeStages(current.Stages), nonFinalizeStages(next.Stages)):
+		return invalidRecord("terminal non-finalize stages are immutable")
+	}
+	return validateMonotonicStages(current.Stages, next.Stages)
+}
+
+func nonFinalizeStages(stages []StageResult) []StageResult {
+	result := make([]StageResult, 0, len(stages))
+	for _, stage := range stages {
+		if stage.Name != "finalize" {
+			result = append(result, stage)
+		}
+	}
+	return result
 }
 
 func stageKey(stage StageResult) string {

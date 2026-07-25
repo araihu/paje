@@ -233,6 +233,170 @@ func TestPrepareSaveAllowsRetryExhaustionToBecomeFailed(t *testing.T) {
 	}
 }
 
+func TestPrepareSaveAllowsOnlyFinalizeBookkeepingOnTerminalRecords(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	ref := artifact.Reference{RunID: "run-1", Digest: strings.Repeat("a", 64), Size: 1}
+	decline := approval.Result{RunID: "run-1", ArtifactDigest: ref.Digest, Actor: "human", DecidedAt: now, Reason: "no"}
+	terminals := []Record{
+		withFailure(validRecord(StatusFailed)),
+		withCanceledFailure(validRecord(StatusCanceled)),
+		withApproval(withArtifact(validRecord(StatusDeclined), ref), decline),
+	}
+	for _, current := range terminals {
+		t.Run(string(current.Status), func(t *testing.T) {
+			current.Stages = []StageResult{{
+				Name: "execute", Status: StageFailed, StartedAt: now,
+				FinishedAt: now.Add(time.Minute), Attempts: 1,
+			}}
+			current.UpdatedAt = now.Add(time.Minute)
+			next := CloneRecord(current)
+			next.OutcomeMemorySaved = true
+			next.UpdatedAt = now.Add(2 * time.Minute)
+			next, err := UpsertStage(next, StageResult{
+				Name: "finalize", Status: StageSucceeded, StartedAt: next.UpdatedAt,
+				FinishedAt: next.UpdatedAt.Add(time.Minute), Attempts: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			next.UpdatedAt = now.Add(3 * time.Minute)
+			saved, err := PrepareSave(current, next)
+			if err != nil {
+				t.Fatalf("PrepareSave() terminal finalize error = %v", err)
+			}
+			if saved.Status != current.Status || !saved.OutcomeMemorySaved {
+				t.Fatalf("terminal finalize changed status/bookkeeping: %#v", saved)
+			}
+		})
+	}
+}
+
+func TestPrepareSaveRejectsUnrelatedTerminalFinalizationMutation(t *testing.T) {
+	t.Parallel()
+	current := withFailure(validRecord(StatusFailed))
+	current.BaseSHA = strings.Repeat("a", 40)
+	current.MemorySnapshot = []memory.Memory{{ID: "m-1", Content: "memory", Metadata: map[string]string{"scope": "run"}}}
+	ref := artifact.Reference{RunID: current.ID, Digest: strings.Repeat("b", 64), Size: 1}
+	current.Artifact = &ref
+	approvalResult := approval.Result{RunID: current.ID, ArtifactDigest: ref.Digest, Approved: true, Actor: "human", DecidedAt: current.UpdatedAt}
+	current.Approval = &approvalResult
+	publication := publisher.Result{Provider: "github", Branch: "paje/run-1", CommitSHA: strings.Repeat("c", 40), PullRequestID: "1", PullRequestURL: "https://example.test/pull/1"}
+	current.Publication = &publication
+	current.Stages = []StageResult{{Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 1}}
+
+	tests := []struct {
+		name   string
+		mutate func(*Record)
+	}{
+		{name: "status", mutate: func(record *Record) { record.Status = StatusCanceled; record.Failure.Class = FailureCanceled }},
+		{name: "base SHA", mutate: func(record *Record) { record.BaseSHA = strings.Repeat("d", 40) }},
+		{name: "memory", mutate: func(record *Record) { record.MemorySnapshot[0].Content = "changed" }},
+		{name: "artifact", mutate: func(record *Record) { record.Artifact.Digest = strings.Repeat("e", 64) }},
+		{name: "approval", mutate: func(record *Record) { record.Approval.Actor = "other" }},
+		{name: "publication", mutate: func(record *Record) { record.Publication.PullRequestID = "2" }},
+		{name: "failure", mutate: func(record *Record) { record.Failure.Diagnostic = "changed" }},
+		{name: "non-finalize stage", mutate: func(record *Record) { record.Stages[0].Evidence = map[string]string{"changed": "true"} }},
+		{name: "outcome reversal", mutate: func(record *Record) { record.OutcomeMemorySaved = false }},
+	}
+	current.OutcomeMemorySaved = true
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			next := CloneRecord(current)
+			next.UpdatedAt = next.UpdatedAt.Add(time.Minute)
+			test.mutate(&next)
+			if _, err := PrepareSave(current, next); err == nil {
+				t.Fatal("PrepareSave() accepted unrelated terminal mutation")
+			}
+		})
+	}
+}
+
+func TestRetryExhaustionAllowsOnlyExactLatestFailureChange(t *testing.T) {
+	t.Parallel()
+	current := withRetryableFailure(validRecord(StatusExecuting))
+	failure := *current.Failure
+	current.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt,
+		FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &failure,
+	}}
+
+	exhausted := func() Record {
+		next := CloneRecord(current)
+		next.Failure.Retryable = false
+		next.Failure.CauseCode = "retries_exhausted"
+		next.Stages[0].Failure.Retryable = false
+		next.Stages[0].Failure.CauseCode = "retries_exhausted"
+		return next
+	}
+	if _, err := PrepareSave(current, exhausted()); err != nil {
+		t.Fatalf("exact retry exhaustion rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Failure)
+	}{
+		{name: "diagnostic", mutate: func(failure *Failure) { failure.Diagnostic = "rewritten" }},
+		{name: "class", mutate: func(failure *Failure) { failure.Class = FailureInternal }},
+		{name: "stage", mutate: func(failure *Failure) { failure.Stage = "resolve" }},
+		{name: "cause", mutate: func(failure *Failure) { failure.CauseCode = "other" }},
+		{name: "still retryable", mutate: func(failure *Failure) { failure.Retryable = true }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			next := exhausted()
+			test.mutate(next.Failure)
+			test.mutate(next.Stages[0].Failure)
+			if _, err := PrepareSave(current, next); err == nil {
+				t.Fatal("PrepareSave() accepted imprecise retry exhaustion")
+			}
+		})
+	}
+
+	topOnly := exhausted()
+	topOnly.Failure.Diagnostic = "top-only rewrite"
+	if _, err := PrepareSave(current, topOnly); err == nil {
+		t.Fatal("PrepareSave() accepted top-level failure rewrite")
+	}
+}
+
+func TestRetryExhaustionRejectsHistoricalAttempt(t *testing.T) {
+	t.Parallel()
+	current := withRetryableFailure(validRecord(StatusExecuting))
+	firstFailure := *current.Failure
+	secondFailure := *current.Failure
+	current.Stages = []StageResult{
+		{Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &firstFailure},
+		{Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 2, Failure: &secondFailure},
+	}
+	next := CloneRecord(current)
+	next.Stages[0].Failure.Retryable = false
+	next.Stages[0].Failure.CauseCode = "retries_exhausted"
+	if _, err := PrepareSave(current, next); err == nil {
+		t.Fatal("PrepareSave() exhausted a non-latest attempt")
+	}
+}
+
+func TestPrepareSaveBindsNewTopLevelFailureToLatestAttempt(t *testing.T) {
+	t.Parallel()
+	current := validRecord(StatusExecuting)
+	unbound := withRetryableFailure(CloneRecord(current))
+	if _, err := PrepareSave(current, unbound); err == nil {
+		t.Fatal("PrepareSave() accepted an unbound top-level failure")
+	}
+
+	bound := withRetryableFailure(CloneRecord(current))
+	stageFailure := *bound.Failure
+	bound.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: bound.CreatedAt,
+		FinishedAt: bound.UpdatedAt, Attempts: 1, Failure: &stageFailure,
+	}}
+	if _, err := PrepareSave(current, bound); err != nil {
+		t.Fatalf("PrepareSave() rejected latest-attempt-bound failure: %v", err)
+	}
+}
+
 func TestTransitionValidatesSourceBeforeRepairingStatus(t *testing.T) {
 	t.Parallel()
 	record := withFailure(validRecord(Status("unknown")))
