@@ -25,7 +25,7 @@ export async function generateMetadata(): Promise<Metadata> {
     metadataBase: await metadataBase(),
     title: "Pajé — Orquestração durável pilotada pelo agente",
     description:
-      "O agente pilota via hooks e skills. Pajé torna mudanças de código duráveis em qualquer linguagem, com Codex como primeiro harness.",
+      "Projetado para o agente pilotar via hooks e skills. Pajé torna mudanças duráveis em qualquer linguagem, com Codex como primeiro harness.",
     applicationName: "Pajé",
     alternates: { canonical: "/" },
     openGraph: {
@@ -33,7 +33,7 @@ export async function generateMetadata(): Promise<Metadata> {
       locale: "pt_BR",
       siteName: "Pajé",
       title: "Pajé — Do pedido ao pull request. Sem perder o fio.",
-      description: "Pilotado pelo agente, independente da linguagem e com Codex como primeiro harness.",
+      description: "Projetado para o agente pilotar, independente da linguagem e com Codex como primeiro harness.",
       images: [
         {
           url: "/og.png",
@@ -46,7 +46,7 @@ export async function generateMetadata(): Promise<Metadata> {
     twitter: {
       card: "summary_large_image",
       title: "Pajé — Do pedido ao pull request. Sem perder o fio.",
-      description: "Pilotado pelo agente, independente da linguagem e com Codex como primeiro harness.",
+      description: "Projetado para o agente pilotar, independente da linguagem e com Codex como primeiro harness.",
       images: ["/og.png"],
     },
   };
