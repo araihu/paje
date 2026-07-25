@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/run"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 )
@@ -96,6 +98,7 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 	if record.BaseSHA != "" || record.Terminal() {
 		return phaseResult(record), nil
 	}
+	attempt := stageAttempt(record, "resolve")
 
 	revision, err := s.resolver.Resolve(ctx, input.RepositoryURI, input.BaseRef)
 	if err != nil {
@@ -106,14 +109,14 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			failure = canceledFailure("resolve")
 		}
-		return s.finishFailure(ctx, runID, failure, err)
+		return s.finishFailure(ctx, runID, failure, err, attempt)
 	}
 	if revision.SourceDirty {
 		failure := run.Failure{
 			Stage: "resolve", Class: run.FailureInput, Retryable: false,
 			Diagnostic: "local repository source is dirty", CauseCode: "source_dirty",
 		}
-		return s.finishFailure(ctx, runID, failure, errors.New("local repository source is dirty"))
+		return s.finishFailure(ctx, runID, failure, errors.New("local repository source is dirty"), attempt)
 	}
 	if revision.RepositoryURI != input.RepositoryURI ||
 		revision.Ref != input.BaseRef ||
@@ -122,27 +125,38 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 			Stage: "resolve", Class: run.FailureInternal, Retryable: false,
 			Diagnostic: "repository resolver returned an invalid immutable revision", CauseCode: "invalid_revision",
 		}
-		return s.finishFailure(ctx, runID, failure, errors.New("repository resolver returned an invalid revision"))
+		return s.finishFailure(ctx, runID, failure, errors.New("repository resolver returned an invalid revision"), attempt)
+	}
+
+	capabilityEvidence, capabilityFailure, capabilityErr := s.validateResolveCapabilities(ctx, runID, attempt, input)
+	if capabilityFailure != nil {
+		return s.finishFailure(ctx, runID, *capabilityFailure, capabilityErr, attempt)
 	}
 
 	query := input.MemoryQuery
 	if query == "" {
 		query = input.TaskDescription
 	}
-	memories, err := s.memory.Search(ctx, query, input.MemoryLimit, cloneStringMap(input.Tags))
-	if err != nil {
-		failure := run.Failure{
-			Stage: "resolve", Class: run.FailureInternal, Retryable: true,
-			Diagnostic: "scoped memory is temporarily unavailable", CauseCode: "memory_unavailable",
+	memories := []memory.Memory{}
+	if input.MemoryLimit > 0 {
+		memories, err = s.memory.Search(ctx, query, input.MemoryLimit, cloneStringMap(input.Tags))
+		if err != nil {
+			failure := run.Failure{
+				Stage: "resolve", Class: run.FailureInternal, Retryable: true,
+				Diagnostic: "scoped memory is temporarily unavailable", CauseCode: "memory_unavailable",
+			}
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				failure = canceledFailure("resolve")
+			}
+			return s.finishFailure(ctx, runID, failure, err, attempt)
 		}
-		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-			failure = canceledFailure("resolve")
-		}
-		return s.finishFailure(ctx, runID, failure, err)
 	}
 
 	record, err = s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
 		if current.BaseSHA != "" || current.Terminal() {
+			return current, false, nil
+		}
+		if !runningStageAttempt(current, "resolve", attempt) {
 			return current, false, nil
 		}
 		next := run.CloneRecord(current)
@@ -157,6 +171,9 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 				"base_sha": revision.SHA, "memory_count": fmt.Sprintf("%d", len(memories)),
 			},
 		}
+		for key, value := range capabilityEvidence {
+			finished.Evidence[key] = value
+		}
 		next, err := run.UpsertStage(next, finished)
 		if err != nil {
 			return run.Record{}, false, err
@@ -167,7 +184,60 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 	if err != nil {
 		return phaseResult(record), err
 	}
+	if record.BaseSHA == "" && !record.Terminal() {
+		return phaseInProgress(record)
+	}
 	return phaseResult(record), nil
+}
+
+func (s *Service) validateResolveCapabilities(
+	ctx context.Context,
+	runID string,
+	attempt int,
+	input templatecodechange.Input,
+) (map[string]string, *run.Failure, error) {
+	evidence := make(map[string]string)
+	var primary error
+	runtimeID := resolveCapabilityRuntimeID(runID, attempt)
+	for _, stage := range []environment.Stage{environment.StageAgent, environment.StageVerification} {
+		result, err := s.environments.Build(ctx, environment.Request{
+			RunID: runtimeID, Stage: stage, RequestedKeys: append([]string(nil), input.EnvironmentKeys...),
+		})
+		if err != nil {
+			primary = err
+			break
+		}
+		evidence["capability_"+string(stage)+"_keys"] = encodeStrings(result.Keys)
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	cleanupErr := s.environments.Cleanup(cleanupCtx, runtimeID)
+	cancel()
+	if ctx.Err() != nil || errors.Is(primary, context.Canceled) {
+		failure := canceledFailure("resolve")
+		return nil, &failure, errors.Join(primary, cleanupErr, ctx.Err())
+	}
+	if primary != nil {
+		failure := environmentPolicyFailure(ctx, "resolve")
+		if cleanupErr != nil {
+			failure.Retryable = false
+			failure.Diagnostic = run.SafeDiagnostic(failure.Diagnostic + "; capability cleanup failed")
+		}
+		return nil, &failure, errors.Join(primary, cleanupErr)
+	}
+	if cleanupErr != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureCleanup, Retryable: false,
+			Diagnostic: "capability validation cleanup failed", CauseCode: "cleanup_failed",
+		}
+		return nil, &failure, cleanupErr
+	}
+	return evidence, nil, nil
+}
+
+func resolveCapabilityRuntimeID(runID string, attempt int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", runID, attempt)))
+	return "resolve-" + hex.EncodeToString(sum[:16])
 }
 
 func (s *Service) beginStage(ctx context.Context, runID, name string, status run.Status) (run.Record, bool, error) {
@@ -180,13 +250,48 @@ func (s *Service) beginStage(ctx context.Context, runID, name string, status run
 		if name == "resolve" && current.BaseSHA != "" {
 			return current, false, nil
 		}
+		next := run.CloneRecord(current)
+		if latest, found := latestStage(current, name); found && latest.Status == run.StageRunning {
+			lease := s.resolveLease
+			if name == "execute" {
+				lease = s.executeLease
+			}
+			if !stageExpired(latest, s.clock(), lease) {
+				return current, false, nil
+			}
+			if name == "execute" {
+				failure := run.Failure{
+					Stage: name, Class: run.FailureInternal, Retryable: false,
+					Diagnostic: "running attempt outcome is ambiguous", CauseCode: "ambiguous_attempt",
+				}
+				latest.Status = run.StageFailed
+				latest.FinishedAt = s.clock()
+				latest.Failure = &failure
+				next.Failure = &failure
+				var mutationErr error
+				next, mutationErr = run.UpsertStage(next, latest)
+				if mutationErr != nil {
+					return run.Record{}, false, mutationErr
+				}
+				next, mutationErr = run.Transition(next, run.StatusFailed, s.clock())
+				return next, true, mutationErr
+			}
+			lost := run.Failure{
+				Stage: name, Class: run.FailureInternal, Retryable: true,
+				Diagnostic: "worker lease expired before resolve completed", CauseCode: "worker_lost",
+			}
+			latest.Status = run.StageFailed
+			latest.FinishedAt = s.clock()
+			latest.Failure = &lost
+			var mutationErr error
+			next, mutationErr = run.UpsertStage(next, latest)
+			if mutationErr != nil {
+				return run.Record{}, false, mutationErr
+			}
+		}
 		if name == "execute" && current.Artifact != nil {
 			return current, false, nil
 		}
-		if latest, found := latestStage(current, name); found && latest.Status == run.StageRunning {
-			return current, false, nil
-		}
-		next := run.CloneRecord(current)
 		var mutationErr error
 		if next.Status != status {
 			next, mutationErr = run.Transition(next, status, s.clock())
@@ -197,7 +302,7 @@ func (s *Service) beginStage(ctx context.Context, runID, name string, status run
 		next.Failure = nil
 		stage := run.StageResult{
 			Name: name, Status: run.StageRunning, StartedAt: s.clock(),
-			Attempts: stageAttempt(current, name) + 1,
+			Attempts: stageAttempt(next, name) + 1,
 		}
 		next, mutationErr = run.UpsertStage(next, stage)
 		if mutationErr != nil {
@@ -210,15 +315,29 @@ func (s *Service) beginStage(ctx context.Context, runID, name string, status run
 	return record, started, err
 }
 
-func (s *Service) finishFailure(ctx context.Context, runID string, failure run.Failure, cause error) (PhaseResult, error) {
+func stageExpired(stage run.StageResult, now time.Time, lease time.Duration) bool {
+	return lease > 0 && !now.Before(stage.StartedAt.Add(lease))
+}
+
+func (s *Service) finishFailure(
+	ctx context.Context,
+	runID string,
+	failure run.Failure,
+	cause error,
+	expectedAttempt ...int,
+) (PhaseResult, error) {
 	persistCtx := ctx
 	cancel := func() {}
 	if ctx.Err() != nil {
-		persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	}
 	defer cancel()
 	record, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
 		if current.Terminal() {
+			return current, false, nil
+		}
+		if len(expectedAttempt) != 0 &&
+			!runningStageAttempt(current, failure.Stage, expectedAttempt[0]) {
 			return current, false, nil
 		}
 		next := run.CloneRecord(current)
@@ -251,7 +370,24 @@ func (s *Service) finishFailure(ctx context.Context, runID string, failure run.F
 	if err != nil {
 		return phaseResult(record), errors.Join(newPhaseError(failure, cause), err)
 	}
+	if len(expectedAttempt) != 0 &&
+		!finishedStageAttempt(record, failure.Stage, expectedAttempt[0]) {
+		if record.Terminal() || record.BaseSHA != "" {
+			return phaseResult(record), nil
+		}
+		return phaseInProgress(record)
+	}
 	return phaseResult(record), newPhaseError(failure, cause)
+}
+
+func runningStageAttempt(record run.Record, name string, attempt int) bool {
+	latest, found := latestStage(record, name)
+	return found && latest.Attempts == attempt && latest.Status == run.StageRunning
+}
+
+func finishedStageAttempt(record run.Record, name string, attempt int) bool {
+	latest, found := latestStage(record, name)
+	return found && latest.Attempts == attempt && latest.Status != run.StageRunning
 }
 
 func latestStageStart(record run.Record, name string) time.Time {

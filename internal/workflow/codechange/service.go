@@ -2,7 +2,10 @@
 package codechange
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
@@ -24,15 +27,20 @@ import (
 )
 
 const (
-	maxCASAttempts      = 3
-	maxAgentPromptBytes = 1 << 20
-	maxCaptureBytes     = 10 << 20
-	cleanupTimeout      = 30 * time.Second
+	maxCASAttempts        = 3
+	maxAgentPromptBytes   = 1 << 20
+	maxCaptureBytes       = 10 << 20
+	defaultCleanupTimeout = 30 * time.Second
+	defaultResolveLease   = 5 * time.Minute
+	defaultExecuteLease   = 35 * time.Minute
 )
 
 // ErrPhaseInProgress asks an outer adapter to retry rather than launch a
 // duplicate side-effecting attempt.
 var ErrPhaseInProgress = errors.New("workflow phase already in progress")
+
+// ErrRunBinding indicates durable duplicated identity fields no longer agree.
+var ErrRunBinding = errors.New("durable run binding mismatch")
 
 // Dependencies is the complete provider-neutral port bundle used by the
 // code-change service.
@@ -65,21 +73,24 @@ type PhaseResult struct {
 
 // Service implements the provider-neutral workflow phases.
 type Service struct {
-	templates    *template.Registry
-	runs         run.Store
-	memory       memory.Store
-	resolver     repository.Resolver
-	workspaces   workspace.Manager
-	profiles     map[string]repository.Profile
-	environments environment.Builder
-	agent        runner.Runner
-	verifier     verification.Runner
-	capturer     gitcapture.Capturer
-	policy       policy.Evaluator
-	artifacts    artifact.Store
-	publisher    publisher.Publisher
-	clock        func() time.Time
-	newID        func() string
+	templates      *template.Registry
+	runs           run.Store
+	memory         memory.Store
+	resolver       repository.Resolver
+	workspaces     workspace.Manager
+	profiles       map[string]repository.Profile
+	environments   environment.Builder
+	agent          runner.Runner
+	verifier       verification.Runner
+	capturer       gitcapture.Capturer
+	policy         policy.Evaluator
+	artifacts      artifact.Store
+	publisher      publisher.Publisher
+	clock          func() time.Time
+	newID          func() string
+	cleanupTimeout time.Duration
+	resolveLease   time.Duration
+	executeLease   time.Duration
 }
 
 // New validates and snapshots the workflow dependency bundle.
@@ -140,7 +151,8 @@ func New(dependencies Dependencies) (*Service, error) {
 		verifier: dependencies.Verifier, capturer: dependencies.Capturer,
 		policy: dependencies.Policy, artifacts: dependencies.Artifacts,
 		publisher: dependencies.Publisher, clock: dependencies.Clock,
-		newID: dependencies.NewID,
+		newID: dependencies.NewID, cleanupTimeout: defaultCleanupTimeout,
+		resolveLease: defaultResolveLease, executeLease: defaultExecuteLease,
 	}, nil
 }
 
@@ -258,4 +270,27 @@ func canceledFailure(stage string) run.Failure {
 		Stage: stage, Class: run.FailureCanceled, Retryable: false,
 		Diagnostic: "caller canceled", CauseCode: "caller_canceled",
 	}
+}
+
+func validateRunBinding(record run.Record) (templatecodechange.Input, error) {
+	if record.Template != templatecodechange.ID {
+		return templatecodechange.Input{}, fmt.Errorf("%w: template", ErrRunBinding)
+	}
+	input, err := templatecodechange.Decode(record.Input)
+	if err != nil {
+		return templatecodechange.Input{}, fmt.Errorf("%w: decode input", ErrRunBinding)
+	}
+	canonical, err := canonicalInput(input)
+	if err != nil || !bytes.Equal(canonical, record.Input) {
+		return templatecodechange.Input{}, fmt.Errorf("%w: canonical input", ErrRunBinding)
+	}
+	sum := sha256.Sum256(canonical)
+	if record.InputHash != hex.EncodeToString(sum[:]) ||
+		record.IdempotencyKey != input.IdempotencyKey ||
+		record.RepositoryURI != input.RepositoryURI ||
+		record.BaseRef != input.BaseRef ||
+		record.PublicationMode != input.Publication.Mode {
+		return templatecodechange.Input{}, fmt.Errorf("%w: immutable fields", ErrRunBinding)
+	}
+	return input, nil
 }

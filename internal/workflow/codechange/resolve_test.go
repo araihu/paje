@@ -101,6 +101,7 @@ func TestResolveIsCanonicalIdempotentAndFreezesMemory(t *testing.T) {
 
 func TestResolveCanonicalInputPreservesExplicitZeroMemoryLimit(t *testing.T) {
 	fixture := newServiceFixture(t)
+	fixture.mem.result = []memory.Memory{{ID: "must-not-load", Content: "not requested"}}
 	var value map[string]any
 	if err := json.Unmarshal(validRawInput("Change docs", "zero-memory"), &value); err != nil {
 		t.Fatal(err)
@@ -114,6 +115,12 @@ func TestResolveCanonicalInputPreservesExplicitZeroMemoryLimit(t *testing.T) {
 	record, _ := fixture.runs.Load(context.Background(), result.RunID)
 	if !bytes.Contains(record.Input, []byte(`"memory_limit":0`)) {
 		t.Fatalf("canonical input lost explicit zero memory limit: %s", record.Input)
+	}
+	if fixture.mem.calls != 0 {
+		t.Fatalf("Memory.Search() calls = %d, want 0", fixture.mem.calls)
+	}
+	if record.MemorySnapshot == nil || len(record.MemorySnapshot) != 0 {
+		t.Fatalf("MemorySnapshot = %#v, want frozen empty snapshot", record.MemorySnapshot)
 	}
 }
 
@@ -156,6 +163,52 @@ func TestResolveRejectsDirtyLocalSourceAndPersistsFailure(t *testing.T) {
 	}
 }
 
+func TestResolveValidatesCapabilitiesAndCleansRuntimeBeforeMemory(t *testing.T) {
+	fixture := newServiceFixture(t)
+	var events []string
+	fixture.env.events = &events
+	fixture.mem.onSearch = func() { events = append(events, "memory") }
+
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "capabilities")); err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if got, want := strings.Join(events, ","), "build:agent,build:verification,cleanup,memory"; got != want {
+		t.Fatalf("event order = %q, want %q", got, want)
+	}
+	if fixture.env.cleanupCalls != 1 {
+		t.Fatalf("environment cleanup calls = %d, want 1", fixture.env.cleanupCalls)
+	}
+}
+
+func TestResolveCapabilityFailureCleansAndStopsBeforeMemory(t *testing.T) {
+	fixture := newServiceFixture(t)
+	var events []string
+	fixture.env.events = &events
+	fixture.mem.onSearch = func() { events = append(events, "memory") }
+	fixture.env.build = func(_ context.Context, request environment.Request) (environment.Result, error) {
+		if request.Stage == environment.StageVerification {
+			return environment.Result{}, errors.New("denied secret-value")
+		}
+		return environment.Result{Values: map[string]string{"PATH": "/bin", "CODEX_HOME": "/codex"}}, nil
+	}
+
+	result, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "capability-failure"))
+	if err == nil || result.FailureClass != run.FailurePolicy || result.Retryable {
+		t.Fatalf("Resolve() result=%#v error=%v", result, err)
+	}
+	if got, want := strings.Join(events, ","), "build:agent,build:verification,cleanup"; got != want {
+		t.Fatalf("event order = %q, want %q", got, want)
+	}
+	if fixture.mem.calls != 0 {
+		t.Fatalf("Memory.Search() calls = %d, want 0", fixture.mem.calls)
+	}
+	record, _ := fixture.runs.Load(context.Background(), result.RunID)
+	encoded, _ := json.Marshal(record)
+	if strings.Contains(string(encoded), "secret-value") {
+		t.Fatalf("durable failure leaked capability error: %s", encoded)
+	}
+}
+
 func TestResolveDoesNotStartASecondConcurrentStageAttempt(t *testing.T) {
 	fixture := newServiceFixture(t)
 	started := make(chan struct{})
@@ -188,6 +241,117 @@ func TestResolveDoesNotStartASecondConcurrentStageAttempt(t *testing.T) {
 	close(release)
 	if err := <-firstDone; err != nil {
 		t.Fatalf("Resolve(first) error = %v", err)
+	}
+}
+
+func TestResolveRecoversExpiredRunningAttemptAsNewAttempt(t *testing.T) {
+	fixture := newServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.resolveLease = time.Minute
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fixture.resolver.resolve = func(call int) (repository.Revision, error) {
+		if call == 1 {
+			close(started)
+			<-release
+		}
+		return fixture.resolver.revision, nil
+	}
+	raw := validRawInput("Change docs", "expired-resolve")
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.service.Resolve(context.Background(), raw)
+		firstDone <- err
+	}()
+	<-started
+	clock.Advance(2 * time.Minute)
+
+	second, err := fixture.service.Resolve(context.Background(), raw)
+	if err != nil || second.Status != run.StatusExecuting {
+		t.Fatalf("Resolve(recovery) result=%#v error=%v", second, err)
+	}
+	if fixture.resolver.callCount() != 2 {
+		t.Fatalf("resolver calls = %d, want 2", fixture.resolver.callCount())
+	}
+	record, _ := fixture.runs.Load(context.Background(), "run-123")
+	if len(record.Stages) != 2 ||
+		record.Stages[0].Status != run.StageFailed ||
+		record.Stages[0].Failure == nil ||
+		record.Stages[0].Failure.CauseCode != "worker_lost" ||
+		record.Stages[1].Status != run.StageSucceeded {
+		t.Fatalf("resolve stage history = %#v", record.Stages)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("Resolve(original) error = %v", err)
+	}
+}
+
+func TestResolveExpiredWorkerCannotFinishSuccessorAttempt(t *testing.T) {
+	fixture := newServiceFixture(t)
+	clock := newMutableClock(time.Unix(100, 0).UTC())
+	fixture.service.clock = clock.Now
+	fixture.service.resolveLease = time.Minute
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	firstRevision := fixture.resolver.revision
+	firstRevision.SHA = strings.Repeat("1", 40)
+	secondRevision := fixture.resolver.revision
+	secondRevision.SHA = strings.Repeat("2", 40)
+	fixture.resolver.resolve = func(call int) (repository.Revision, error) {
+		switch call {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+			return firstRevision, nil
+		case 2:
+			close(secondStarted)
+			<-releaseSecond
+			return secondRevision, nil
+		default:
+			return repository.Revision{}, errors.New("unexpected resolver call")
+		}
+	}
+	raw := validRawInput("Change docs", "fenced-resolve")
+	type response struct {
+		result PhaseResult
+		err    error
+	}
+	firstDone := make(chan response, 1)
+	go func() {
+		result, err := fixture.service.Resolve(context.Background(), raw)
+		firstDone <- response{result: result, err: err}
+	}()
+	<-firstStarted
+	clock.Advance(2 * time.Minute)
+	secondDone := make(chan response, 1)
+	go func() {
+		result, err := fixture.service.Resolve(context.Background(), raw)
+		secondDone <- response{result: result, err: err}
+	}()
+	<-secondStarted
+
+	close(releaseFirst)
+	stale := <-firstDone
+	if !errors.Is(stale.err, ErrPhaseInProgress) || stale.result.Status != run.StatusResolving {
+		t.Fatalf("stale Resolve() result=%#v error=%v", stale.result, stale.err)
+	}
+	record, _ := fixture.runs.Load(context.Background(), "run-123")
+	if record.BaseSHA != "" || !runningStageAttempt(record, "resolve", 2) {
+		t.Fatalf("stale worker completed successor attempt: %#v", record)
+	}
+
+	close(releaseSecond)
+	recovered := <-secondDone
+	if recovered.err != nil || recovered.result.Status != run.StatusExecuting {
+		t.Fatalf("successor Resolve() result=%#v error=%v", recovered.result, recovered.err)
+	}
+	record, _ = fixture.runs.Load(context.Background(), "run-123")
+	if record.BaseSHA != secondRevision.SHA {
+		t.Fatalf("BaseSHA = %q, want successor SHA %q", record.BaseSHA, secondRevision.SHA)
 	}
 }
 
@@ -331,17 +495,18 @@ func validRawInput(task, key string) json.RawMessage {
 }
 
 type serviceFixture struct {
-	service   *Service
-	runs      *recordingRunStore
-	resolver  *recordingResolver
-	mem       *recordingMemory
-	profile   *fakeProfile
-	env       *fakeEnvironment
-	agent     *fakeAgent
-	verifier  *fakeVerifier
-	capturer  *fakeCapturer
-	policy    *fakePolicy
-	artifacts *artifactmock.Store
+	service    *Service
+	runs       *recordingRunStore
+	resolver   *recordingResolver
+	mem        *recordingMemory
+	profile    *fakeProfile
+	env        *fakeEnvironment
+	agent      *fakeAgent
+	verifier   *fakeVerifier
+	capturer   *fakeCapturer
+	policy     *fakePolicy
+	artifacts  *artifactmock.Store
+	workspaces *fakeWorkspaceManager
 }
 
 func newServiceFixture(t *testing.T) *serviceFixture {
@@ -358,21 +523,22 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 			Ref:           "refs/heads/main",
 			SHA:           "0123456789012345678901234567890123456789",
 		}},
-		mem:       &recordingMemory{},
-		profile:   profile,
-		env:       &fakeEnvironment{},
-		agent:     &fakeAgent{},
-		verifier:  &fakeVerifier{},
-		capturer:  &fakeCapturer{},
-		policy:    &fakePolicy{decision: policy.Decision{Allowed: true}},
-		artifacts: artifactmock.NewStore(),
+		mem:        &recordingMemory{},
+		profile:    profile,
+		env:        &fakeEnvironment{},
+		agent:      &fakeAgent{},
+		verifier:   &fakeVerifier{},
+		capturer:   &fakeCapturer{},
+		policy:     &fakePolicy{decision: policy.Decision{Allowed: true}},
+		artifacts:  artifactmock.NewStore(),
+		workspaces: &fakeWorkspaceManager{},
 	}
 	fixture.service, err = New(Dependencies{
 		Templates:    registry,
 		Runs:         fixture.runs,
 		Memory:       fixture.mem,
 		Resolver:     fixture.resolver,
-		Workspaces:   &fakeWorkspaceManager{},
+		Workspaces:   fixture.workspaces,
 		Profiles:     map[string]repository.Profile{"generic": profile, "go": &fakeProfile{name: "go"}},
 		Environments: fixture.env,
 		Agent:        fixture.agent,
@@ -395,6 +561,9 @@ type recordingRunStore struct {
 	reserveCalls  int
 	saveCalls     int
 	saveConflicts int
+	saveErrors    map[int]error
+	saveHook      func(int, run.Record)
+	loadMutate    func(run.Record) run.Record
 }
 
 func (s *recordingRunStore) Reserve(ctx context.Context, reservation run.Reservation) (run.Record, bool, error) {
@@ -402,8 +571,22 @@ func (s *recordingRunStore) Reserve(ctx context.Context, reservation run.Reserva
 	return s.Store.Reserve(ctx, reservation)
 }
 
+func (s *recordingRunStore) Load(ctx context.Context, id string) (run.Record, error) {
+	record, err := s.Store.Load(ctx, id)
+	if err == nil && s.loadMutate != nil {
+		record = s.loadMutate(record)
+	}
+	return record, err
+}
+
 func (s *recordingRunStore) Save(ctx context.Context, record run.Record, expected uint64) (run.Record, error) {
 	s.saveCalls++
+	if s.saveHook != nil {
+		s.saveHook(s.saveCalls, record)
+	}
+	if err := s.saveErrors[s.saveCalls]; err != nil {
+		return run.Record{}, err
+	}
 	if s.saveConflicts > 0 {
 		s.saveConflicts--
 		return run.Record{}, run.ErrVersionConflict
@@ -440,16 +623,20 @@ func (r *recordingResolver) callCount() int {
 }
 
 type recordingMemory struct {
-	mu     sync.Mutex
-	calls  int
-	result []memory.Memory
-	err    error
+	mu       sync.Mutex
+	calls    int
+	result   []memory.Memory
+	err      error
+	onSearch func()
 }
 
 func (m *recordingMemory) Search(_ context.Context, _ string, _ int, _ map[string]string) ([]memory.Memory, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls++
+	if m.onSearch != nil {
+		m.onSearch()
+	}
 	return cloneTestMemories(m.result), m.err
 }
 
@@ -467,17 +654,26 @@ func (p *fakeProfile) Inspect(context.Context, repository.ProfileRequest) (repos
 }
 
 type fakeEnvironment struct {
-	build   func(context.Context, environment.Request) (environment.Result, error)
-	cleanup func(context.Context, string) error
+	build        func(context.Context, environment.Request) (environment.Result, error)
+	cleanup      func(context.Context, string) error
+	events       *[]string
+	cleanupCalls int
 }
 
 func (e *fakeEnvironment) Build(ctx context.Context, req environment.Request) (environment.Result, error) {
+	if e.events != nil {
+		*e.events = append(*e.events, "build:"+string(req.Stage))
+	}
 	if e.build != nil {
 		return e.build(ctx, req)
 	}
 	return environment.Result{Values: map[string]string{"PATH": "/bin", "CODEX_HOME": "/codex"}}, nil
 }
 func (e *fakeEnvironment) Cleanup(ctx context.Context, runID string) error {
+	e.cleanupCalls++
+	if e.events != nil {
+		*e.events = append(*e.events, "cleanup")
+	}
 	if e.cleanup != nil {
 		return e.cleanup(ctx, runID)
 	}
@@ -530,9 +726,11 @@ func (p *fakePolicy) Evaluate(context.Context, gitcapture.Result) policy.Decisio
 
 type fakeWorkspaceManager struct {
 	prepare func(context.Context, string, string) (workspace.Workspace, error)
+	calls   int
 }
 
 func (m *fakeWorkspaceManager) Prepare(ctx context.Context, repo, sha string) (workspace.Workspace, error) {
+	m.calls++
 	if m.prepare != nil {
 		return m.prepare(ctx, repo, sha)
 	}
@@ -562,6 +760,23 @@ func cloneTestMemories(source []memory.Memory) []memory.Memory {
 		}
 	}
 	return cloned
+}
+
+type mutableClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newMutableClock(now time.Time) *mutableClock { return &mutableClock{now: now} }
+func (c *mutableClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+func (c *mutableClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
 }
 
 var (

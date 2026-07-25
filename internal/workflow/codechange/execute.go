@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,19 +31,30 @@ type executeOutcome struct {
 	failure      *run.Failure
 	cause        error
 	evidence     map[string]string
+	scrubber     durableScrubber
 }
 
 // Execute runs one fresh-workspace attempt and persists only durable evidence.
 func (s *Service) Execute(ctx context.Context, runID string) (PhaseResult, error) {
 	record, input, err := s.loadExecutable(ctx, runID)
-	if err != nil || record.Terminal() || record.Artifact != nil {
+	if err != nil || record.Terminal() {
 		return phaseResult(record), err
 	}
 	record, started, err := s.beginStage(ctx, runID, "execute", run.StatusExecuting)
-	if err != nil || record.Terminal() || record.Artifact != nil {
+	if err != nil {
 		return phaseResult(record), err
 	}
+	if record.Terminal() {
+		if record.Failure != nil && record.Failure.CauseCode == "ambiguous_attempt" {
+			return phaseResult(record), newPhaseError(*record.Failure, errors.New(record.Failure.Diagnostic))
+		}
+		return phaseResult(record), nil
+	}
 	if !started {
+		if latest, found := latestStage(record, "execute"); found && latest.Status != run.StageRunning &&
+			record.Artifact != nil {
+			return phaseResult(record), nil
+		}
 		return phaseInProgress(record)
 	}
 
@@ -53,6 +65,17 @@ func (s *Service) Execute(ctx context.Context, runID string) (PhaseResult, error
 	}
 
 	outcome := s.executePrepared(ctx, record, input, prepared.Path())
+	outcome = outcome.withCancellation(ctx.Err())
+	if outcome.artifact != nil {
+		if checkpointErr := s.checkpointArtifact(ctx, runID, *outcome.artifact); checkpointErr != nil {
+			failure := run.Failure{
+				Stage: "execute", Class: run.FailureInternal, Retryable: false,
+				Diagnostic: "checkpoint artifact reference failed", CauseCode: "artifact_checkpoint",
+			}
+			outcome = outcome.withFailure(failure, checkpointErr)
+		}
+	}
+	outcome = outcome.withCancellation(ctx.Err())
 	cleanupErr := s.cleanupAttempt(ctx, runID, prepared)
 	if cleanupErr != nil {
 		outcome.cause = errors.Join(outcome.cause, cleanupErr)
@@ -64,10 +87,12 @@ func (s *Service) Execute(ctx context.Context, runID string) (PhaseResult, error
 			outcome.failure = &failure
 		} else {
 			failure := *outcome.failure
+			failure.Retryable = false
 			failure.Diagnostic = run.SafeDiagnostic(failure.Diagnostic + "; attempt cleanup failed")
 			outcome.failure = &failure
 		}
 	}
+	outcome = outcome.withCancellation(ctx.Err())
 	return s.finishExecute(ctx, runID, outcome)
 }
 
@@ -76,15 +101,15 @@ func (s *Service) loadExecutable(ctx context.Context, runID string) (run.Record,
 	if err != nil {
 		return run.Record{}, templatecodechange.Input{}, err
 	}
-	if record.Terminal() || record.Artifact != nil {
-		return record, templatecodechange.Input{}, nil
+	input, err := validateRunBinding(record)
+	if err != nil {
+		return record, templatecodechange.Input{}, err
+	}
+	if record.Terminal() {
+		return record, input, nil
 	}
 	if record.Status != run.StatusExecuting || strings.TrimSpace(record.BaseSHA) == "" {
 		return record, templatecodechange.Input{}, fmt.Errorf("execute code change: run is not resolved")
-	}
-	input, err := templatecodechange.Decode(record.Input)
-	if err != nil {
-		return record, templatecodechange.Input{}, fmt.Errorf("execute code change: decode persisted input: %w", err)
 	}
 	return record, input, nil
 }
@@ -95,19 +120,25 @@ func (s *Service) executePrepared(
 	input templatecodechange.Input,
 	workspacePath string,
 ) executeOutcome {
-	outcome := executeOutcome{evidence: make(map[string]string)}
+	outcome := executeOutcome{
+		evidence: make(map[string]string),
+		scrubber: newDurableScrubber(workspacePath),
+	}
 	agentEnvironment, err := s.environments.Build(ctx, environment.Request{
 		RunID: record.ID, Stage: environment.StageAgent, RequestedKeys: input.EnvironmentKeys,
 	})
 	if err != nil {
-		return outcome.withFailure(environmentPolicyFailure(ctx), err)
+		return outcome.withFailure(environmentPolicyFailure(ctx, "execute"), err)
 	}
 	verificationEnvironment, err := s.environments.Build(ctx, environment.Request{
 		RunID: record.ID, Stage: environment.StageVerification, RequestedKeys: input.EnvironmentKeys,
 	})
 	if err != nil {
-		return outcome.withFailure(environmentPolicyFailure(ctx), err)
+		return outcome.withFailure(environmentPolicyFailure(ctx, "execute"), err)
 	}
+	outcome.scrubber = newDurableScrubber(
+		workspacePath, agentEnvironment.Values, verificationEnvironment.Values,
+	)
 	outcome.evidence["agent_environment_keys"] = encodeStrings(agentEnvironment.Keys)
 	outcome.evidence["verification_environment_keys"] = encodeStrings(verificationEnvironment.Keys)
 
@@ -217,6 +248,9 @@ func (s *Service) executePrepared(
 	}
 	reference, err := s.artifacts.Save(ctx, bundle)
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return outcome.withFailure(canceledFailure("execute"), errors.Join(err, ctx.Err()))
+		}
 		failure := run.Failure{
 			Stage: "execute", Class: run.FailureInternal,
 			Retryable:  !outcome.execution.Completed,
@@ -228,6 +262,7 @@ func (s *Service) executePrepared(
 	outcome.evidence["artifact_digest"] = reference.Digest
 	outcome.evidence["artifact_size"] = strconv.FormatInt(reference.Size, 10)
 	outcome.evidence["tree_sha"] = outcome.capture.TreeSHA
+	outcome = outcome.withCancellation(ctx.Err())
 	return outcome
 }
 
@@ -254,6 +289,13 @@ func (s *Service) runVerification(
 				CauseCode:  safeCauseCode(result.CauseCode, "verification_environment"),
 			}
 			outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
+		case "internal":
+			failure := run.Failure{
+				Stage: "execute", Class: run.FailureInternal, Retryable: false,
+				Diagnostic: "verification executor failed internally",
+				CauseCode:  safeCauseCode(result.CauseCode, "verification_internal"),
+			}
+			outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
 		default:
 			failure := run.Failure{
 				Stage: "execute", Class: run.FailureVerification, Retryable: false,
@@ -276,40 +318,215 @@ func buildBundle(record run.Record, outcome executeOutcome) (artifact.Bundle, er
 		memoryIDs = append(memoryIDs, item.ID)
 	}
 	sort.Strings(memoryIDs)
+	verificationEvidence := make([]verification.Result, len(outcome.verification))
+	for index, result := range outcome.verification {
+		durable, err := outcome.scrubber.verificationResult(result)
+		if err != nil {
+			return artifact.Bundle{}, err
+		}
+		verificationEvidence[index] = durable
+	}
+	changes := append([]artifact.Change(nil), outcome.capture.Changes...)
+	for index := range changes {
+		changes[index].Path = outcome.scrubber.string(changes[index].Path)
+		changes[index].OldPath = outcome.scrubber.string(changes[index].OldPath)
+	}
 	return artifact.Bundle{
 		Manifest: artifact.Manifest{
 			RunID: record.ID, Template: record.Template,
 			Repository: record.RepositoryURI, BaseSHA: record.BaseSHA,
-			TreeSHA: outcome.capture.TreeSHA, Changes: append([]artifact.Change(nil), outcome.capture.Changes...),
+			TreeSHA: outcome.scrubber.string(outcome.capture.TreeSHA), Changes: changes,
 			MemoryIDs: memoryIDs, MemoryCount: len(memoryIDs),
 		},
 		ChangesPatch:      append([]byte(nil), outcome.capture.Patch...),
-		AgentOutput:       []byte(outcome.execution.Output),
+		AgentOutput:       []byte(outcome.scrubber.string(outcome.execution.Output)),
 		ExecutionMetadata: executionMetadata,
-		Verification:      append([]verification.Result(nil), outcome.verification...),
-		Preflight:         cloneStringMap(outcome.profile.Facts),
-		Warnings:          append([]string(nil), outcome.profile.Warnings...),
+		Verification:      verificationEvidence,
+		Preflight:         outcome.scrubber.stringMap(outcome.profile.Facts),
+		Warnings:          outcome.scrubber.strings(outcome.profile.Warnings),
 	}, nil
 }
 
+type durableScrubber struct {
+	workspace string
+	prefixes  []string
+}
+
+func newDurableScrubber(workspacePath string, environments ...map[string]string) durableScrubber {
+	scrubber := durableScrubber{workspace: filepath.Clean(workspacePath)}
+	seen := make(map[string]struct{})
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || value == "." {
+			return
+		}
+		value = filepath.Clean(value)
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		scrubber.prefixes = append(scrubber.prefixes, value)
+	}
+	add(workspacePath)
+	runtimePaths := make([]string, 0, len(environments)*4)
+	for _, values := range environments {
+		for _, key := range []string{"HOME", "TMPDIR", "TMP", "TEMP"} {
+			value := values[key]
+			add(value)
+			if strings.TrimSpace(value) != "" {
+				runtimePaths = append(runtimePaths, value)
+			}
+		}
+		add(values["CODEX_HOME"])
+	}
+	add(commonPathAncestor(runtimePaths))
+	sort.Slice(scrubber.prefixes, func(left, right int) bool {
+		return len(scrubber.prefixes[left]) > len(scrubber.prefixes[right])
+	})
+	return scrubber
+}
+
+func commonPathAncestor(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	common := filepath.Clean(paths[0])
+	for _, candidate := range paths[1:] {
+		candidate = filepath.Clean(candidate)
+		for !pathWithin(common, candidate) {
+			parent := filepath.Dir(common)
+			if parent == common {
+				return ""
+			}
+			common = parent
+		}
+	}
+	return common
+}
+
+func pathWithin(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func (s durableScrubber) string(value string) string {
+	for _, prefix := range s.prefixes {
+		replacement := "<runtime>"
+		if prefix == s.workspace {
+			replacement = "."
+		}
+		value = strings.ReplaceAll(value, prefix, replacement)
+	}
+	return value
+}
+
+func (s durableScrubber) strings(values []string) []string {
+	scrubbed := make([]string, len(values))
+	for index, value := range values {
+		scrubbed[index] = s.string(value)
+	}
+	return scrubbed
+}
+
+func (s durableScrubber) stringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	scrubbed := make(map[string]string, len(values))
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		durableKey := s.string(key)
+		candidate := durableKey
+		for suffix := 2; ; suffix++ {
+			if _, exists := scrubbed[candidate]; !exists {
+				break
+			}
+			candidate = fmt.Sprintf("%s_%d", durableKey, suffix)
+		}
+		scrubbed[candidate] = s.string(values[key])
+	}
+	return scrubbed
+}
+
+func (s durableScrubber) verificationResult(result verification.Result) (verification.Result, error) {
+	directory, err := durableDirectory(s.workspace, result.Command.Directory)
+	if err != nil {
+		return verification.Result{}, err
+	}
+	result.Command.Name = s.string(result.Command.Name)
+	result.Command.Directory = directory
+	result.Command.Executable = s.string(result.Command.Executable)
+	result.Command.Args = s.strings(result.Command.Args)
+	result.Command.Environment = s.stringMap(result.Command.Environment)
+	result.Output = s.string(result.Output)
+	result.FailureClass = s.string(result.FailureClass)
+	result.CauseCode = s.string(result.CauseCode)
+	return result, nil
+}
+
+func durableDirectory(workspacePath, directory string) (string, error) {
+	if strings.TrimSpace(workspacePath) == "" || strings.TrimSpace(directory) == "" {
+		return "", fmt.Errorf("durable verification directory is missing")
+	}
+	workspacePath = filepath.Clean(workspacePath)
+	if !filepath.IsAbs(directory) {
+		return "", fmt.Errorf("durable verification directory is not compiled")
+	}
+	relative, err := filepath.Rel(workspacePath, filepath.Clean(directory))
+	if err != nil {
+		return "", fmt.Errorf("make verification directory durable: %w", err)
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("make verification directory durable: directory escapes workspace")
+	}
+	return filepath.ToSlash(relative), nil
+}
+
 func (s *Service) cleanupAttempt(ctx context.Context, runID string, prepared workspace.Workspace) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	defer cancel()
-	runtimeErr := s.environments.Cleanup(cleanupCtx, runID)
-	workspaceErr := prepared.Cleanup(cleanupCtx)
+	runtimeCtx, cancelRuntime := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	runtimeErr := s.environments.Cleanup(runtimeCtx, runID)
+	cancelRuntime()
+	workspaceCtx, cancelWorkspace := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	workspaceErr := prepared.Cleanup(workspaceCtx)
+	cancelWorkspace()
 	return errors.Join(runtimeErr, workspaceErr)
 }
 
+func (s *Service) checkpointArtifact(ctx context.Context, runID string, reference artifact.Reference) error {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	defer cancel()
+	_, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.Artifact != nil {
+			if *current.Artifact != reference {
+				return run.Record{}, false, fmt.Errorf("checkpoint artifact: durable reference differs")
+			}
+			return current, false, nil
+		}
+		if current.Terminal() {
+			return current, false, fmt.Errorf("checkpoint artifact: run is already terminal")
+		}
+		next := run.CloneRecord(current)
+		checkpoint := reference
+		next.Artifact = &checkpoint
+		next.UpdatedAt = s.clock()
+		return next, true, nil
+	})
+	return err
+}
+
 func (s *Service) finishExecute(ctx context.Context, runID string, outcome executeOutcome) (PhaseResult, error) {
-	persistCtx := ctx
-	cancel := func() {}
-	if ctx.Err() != nil {
-		persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	}
+	outcome = outcome.withCancellation(ctx.Err())
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	defer cancel()
 
 	record, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
-		if current.Terminal() || current.Artifact != nil {
+		outcome = outcome.withCancellation(ctx.Err())
+		if current.Terminal() {
 			return current, false, nil
 		}
 		next := run.CloneRecord(current)
@@ -320,7 +537,7 @@ func (s *Service) finishExecute(ctx context.Context, runID string, outcome execu
 		stage := run.StageResult{
 			Name: "execute", StartedAt: latestStageStart(current, "execute"),
 			FinishedAt: s.clock(), Attempts: stageAttempt(current, "execute"),
-			Evidence: cloneStringMap(outcome.evidence),
+			Evidence: outcome.scrubber.stringMap(outcome.evidence),
 		}
 		if outcome.failure == nil {
 			stage.Status = run.StageSucceeded
@@ -349,6 +566,10 @@ func (s *Service) finishExecute(ctx context.Context, runID string, outcome execu
 		}
 		return next, true, nil
 	})
+	outcome = outcome.withCancellation(ctx.Err())
+	if err == nil && ctx.Err() != nil && record.Status != run.StatusCanceled {
+		record, err = s.persistLateCancellation(ctx, runID)
+	}
 	if err != nil {
 		if outcome.failure == nil {
 			return phaseResult(record), err
@@ -361,11 +582,48 @@ func (s *Service) finishExecute(ctx context.Context, runID string, outcome execu
 	return phaseResult(record), nil
 }
 
+func (s *Service) persistLateCancellation(ctx context.Context, runID string) (run.Record, error) {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	defer cancel()
+	return s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.Status == run.StatusCanceled {
+			return current, false, nil
+		}
+		if current.Terminal() {
+			return current, false, fmt.Errorf("persist late cancellation: run is already terminal")
+		}
+		failure := canceledFailure("execute")
+		now := s.clock()
+		stage := run.StageResult{
+			Name: "execute", Status: run.StageFailed, StartedAt: now, FinishedAt: now,
+			Attempts: stageAttempt(current, "execute") + 1, Failure: &failure,
+		}
+		next, err := run.UpsertStage(run.CloneRecord(current), stage)
+		if err != nil {
+			return run.Record{}, false, err
+		}
+		next.Failure = &failure
+		next.UpdatedAt = now
+		next, err = run.Transition(next, run.StatusCanceled, now)
+		if err != nil {
+			return run.Record{}, false, err
+		}
+		return next, true, nil
+	})
+}
+
 func (outcome executeOutcome) withFailure(failure run.Failure, cause error) executeOutcome {
 	failure.Diagnostic = run.SafeDiagnostic(failure.Diagnostic)
 	outcome.failure = &failure
 	outcome.cause = errors.Join(outcome.cause, cause)
 	return outcome
+}
+
+func (outcome executeOutcome) withCancellation(cause error) executeOutcome {
+	if cause == nil {
+		return outcome
+	}
+	return outcome.withFailure(canceledFailure("execute"), cause)
 }
 
 func classifyWorkspaceFailure(ctx context.Context, err error) run.Failure {
@@ -378,12 +636,12 @@ func classifyWorkspaceFailure(ctx context.Context, err error) run.Failure {
 	}
 }
 
-func environmentPolicyFailure(ctx context.Context) run.Failure {
+func environmentPolicyFailure(ctx context.Context, stage string) run.Failure {
 	if ctx.Err() != nil {
-		return canceledFailure("execute")
+		return canceledFailure(stage)
 	}
 	return run.Failure{
-		Stage: "execute", Class: run.FailurePolicy, Retryable: false,
+		Stage: stage, Class: run.FailurePolicy, Retryable: false,
 		Diagnostic: "requested execution environment was denied", CauseCode: "environment_policy_denied",
 	}
 }
@@ -431,14 +689,38 @@ func encodeFindings(findings []policy.Finding) string {
 // terminal retry exhaustion evidence.
 func (s *Service) Exhaust(ctx context.Context, runID, stage string) (PhaseResult, error) {
 	record, err := s.runs.Load(ctx, runID)
-	if err != nil || record.Terminal() {
+	if err != nil {
 		return phaseResult(record), err
+	}
+	if _, err := validateRunBinding(record); err != nil {
+		return phaseResult(record), err
+	}
+	if record.Terminal() {
+		return phaseResult(record), nil
 	}
 	record, err = s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
 		if current.Terminal() {
 			return current, false, nil
 		}
 		latest, found := latestStage(current, stage)
+		if found && latest.Status == run.StageRunning {
+			next := run.CloneRecord(current)
+			failure := run.Failure{
+				Stage: stage, Class: run.FailureInternal, Retryable: false,
+				Diagnostic: "running attempt outcome is ambiguous", CauseCode: "ambiguous_attempt",
+			}
+			latest.Status = run.StageFailed
+			latest.FinishedAt = s.clock()
+			latest.Failure = &failure
+			next.Failure = &failure
+			var mutationErr error
+			next, mutationErr = run.UpsertStage(next, latest)
+			if mutationErr != nil {
+				return run.Record{}, false, mutationErr
+			}
+			next, mutationErr = run.Transition(next, run.StatusFailed, s.clock())
+			return next, true, mutationErr
+		}
 		if !found || latest.Failure == nil || !latest.Failure.Retryable ||
 			current.Failure == nil || current.Failure.Stage != stage {
 			return run.Record{}, false, fmt.Errorf("exhaust stage %q: no retryable failure", stage)
