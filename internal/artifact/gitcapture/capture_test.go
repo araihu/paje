@@ -203,6 +203,107 @@ func TestApplyRejectsUntrackedTargetWithoutMutatingIt(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsIgnoredTargetWithoutMutatingOrDeletingIt(t *testing.T) {
+	repo := initializedRepository(t)
+	writeFile(t, filepath.Join(repo, ".gitignore"), []byte("ignored.cache\n"), 0o644)
+	git(t, repo, "add", ".gitignore")
+	git(t, repo, "commit", "-m", "ignore cache")
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	git(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+	ignored := filepath.Join(target, "ignored.cache")
+	writeFile(t, ignored, []byte("must survive\n"), 0o600)
+	beforeIndex := readIndex(t, target)
+
+	err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{
+		Workspace:       target,
+		BaseSHA:         base,
+		Patch:           result.Patch,
+		ExpectedTreeSHA: result.TreeSHA,
+	})
+	if !errors.Is(err, gitcapture.ErrDirtyIndex) {
+		t.Fatalf("Apply() error = %v, want ErrDirtyIndex", err)
+	}
+	contents, err := os.ReadFile(ignored)
+	if err != nil {
+		t.Fatalf("ignored file was removed: %v", err)
+	}
+	if string(contents) != "must survive\n" {
+		t.Fatalf("ignored file contents = %q, want byte-for-byte preservation", contents)
+	}
+	if got := readIndex(t, target); !bytes.Equal(got, beforeIndex) {
+		t.Fatal("Apply() changed the index before rejecting ignored state")
+	}
+	text, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(text) != "base\n" {
+		t.Fatalf("Apply() mutated tracked content before rejecting ignored state: %q", text)
+	}
+}
+
+func TestApplyRejectsPreexistingIndexLockWithoutRemovingIt(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("changed\n"), 0o644)
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	git(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+	index := git(t, target, "rev-parse", "--git-path", "index")
+	if !filepath.IsAbs(index) {
+		index = filepath.Join(target, index)
+	}
+	lock := index + ".lock"
+	writeFile(t, lock, []byte("preexisting lock\n"), 0o600)
+	beforeIndex := readIndex(t, target)
+
+	err = capturer.Apply(context.Background(), gitcapture.ApplyRequest{
+		Workspace:       target,
+		BaseSHA:         base,
+		Patch:           result.Patch,
+		ExpectedTreeSHA: result.TreeSHA,
+	})
+	if !errors.Is(err, gitcapture.ErrDirtyIndex) {
+		t.Fatalf("Apply() error = %v, want ErrDirtyIndex", err)
+	}
+	lockContents, err := os.ReadFile(lock)
+	if err != nil {
+		t.Fatalf("pre-existing lock was removed: %v", err)
+	}
+	if string(lockContents) != "preexisting lock\n" {
+		t.Fatalf("pre-existing lock contents = %q, want byte-for-byte preservation", lockContents)
+	}
+	if got := readIndex(t, target); !bytes.Equal(got, beforeIndex) {
+		t.Fatal("Apply() changed the index before rejecting pre-existing lock")
+	}
+	text, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(text) != "base\n" {
+		t.Fatalf("Apply() mutated tracked content before rejecting pre-existing lock: %q", text)
+	}
+}
+
 func TestApplyTreeMismatchLeavesWorktreeAndIndexUnchanged(t *testing.T) {
 	repo := initializedRepository(t)
 	base := git(t, repo, "rev-parse", "HEAD")

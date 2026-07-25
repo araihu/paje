@@ -1,12 +1,15 @@
 package gitcapture
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/araihu/paje/internal/artifact"
 )
@@ -159,4 +162,208 @@ func TestValidatePatchPathsRejectsUnsafeOrInconsistentEffectivePaths(t *testing.
 			}
 		})
 	}
+}
+
+func TestApplyTimeoutDuringRealMutationRemovesOperationLockAndRestoresTarget(t *testing.T) {
+	repo := t.TempDir()
+	testGit(t, repo, "init")
+	testGit(t, repo, "config", "user.name", "Paje Test")
+	testGit(t, repo, "config", "user.email", "paje@example.test")
+	if err := os.WriteFile(filepath.Join(repo, "text.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, repo, "add", "-A")
+	testGit(t, repo, "commit", "-m", "base")
+	base := testGit(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "text.txt"), []byte("captured\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capturer, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), Request{Workspace: repo, BaseSHA: base, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	testGit(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { testGit(t, repo, "worktree", "remove", "--force", target) })
+	beforeStages := testGitBytes(t, target, "ls-files", "--stage", "-z")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := filepath.Join(t.TempDir(), "mutated")
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = apply ] && [ \"$2\" = --index ]; then\n" +
+		"  printf 'partial mutation\\n' > \"$PWD/text.txt\"\n" +
+		"  : > \"$GIT_INDEX_FILE.lock\"\n" +
+		"  /bin/chmod 600 \"$GIT_INDEX_FILE.lock\"\n" +
+		"  : > " + testShellQuote(mutated) + "\n" +
+		"  exec /bin/sleep 30\n" +
+		"fi\n" +
+		"exec " + testShellQuote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err = New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturer.applyTimeout = 150 * time.Millisecond
+
+	err = capturer.Apply(context.Background(), ApplyRequest{
+		Workspace:       target,
+		BaseSHA:         base,
+		Patch:           result.Patch,
+		ExpectedTreeSHA: result.TreeSHA,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Apply() error = %v, want context.DeadlineExceeded joined with restoration", err)
+	}
+	if _, err := os.Stat(mutated); err != nil {
+		t.Fatalf("timeout fired before real mutation harness: %v", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(target, "text.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "base\n" {
+		t.Fatalf("timed-out Apply left filesystem mutation: %q", contents)
+	}
+	if status := testGit(t, target, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"); status != "" {
+		t.Fatalf("timed-out Apply left target state: %q", status)
+	}
+	if stages := testGitBytes(t, target, "ls-files", "--stage", "-z"); !bytes.Equal(stages, beforeStages) {
+		t.Fatalf("timed-out Apply left different index\nbefore: %q\nafter:  %q", beforeStages, stages)
+	}
+	index := testGit(t, target, "rev-parse", "--git-path", "index")
+	if !filepath.IsAbs(index) {
+		index = filepath.Join(target, index)
+	}
+	if _, err := os.Lstat(index + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("timed-out Apply left index lock: %v", err)
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(resolvedTarget), ".paje-git-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("timed-out Apply left private temp trees: %v, %v", matches, err)
+	}
+}
+
+func TestRemoveOperationIndexLockNeverRemovesUnsafeEntry(t *testing.T) {
+	for _, kind := range []string{"symlink", "writable"} {
+		t.Run(kind, func(t *testing.T) {
+			directory := t.TempDir()
+			index := filepath.Join(directory, "index")
+			state, err := prepareIndexLock(index)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lock := index + ".lock"
+			switch kind {
+			case "symlink":
+				if err := os.WriteFile(filepath.Join(directory, "target"), []byte("target"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("target", lock); err != nil {
+					t.Fatal(err)
+				}
+			case "writable":
+				if err := os.WriteFile(lock, []byte("unsafe"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(lock, 0o666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := removeOperationIndexLock(state); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("removeOperationIndexLock() error = %v, want ErrInvalidRequest", err)
+			}
+			if _, err := os.Lstat(lock); err != nil {
+				t.Fatalf("unsafe lock was removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestoreVerificationReportsIgnoredResidue(t *testing.T) {
+	repo := t.TempDir()
+	testGit(t, repo, "init")
+	testGit(t, repo, "config", "user.name", "Paje Test")
+	testGit(t, repo, "config", "user.email", "paje@example.test")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("ignored.cache\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "text.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, repo, "add", "-A")
+	testGit(t, repo, "commit", "-m", "base")
+	base := testGit(t, repo, "rev-parse", "HEAD")
+	ignored := filepath.Join(repo, "ignored.cache")
+	if err := os.WriteFile(ignored, []byte("residue\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	index, err := realIndexPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := prepareIndexLock(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(t.TempDir(), "git")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = clean ]; then exit 0; fi\n" +
+		"exec " + testShellQuote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(fake))
+	capturer, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := errors.New("injected transaction failure")
+	err = capturer.restoreTarget(context.Background(), repo, index, base, lock, primary)
+	if !errors.Is(err, primary) || !strings.Contains(err.Error(), "target remains dirty") {
+		t.Fatalf("restoreTarget() error = %v, want primary plus ignored-residue verification", err)
+	}
+	if _, err := os.Stat(ignored); err != nil {
+		t.Fatalf("fake clean unexpectedly removed ignored residue: %v", err)
+	}
+}
+
+func testGit(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	return strings.TrimSpace(string(testGitBytes(t, directory, args...)))
+}
+
+func testGitBytes(t *testing.T, directory string, args ...string) []byte {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return output
+}
+
+func testShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

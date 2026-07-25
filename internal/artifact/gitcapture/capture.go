@@ -76,8 +76,9 @@ type Capturer interface {
 
 // Git is a shell-free Git implementation of Capturer.
 type Git struct {
-	command string
-	env     []string
+	command      string
+	env          []string
+	applyTimeout time.Duration
 }
 
 var _ Capturer = (*Git)(nil)
@@ -89,7 +90,7 @@ func New() (*Git, error) {
 	if err != nil {
 		return nil, fmt.Errorf("locate git: %w", err)
 	}
-	return &Git{command: command, env: []string{
+	return &Git{command: command, applyTimeout: applyTimeout, env: []string{
 		"PATH=" + operatorPath,
 		"LC_ALL=C",
 		"LANG=C",
@@ -197,10 +198,14 @@ func (g *Git) Apply(ctx context.Context, request ApplyRequest) (returnErr error)
 	if err != nil {
 		return fmt.Errorf("find worktree index: %w", err)
 	}
+	indexLock, err := prepareIndexLock(realIndex)
+	if err != nil {
+		return err
+	}
 	if err := g.assertBaseAndCleanIndex(ctx, workspace, realIndex, base); err != nil {
 		return err
 	}
-	status, truncated, err := g.run(ctx, workspace, realIndex, diagnosticLimit, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status, truncated, err := g.run(ctx, workspace, realIndex, diagnosticLimit, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
 	if err != nil || truncated {
 		return boundedGitError(err, truncated)
 	}
@@ -242,10 +247,10 @@ func (g *Git) Apply(ctx context.Context, request ApplyRequest) (returnErr error)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	operationContext, cancelOperation := context.WithTimeout(context.WithoutCancel(ctx), applyTimeout)
+	operationContext, cancelOperation := context.WithTimeout(context.WithoutCancel(ctx), g.applyTimeout)
 	defer cancelOperation()
 	restore := func(primary error) error {
-		return g.restoreTarget(ctx, workspace, realIndex, base, primary)
+		return g.restoreTarget(ctx, workspace, realIndex, base, indexLock, primary)
 	}
 	if _, truncated, err := g.run(operationContext, workspace, realIndex, diagnosticLimit, "apply", "--index", "--binary", "--whitespace=nowarn", patchPath); err != nil || truncated {
 		return restore(errors.Join(boundedGitError(err, truncated), ctx.Err(), operationContext.Err()))
@@ -293,7 +298,7 @@ func (g *Git) Apply(ctx context.Context, request ApplyRequest) (returnErr error)
 	return nil
 }
 
-func (g *Git) restoreTarget(caller context.Context, workspace, realIndex, base string, primary error) error {
+func (g *Git) restoreTarget(caller context.Context, workspace, realIndex, base string, indexLock indexLockState, primary error) error {
 	restoreContext, cancel := context.WithTimeout(context.WithoutCancel(caller), restoreTimeout)
 	defer cancel()
 	failures := []error{primary}
@@ -304,13 +309,16 @@ func (g *Git) restoreTarget(caller context.Context, workspace, realIndex, base s
 		}
 		return output
 	}
+	if err := removeOperationIndexLock(indexLock); err != nil {
+		failures = append(failures, err)
+	}
 	run("reset", "--hard", base)
 	run("clean", "-fdx")
 
 	if err := g.assertBaseAndCleanIndex(restoreContext, workspace, realIndex, base); err != nil {
 		failures = append(failures, fmt.Errorf("verify restored base and index: %w", err))
 	}
-	status := run("status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status := run("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
 	if len(status) != 0 {
 		failures = append(failures, errors.New("verify restored worktree: target remains dirty"))
 	}
@@ -328,6 +336,64 @@ func (g *Git) restoreTarget(caller context.Context, workspace, realIndex, base s
 		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
+}
+
+type indexLockState struct {
+	path           string
+	didNotPreexist bool
+	expectedParent string
+	expectedIndex  string
+}
+
+func prepareIndexLock(realIndex string) (indexLockState, error) {
+	state := indexLockState{
+		path:           realIndex + ".lock",
+		expectedParent: filepath.Dir(realIndex),
+		expectedIndex:  realIndex,
+	}
+	if _, err := os.Lstat(state.path); err == nil {
+		return indexLockState{}, ErrDirtyIndex
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return indexLockState{}, fmt.Errorf("inspect worktree index lock: %w", err)
+	}
+	state.didNotPreexist = true
+	return state, nil
+}
+
+func removeOperationIndexLock(state indexLockState) error {
+	if !state.didNotPreexist || state.path != state.expectedIndex+".lock" || filepath.Dir(state.path) != state.expectedParent {
+		return fmt.Errorf("%w: index lock was not proven operation-created", ErrInvalidRequest)
+	}
+	info, err := os.Lstat(state.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect operation index lock: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || !indexOwnerSafe(info) {
+		return fmt.Errorf("%w: unsafe operation index lock", ErrInvalidRequest)
+	}
+	directory, openErr := os.Open(state.expectedParent)
+	removeErr := os.Remove(state.path)
+	var syncErr, closeErr error
+	if openErr == nil {
+		syncErr = directory.Sync()
+		closeErr = directory.Close()
+	}
+	return errors.Join(
+		wrapError("remove operation index lock", removeErr),
+		wrapError("open index directory after lock removal", openErr),
+		wrapError("sync index directory after lock removal", syncErr),
+		wrapError("close index directory after lock removal", closeErr),
+	)
+}
+
+func wrapError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func validateCaptureRequest(request Request) (string, string, error) {
