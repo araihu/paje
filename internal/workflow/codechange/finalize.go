@@ -24,7 +24,10 @@ func (s *Service) Finalize(
 	ctx context.Context,
 	runID string,
 ) (templatecodechange.Result, error) {
-	unlock := s.finalizeLocks.Lock(runID)
+	unlock, err := s.finalizeLocks.Lock(ctx, runID)
+	if err != nil {
+		return templatecodechange.Result{}, err
+	}
 	defer unlock()
 
 	record, err := s.runs.Load(ctx, runID)
@@ -36,7 +39,7 @@ func (s *Service) Finalize(
 		result, resultErr := s.resultFromRecord(ctx, record)
 		return result, errors.Join(err, resultErr)
 	}
-	if finalizeExhausted(record) {
+	if finalizeClosed(record) {
 		return s.resultFromRecord(ctx, record)
 	}
 	if record.OutcomeMemorySaved {
@@ -52,7 +55,20 @@ func (s *Service) Finalize(
 	record, ownership, err := s.beginFinalize(ctx, record)
 	if err != nil {
 		record = s.reloadForResult(ctx, runID, record)
-		result, resultErr := s.resultFromRecord(ctx, record)
+		result, resultErr := s.resultFromRecordBounded(ctx, record)
+		return result, errors.Join(err, resultErr)
+	}
+	if record.OutcomeMemorySaved {
+		record, err = s.finishSavedOutcome(ctx, record.ID)
+		record = s.reloadForResult(ctx, runID, record)
+		result, resultErr := s.resultFromRecordBounded(ctx, record)
+		return result, errors.Join(err, resultErr)
+	}
+	if finalizeClosed(record) {
+		return s.resultFromRecordBounded(ctx, record)
+	}
+	if err := s.validateDurableEvidence(ctx, record, input); err != nil {
+		result, resultErr := s.resultFromRecordBounded(ctx, record)
 		return result, errors.Join(err, resultErr)
 	}
 	content := outcomeContent(record)
@@ -69,16 +85,43 @@ func (s *Service) Finalize(
 		err = ctx.Err()
 	}
 	if err != nil {
-		failed, persistErr := s.failFinalize(ctx, record, ownership, err)
+		failure := finalizeMemoryFailure()
+		if ctx.Err() != nil {
+			failure = canceledFailure(finalizeStage)
+		}
+		failed, persistErr := s.failFinalize(ctx, record, ownership, failure)
 		failed = s.reloadForResult(ctx, runID, failed)
-		result, resultErr := s.resultFromRecord(context.WithoutCancel(ctx), failed)
-		return result, errors.Join(newPhaseError(finalizeMemoryFailure(), err), persistErr, resultErr)
+		result, resultErr := s.resultFromRecordBounded(ctx, failed)
+		return result, errors.Join(newPhaseError(failure, err), persistErr, resultErr)
 	}
 
+	beforeFinish := record
 	record, err = s.finishFinalize(ctx, record.ID, ownership)
+	if err != nil && ctx.Err() != nil {
+		failure := canceledFailure(finalizeStage)
+		failed, persistErr := s.failFinalize(ctx, beforeFinish, ownership, failure)
+		failed = s.reloadForResult(ctx, runID, failed)
+		result, resultErr := s.resultFromRecordBounded(ctx, failed)
+		return result, errors.Join(newPhaseError(failure, ctx.Err()), err, persistErr, resultErr)
+	}
 	record = s.reloadForResult(ctx, runID, record)
-	result, resultErr := s.resultFromRecord(ctx, record)
+	var result templatecodechange.Result
+	var resultErr error
+	if err != nil {
+		result, resultErr = s.resultFromRecordBounded(ctx, record)
+	} else {
+		result, resultErr = s.resultFromRecord(ctx, record)
+	}
 	return result, errors.Join(err, resultErr)
+}
+
+func (s *Service) resultFromRecordBounded(
+	ctx context.Context,
+	record run.Record,
+) (templatecodechange.Result, error) {
+	resultCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	defer cancel()
+	return s.resultFromRecord(resultCtx, record)
 }
 
 func (s *Service) finishSavedOutcome(ctx context.Context, runID string) (run.Record, error) {
@@ -160,7 +203,7 @@ func (s *Service) beginFinalize(
 		if _, err := validateRunBinding(current); err != nil {
 			return run.Record{}, false, err
 		}
-		if current.OutcomeMemorySaved || finalizeExhausted(current) {
+		if current.OutcomeMemorySaved || finalizeClosed(current) {
 			return current, false, nil
 		}
 		if !finalizable(current) {
@@ -197,7 +240,7 @@ func (s *Service) beginFinalize(
 	if err != nil {
 		return updated, stageOwnership{}, err
 	}
-	if ownership.name == "" && !updated.OutcomeMemorySaved && !finalizeExhausted(updated) {
+	if ownership.name == "" && !updated.OutcomeMemorySaved && !finalizeClosed(updated) {
 		return updated, stageOwnership{}, errors.New("finalize stage ownership is missing")
 	}
 	return updated, ownership, nil
@@ -249,7 +292,7 @@ func (s *Service) failFinalize(
 	ctx context.Context,
 	record run.Record,
 	ownership stageOwnership,
-	cause error,
+	failure run.Failure,
 ) (run.Record, error) {
 	persistCtx := ctx
 	cancel := func() {}
@@ -266,7 +309,6 @@ func (s *Service) failFinalize(
 			return current, false, ErrPhaseInProgress
 		}
 		next := run.CloneRecord(current)
-		failure := finalizeMemoryFailure()
 		stage := run.StageResult{
 			Name: finalizeStage, Status: run.StageFailed,
 			StartedAt: ownership.startedAt, FinishedAt: s.clock(),
@@ -281,6 +323,16 @@ func (s *Service) failFinalize(
 			next.Failure = &failure
 		}
 		next.UpdatedAt = s.clock()
+		if !next.Terminal() && !failure.Retryable {
+			status := run.StatusFailed
+			if failure.Class == run.FailureCanceled {
+				status = run.StatusCanceled
+			}
+			next, err = run.Transition(next, status, s.clock())
+			if err != nil {
+				return run.Record{}, false, err
+			}
+		}
 		return next, true, nil
 	})
 }
@@ -310,6 +362,12 @@ func finalizeExhausted(record run.Record) bool {
 		!latest.Failure.Retryable && latest.Failure.CauseCode == "retries_exhausted"
 }
 
+func finalizeClosed(record run.Record) bool {
+	latest, found := latestStage(record, finalizeStage)
+	return found && latest.Status == run.StageFailed &&
+		latest.Failure != nil && !latest.Failure.Retryable
+}
+
 func finalizeOwnership(record run.Record, ownership stageOwnership) bool {
 	latest, found := latestStage(record, ownership.name)
 	return found && latest.Status == run.StageRunning &&
@@ -335,11 +393,20 @@ func (s *Service) exhaustFinalize(ctx context.Context, runID string) (PhaseResul
 	if record.OutcomeMemorySaved || finalizeExhausted(record) {
 		return phaseResult(record), nil
 	}
+	if record.Terminal() {
+		latest, found := latestStage(record, finalizeStage)
+		if !found || latest.Failure == nil || !latest.Failure.Retryable {
+			return phaseResult(record), nil
+		}
+	}
 	record, err = s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
 		if current.OutcomeMemorySaved || finalizeExhausted(current) {
 			return current, false, nil
 		}
 		latest, found := latestStage(current, finalizeStage)
+		if current.Terminal() && (!found || latest.Failure == nil || !latest.Failure.Retryable) {
+			return current, false, nil
+		}
 		if !found || latest.Status != run.StageFailed || latest.Failure == nil ||
 			!latest.Failure.Retryable {
 			return run.Record{}, false, errors.New("exhaust finalize: no retryable failure")
@@ -445,6 +512,13 @@ func (s *Service) resultFromRecord(
 	result := templatecodechange.Result{
 		RunID: record.ID, Status: record.Status, BaseSHA: record.BaseSHA,
 	}
+	input, err := validateRunBinding(record)
+	if err != nil {
+		return result, err
+	}
+	if err := s.validateDurableEvidence(ctx, record, input); err != nil {
+		return result, err
+	}
 	if record.Artifact != nil {
 		result.Artifact = *record.Artifact
 		bundle, err := s.artifacts.Load(ctx, *record.Artifact)
@@ -471,37 +545,92 @@ func (s *Service) resultFromRecord(
 	return result, nil
 }
 
+func (s *Service) validateDurableEvidence(
+	ctx context.Context,
+	record run.Record,
+	input templatecodechange.Input,
+) error {
+	if record.Artifact == nil {
+		if record.Approval != nil || record.Publication != nil {
+			return fmt.Errorf("%w: durable decision lacks artifact", ErrRunBinding)
+		}
+		return nil
+	}
+	bundle, err := s.artifacts.Load(ctx, *record.Artifact)
+	if err != nil {
+		return err
+	}
+	if err := validateArtifactBinding(record, bundle); err != nil {
+		return err
+	}
+	if input.Publication.Mode != "pull_request" {
+		if record.Approval != nil || record.Publication != nil {
+			return fmt.Errorf("%w: artifact-only run contains publication evidence", ErrRunBinding)
+		}
+		return nil
+	}
+	approvalRequest := buildApprovalRequest(record, input, bundle)
+	if record.Approval != nil {
+		if err := validatePersistedApproval(record, approvalRequest); err != nil {
+			return fmt.Errorf("%w: approval evidence: %v", ErrRunBinding, err)
+		}
+	}
+	if record.Publication != nil {
+		if record.Approval == nil || !record.Approval.Approved {
+			return fmt.Errorf("%w: publication lacks approved decision", ErrRunBinding)
+		}
+		request, err := buildPublisherRequest(record, input)
+		if err != nil {
+			return fmt.Errorf("%w: publisher request: %v", ErrRunBinding, err)
+		}
+		if err := validatePersistedPublication(record, request, input.Publication.Provider); err != nil {
+			return fmt.Errorf("%w: publication evidence: %v", ErrRunBinding, err)
+		}
+	}
+	return nil
+}
+
 type keyedMutex struct {
 	mu    sync.Mutex
 	locks map[string]*keyedMutexEntry
 }
 
 type keyedMutexEntry struct {
-	mu   sync.Mutex
-	refs int
+	token chan struct{}
+	refs  int
 }
 
-func (m *keyedMutex) Lock(key string) func() {
+func (m *keyedMutex) Lock(ctx context.Context, key string) (func(), error) {
 	m.mu.Lock()
 	if m.locks == nil {
 		m.locks = make(map[string]*keyedMutexEntry)
 	}
 	entry := m.locks[key]
 	if entry == nil {
-		entry = &keyedMutexEntry{}
+		entry = &keyedMutexEntry{token: make(chan struct{}, 1)}
+		entry.token <- struct{}{}
 		m.locks[key] = entry
 	}
 	entry.refs++
 	m.mu.Unlock()
-	entry.mu.Lock()
+	select {
+	case <-ctx.Done():
+		m.releaseEntry(key, entry)
+		return nil, ctx.Err()
+	case <-entry.token:
+	}
 
 	return func() {
-		entry.mu.Unlock()
-		m.mu.Lock()
-		entry.refs--
-		if entry.refs == 0 {
-			delete(m.locks, key)
-		}
-		m.mu.Unlock()
+		entry.token <- struct{}{}
+		m.releaseEntry(key, entry)
+	}, nil
+}
+
+func (m *keyedMutex) releaseEntry(key string, entry *keyedMutexEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(m.locks, key)
 	}
 }

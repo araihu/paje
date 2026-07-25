@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/araihu/paje/internal/approval"
 	"github.com/araihu/paje/internal/artifact"
@@ -86,7 +86,44 @@ func (s *Service) Approval(
 	if err := decision.Validate(request); err != nil {
 		return s.finishFailure(ctx, runID, approvalBindingFailure(), err, ownership.attempt)
 	}
-	return s.persistApproval(ctx, runID, ownership, request, decision)
+	result, persistErr := s.persistApproval(ctx, runID, ownership, request, decision)
+	if persistErr != nil && ctx.Err() != nil {
+		return s.compensateOwnedCancellation(ctx, runID, ownership, persistErr)
+	}
+	return result, persistErr
+}
+
+func (s *Service) compensateOwnedCancellation(
+	ctx context.Context,
+	runID string,
+	ownership stageOwnership,
+	cause error,
+) (PhaseResult, error) {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	defer cancel()
+	failure := canceledFailure(ownership.name)
+	record, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.Terminal() || !exactStageIdentity(current, ownership) {
+			return current, false, nil
+		}
+		next := run.CloneRecord(current)
+		failureCopy := failure
+		next.Failure = &failureCopy
+		stage := run.StageResult{
+			Name: ownership.name, Status: run.StageFailed,
+			StartedAt: ownership.startedAt, FinishedAt: s.clock(),
+			Attempts: ownership.attempt, Failure: &failureCopy,
+		}
+		var mutationErr error
+		next, mutationErr = run.UpsertStage(next, stage)
+		if mutationErr != nil {
+			return run.Record{}, false, mutationErr
+		}
+		next.UpdatedAt = s.clock()
+		next, mutationErr = run.Transition(next, run.StatusCanceled, s.clock())
+		return next, true, mutationErr
+	})
+	return phaseResult(record), errors.Join(newPhaseError(failure, ctx.Err()), cause, err)
 }
 
 func (s *Service) loadApprovalState(
@@ -154,7 +191,7 @@ func buildApprovalRequest(
 	}
 	return approval.Request{
 		RunID: record.ID, TemplateID: record.Template.String(),
-		Repository: safeApprovalRepository(record.RepositoryURI),
+		Repository: record.RepositoryURI,
 		BaseSHA:    record.BaseSHA, TargetBranch: input.Publication.TargetBranch,
 		PublicationMode:   input.Publication.Mode,
 		PublicationBranch: publicationBranch(record.ID),
@@ -273,7 +310,7 @@ func approvalBindingEvidence(
 ) approval.Request {
 	return approval.Request{
 		RunID: record.ID, TemplateID: record.Template.String(),
-		Repository: safeApprovalRepository(record.RepositoryURI),
+		Repository: record.RepositoryURI,
 		BaseSHA:    record.BaseSHA, TargetBranch: input.Publication.TargetBranch,
 		PublicationMode:   input.Publication.Mode,
 		PublicationBranch: publicationBranch(record.ID),
@@ -319,18 +356,43 @@ func publicationBranch(runID string) string {
 	return "paje/code-change/" + runID
 }
 
-func safeApprovalRepository(repository string) string {
-	if filepath.IsAbs(repository) {
-		return "local-repository"
+func canonicalGitHubRepository(repository string) (string, error) {
+	repository = strings.TrimSpace(repository)
+	if repository == "" || strings.ContainsAny(repository, "\x00\r\n") {
+		return "", errors.New("GitHub repository is invalid")
 	}
 	parsed, err := url.Parse(repository)
-	if err != nil || parsed.Scheme == "" {
-		return repository
+	if err != nil || parsed.Scheme != "https" || parsed.Opaque != "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		!strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Port() != "" ||
+		parsed.RawPath != "" {
+		return "", errors.New("GitHub repository must be a credential-free HTTPS URL")
 	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String()
+	parts := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+	if len(parts) != 2 {
+		return "", errors.New("GitHub repository path must contain owner and repository")
+	}
+	owner := parts[0]
+	name := strings.TrimSuffix(parts[1], ".git")
+	if !safeRepositoryComponent(owner) || !safeRepositoryComponent(name) {
+		return "", errors.New("GitHub repository owner or name is invalid")
+	}
+	return "https://github.com/" + owner + "/" + name + ".git", nil
+}
+
+func safeRepositoryComponent(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range value {
+		if !('a' <= character && character <= 'z') &&
+			!('A' <= character && character <= 'Z') &&
+			!('0' <= character && character <= '9') &&
+			character != '-' && character != '_' && character != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func compactStrings(values []string) []string {

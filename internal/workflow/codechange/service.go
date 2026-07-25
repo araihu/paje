@@ -297,5 +297,11 @@ func validateRunBinding(record run.Record) (templatecodechange.Input, error) {
 		record.PublicationMode != input.Publication.Mode {
 		return templatecodechange.Input{}, fmt.Errorf("%w: immutable fields", ErrRunBinding)
 	}
+	if input.Publication.Mode == "pull_request" {
+		canonical, err := canonicalGitHubRepository(input.RepositoryURI)
+		if err != nil || canonical != input.RepositoryURI {
+			return templatecodechange.Input{}, fmt.Errorf("%w: publication repository", ErrRunBinding)
+		}
+	}
 	return input, nil
 }

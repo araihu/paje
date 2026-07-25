@@ -16,6 +16,7 @@ import (
 
 	"github.com/araihu/paje/internal/approval"
 	approvalmock "github.com/araihu/paje/internal/approval/mock"
+	"github.com/araihu/paje/internal/artifact"
 	artifactfilesystem "github.com/araihu/paje/internal/artifact/filesystem"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	"github.com/araihu/paje/internal/environment"
@@ -255,6 +256,10 @@ func TestServicePullRequestApprovalIsArtifactBoundAndPublishesOnce(t *testing.T)
 	if err != nil || published.Status != run.StatusPublishing || pub.CallCount() != 1 {
 		t.Fatalf("Publish() result=%#v error=%v calls=%d", published, err, pub.CallCount())
 	}
+	if got := pub.Requests()[0].Repository; got != request.Repository ||
+		got != "https://github.com/araihu/paje.git" {
+		t.Fatalf("repository identity approval=%q publisher=%q", request.Repository, got)
+	}
 	again, err := fixture.service.Publish(context.Background(), "run-123")
 	if err != nil || again.Status != run.StatusPublishing || pub.CallCount() != 1 {
 		t.Fatalf("Publish(second) result=%#v error=%v calls=%d", again, err, pub.CallCount())
@@ -375,6 +380,194 @@ func TestServiceApprovalAndPublishPersistCancellationAfterProviderReturns(t *tes
 			t.Fatalf("canceled publish persisted result: %#v", record.Publication)
 		}
 	})
+	t.Run("approval CAS persistence", func(t *testing.T) {
+		fixture := completedServiceFixture(t, "pull_request")
+		record, _ := fixture.runs.Load(context.Background(), "run-123")
+		ctx, cancel := context.WithCancel(context.Background())
+		fixture.service.runs = &cancelOnEvidenceStore{
+			Store: fixture.runs, cancel: cancel, evidence: "approval",
+		}
+		gate := approvalmock.NewGate(approval.Result{
+			RunID: record.ID, ArtifactDigest: record.Artifact.Digest, Approved: true,
+			Actor: "reviewer", DecidedAt: time.Unix(200, 0).UTC(),
+		}, nil)
+		result, err := fixture.service.Approval(ctx, "run-123", gate)
+		if err == nil || result.Status != run.StatusCanceled {
+			t.Fatalf("Approval(CAS canceled) result=%#v error=%v", result, err)
+		}
+		record, _ = fixture.runs.Load(context.Background(), "run-123")
+		stage, _ := latestStage(record, "approval")
+		if record.Approval != nil || stage.Status != run.StageFailed ||
+			stage.Failure == nil || stage.Failure.Class != run.FailureCanceled {
+			t.Fatalf("approval cancellation record = %#v", record)
+		}
+	})
+	t.Run("publish CAS persistence", func(t *testing.T) {
+		fixture := approvedServiceFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		fixture.service.runs = &cancelOnEvidenceStore{
+			Store: fixture.runs, cancel: cancel, evidence: "publication",
+		}
+		fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
+			Provider: "github", Branch: "paje/code-change/run-123",
+			CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
+			PullRequestURL: "https://example.test/pull/42",
+		}}}
+		result, err := fixture.service.Publish(ctx, "run-123")
+		if err == nil || result.Status != run.StatusCanceled {
+			t.Fatalf("Publish(CAS canceled) result=%#v error=%v", result, err)
+		}
+		record, _ := fixture.runs.Load(context.Background(), "run-123")
+		stage, _ := latestStage(record, "publish")
+		if record.Publication != nil || stage.Status != run.StageFailed ||
+			stage.Failure == nil || stage.Failure.Class != run.FailureCanceled {
+			t.Fatalf("publish cancellation record = %#v", record)
+		}
+	})
+}
+
+func TestServiceFinalizeCancellationIsTerminalAndDoesNotRetryMemory(t *testing.T) {
+	fixture := completedServiceFixture(t, "artifact")
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	fixture.service.memory = memoryFunc{
+		search: func(context.Context, string, int, map[string]string) ([]memory.Memory, error) {
+			calls++
+			cancel()
+			return nil, context.Canceled
+		},
+	}
+	result, err := fixture.service.Finalize(ctx, "run-123")
+	if err == nil || result.Status != run.StatusCanceled ||
+		result.Failure == nil || result.Failure.Class != run.FailureCanceled ||
+		result.Failure.Retryable {
+		t.Fatalf("Finalize(canceled) result=%#v error=%v", result, err)
+	}
+	again, err := fixture.service.Finalize(context.Background(), "run-123")
+	if err != nil || again.Status != run.StatusCanceled || calls != 1 {
+		t.Fatalf("Finalize(after cancellation) result=%#v error=%v calls=%d", again, err, calls)
+	}
+
+	t.Run("marker CAS persistence", func(t *testing.T) {
+		fixture := completedServiceFixture(t, "artifact")
+		fixture.service.memory = &outcomeMemory{}
+		ctx, cancel := context.WithCancel(context.Background())
+		fixture.service.runs = &cancelOnEvidenceStore{
+			Store: fixture.runs, cancel: cancel, evidence: "outcome",
+		}
+		result, err := fixture.service.Finalize(ctx, "run-123")
+		if err == nil || result.Status != run.StatusCanceled ||
+			result.Failure == nil || result.Failure.Class != run.FailureCanceled {
+			t.Fatalf("Finalize(marker CAS canceled) result=%#v error=%v", result, err)
+		}
+		record, _ := fixture.runs.Load(context.Background(), "run-123")
+		if record.OutcomeMemorySaved {
+			t.Fatalf("canceled marker persistence claimed memory saved: %#v", record)
+		}
+	})
+}
+
+func TestServiceFinalizeBoundsDetachedResultReconstruction(t *testing.T) {
+	fixture := completedServiceFixture(t, "artifact")
+	fixture.service.cleanupTimeout = 20 * time.Millisecond
+	fixture.service.artifacts = &blockingLoadArtifact{
+		Store: fixture.artifacts, blockAt: 2,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture.service.memory = memoryFunc{
+		search: func(context.Context, string, int, map[string]string) ([]memory.Memory, error) {
+			cancel()
+			return nil, context.Canceled
+		},
+	}
+	before := time.Now()
+	result, err := fixture.service.Finalize(ctx, "run-123")
+	if err == nil || result.RunID != "run-123" || result.Status != run.StatusCanceled {
+		t.Fatalf("Finalize() result=%#v error=%v", result, err)
+	}
+	if time.Since(before) > 200*time.Millisecond {
+		t.Fatalf("detached result reconstruction was unbounded: %v", time.Since(before))
+	}
+}
+
+func TestServiceFinalizeRejectsTamperedDurableApprovalBeforeMemoryAndResult(t *testing.T) {
+	fixture := approvedServiceFixture(t)
+	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
+		Provider: "github", Branch: "paje/code-change/run-123",
+		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
+		PullRequestURL: "https://example.test/pull/42",
+	}}}
+	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
+		t.Fatal(err)
+	}
+	outcomes := &outcomeMemory{}
+	fixture.service.memory = outcomes
+	fixture.runs.loadMutate = func(record run.Record) run.Record {
+		for index := range record.Stages {
+			if record.Stages[index].Name == "approval" {
+				record.Stages[index].Evidence["target_branch"] = "tampered"
+			}
+		}
+		return record
+	}
+	result, err := fixture.service.Finalize(context.Background(), "run-123")
+	if err == nil || result.RunID != "run-123" || outcomes.SaveCount() != 0 {
+		t.Fatalf("Finalize(tampered) result=%#v error=%v saves=%d", result, err, outcomes.SaveCount())
+	}
+}
+
+func TestServiceRejectsUnsafePullRequestRepositoryBeforePorts(t *testing.T) {
+	for _, repositoryURI := range []string{
+		"/tmp/repository", "git@github.com:owner/repo.git",
+		"https://token@github.com/owner/repo.git",
+		"https://github.com/owner/repo.git?token=secret",
+		"https://github.com/owner/../repo.git",
+		"https://example.test/owner/repo.git",
+	} {
+		t.Run(repositoryURI, func(t *testing.T) {
+			fixture := newServiceFixture(t)
+			var value map[string]any
+			_ = json.Unmarshal(validRawInput("change", "unsafe-repo"), &value)
+			value["repository_uri"] = repositoryURI
+			value["publication"] = map[string]any{
+				"mode": "pull_request", "provider": "github", "target_branch": "main",
+			}
+			raw, _ := json.Marshal(value)
+			if _, err := fixture.service.Resolve(context.Background(), raw); err == nil {
+				t.Fatalf("Resolve(%q) error = nil", repositoryURI)
+			}
+			if fixture.runs.reserveCalls != 0 || fixture.resolver.calls != 0 {
+				t.Fatalf("unsafe repository reached ports: reserve=%d resolver=%d",
+					fixture.runs.reserveCalls, fixture.resolver.calls)
+			}
+		})
+	}
+}
+
+func TestServiceFinalizeWaiterHonorsContext(t *testing.T) {
+	fixture := completedServiceFixture(t, "artifact")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fixture.service.memory = &blockingMemory{started: started, release: release}
+	done := make(chan error, 1)
+	go func() {
+		_, err := fixture.service.Finalize(context.Background(), "run-123")
+		done <- err
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	before := time.Now()
+	if _, err := fixture.service.Finalize(ctx, "run-123"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Finalize(waiter) error = %v", err)
+	}
+	if time.Since(before) > 200*time.Millisecond {
+		t.Fatalf("canceled lock waiter returned too slowly: %v", time.Since(before))
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("first Finalize() error = %v", err)
+	}
 }
 
 func TestServicePublishClassifiesConflictAndRetriesTypedOutage(t *testing.T) {
@@ -575,6 +768,29 @@ func TestServiceFinalizeRetriesRecoversVisibleMemoryAndExhaustsSafely(t *testing
 		}
 	})
 
+	t.Run("marker observed during begin skips lagging memory", func(t *testing.T) {
+		resumed := completedServiceFixture(t, "artifact")
+		record, _ := resumed.runs.Load(context.Background(), "run-123")
+		record.OutcomeMemorySaved = true
+		if _, err := resumed.runs.Save(context.Background(), record, record.Version); err != nil {
+			t.Fatal(err)
+		}
+		loads := 0
+		resumed.runs.loadMutate = func(record run.Record) run.Record {
+			loads++
+			if loads == 1 {
+				record.OutcomeMemorySaved = false
+			}
+			return record
+		}
+		memoryStore := &outcomeMemory{}
+		resumed.service.memory = memoryStore
+		result, err := resumed.service.Finalize(context.Background(), "run-123")
+		if err != nil || result.Status != run.StatusSucceeded || memoryStore.SaveCount() != 0 {
+			t.Fatalf("Finalize(marker race) result=%#v error=%v saves=%d", result, err, memoryStore.SaveCount())
+		}
+	})
+
 	t.Run("terminal upstream failure records finalize exhaustion bookkeeping", func(t *testing.T) {
 		terminal := completedServiceFixture(t, "artifact")
 		now := time.Unix(100, 0).UTC()
@@ -599,6 +815,9 @@ func TestServiceFinalizeRetriesRecoversVisibleMemoryAndExhaustsSafely(t *testing
 		record, _ = run.Transition(record, run.StatusFailed, terminal.service.clock())
 		if _, err := terminal.runs.Save(context.Background(), record, record.Version); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := terminal.service.Exhaust(context.Background(), "run-123", "finalize"); err != nil {
+			t.Fatalf("Exhaust(terminal without finalize failure) error = %v", err)
 		}
 		terminal.service.memory = &outcomeMemory{saveErrors: []error{errors.New("down")}}
 		if _, err := terminal.service.Finalize(context.Background(), "run-123"); err == nil {
@@ -680,6 +899,8 @@ func completedServiceFixture(t *testing.T, mode string) *serviceFixture {
 		publication["provider"] = "github"
 		publication["target_branch"] = "main"
 		publication["title"] = "Safe change"
+		input["repository_uri"] = "https://github.com/araihu/paje"
+		fixture.resolver.revision.RepositoryURI = "https://github.com/araihu/paje.git"
 	}
 	input["publication"] = publication
 	raw, _ = json.Marshal(input)
@@ -847,9 +1068,116 @@ func (p *sequencePublisher) CallCount() int {
 	return len(p.requests)
 }
 
+func (p *sequencePublisher) Requests() []publisher.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make([]publisher.Request, len(p.requests))
+	for index, request := range p.requests {
+		result[index] = publisher.CloneRequest(request)
+	}
+	return result
+}
+
 type retryableTestError struct{ error }
 
 func (retryableTestError) Retryable() bool { return true }
+
+type cancelOnEvidenceStore struct {
+	run.Store
+	cancel   context.CancelFunc
+	evidence string
+	once     sync.Once
+}
+
+func (s *cancelOnEvidenceStore) Save(
+	ctx context.Context,
+	record run.Record,
+	expected uint64,
+) (run.Record, error) {
+	matches := (s.evidence == "approval" && record.Approval != nil) ||
+		(s.evidence == "publication" && record.Publication != nil) ||
+		(s.evidence == "outcome" && record.OutcomeMemorySaved)
+	if matches {
+		fired := false
+		s.once.Do(func() {
+			fired = true
+			s.cancel()
+		})
+		if fired {
+			return run.Record{}, ctx.Err()
+		}
+	}
+	return s.Store.Save(ctx, record, expected)
+}
+
+type memoryFunc struct {
+	search func(context.Context, string, int, map[string]string) ([]memory.Memory, error)
+	save   func(context.Context, string, map[string]string) error
+}
+
+func (m memoryFunc) Search(
+	ctx context.Context,
+	query string,
+	limit int,
+	tags map[string]string,
+) ([]memory.Memory, error) {
+	if m.search == nil {
+		return nil, nil
+	}
+	return m.search(ctx, query, limit, tags)
+}
+
+func (m memoryFunc) Save(ctx context.Context, content string, tags map[string]string) error {
+	if m.save == nil {
+		return nil
+	}
+	return m.save(ctx, content, tags)
+}
+
+type blockingMemory struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (m *blockingMemory) Search(
+	ctx context.Context,
+	_ string,
+	_ int,
+	_ map[string]string,
+) ([]memory.Memory, error) {
+	m.once.Do(func() { close(m.started) })
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-m.release:
+		return nil, nil
+	}
+}
+
+func (*blockingMemory) Save(context.Context, string, map[string]string) error { return nil }
+
+type blockingLoadArtifact struct {
+	artifact.Store
+	mu      sync.Mutex
+	calls   int
+	blockAt int
+}
+
+func (s *blockingLoadArtifact) Load(
+	ctx context.Context,
+	reference artifact.Reference,
+) (artifact.Bundle, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call >= s.blockAt {
+		<-ctx.Done()
+		return artifact.Bundle{}, ctx.Err()
+	}
+	return s.Store.Load(ctx, reference)
+}
 
 type gateFunc func(context.Context, approval.Request) (approval.Result, error)
 

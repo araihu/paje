@@ -52,6 +52,12 @@ func (s *Service) decodeInput(raw json.RawMessage) (templatecodechange.Input, js
 	if err != nil {
 		return templatecodechange.Input{}, nil, "", err
 	}
+	if input.Publication.Mode == "pull_request" {
+		input.RepositoryURI, err = canonicalGitHubRepository(input.RepositoryURI)
+		if err != nil {
+			return templatecodechange.Input{}, nil, "", fmt.Errorf("resolve code-change input: %w", err)
+		}
+	}
 	if _, ok := s.profiles[input.Profile]; !ok {
 		return templatecodechange.Input{}, nil, "", fmt.Errorf("resolve code-change input: profile %q is unavailable", input.Profile)
 	}

@@ -90,7 +90,11 @@ func (s *Service) Publish(ctx context.Context, runID string) (PhaseResult, error
 		}
 		return s.finishFailure(ctx, runID, failure, err, ownership.attempt)
 	}
-	return s.persistPublication(ctx, runID, ownership, request, result)
+	phase, persistErr := s.persistPublication(ctx, runID, ownership, request, result)
+	if persistErr != nil && ctx.Err() != nil {
+		return s.compensateOwnedCancellation(ctx, runID, ownership, persistErr)
+	}
+	return phase, persistErr
 }
 
 func (s *Service) loadPublishable(
@@ -130,7 +134,7 @@ func buildPublisherRequest(
 		title = "Pajé code change " + record.ID
 	}
 	request := publisher.Request{
-		RunID: record.ID, Repository: safePublicationRepository(record.RepositoryURI),
+		RunID: record.ID, Repository: record.RepositoryURI,
 		BaseSHA: record.BaseSHA, TargetRef: input.Publication.TargetBranch,
 		Branch: publicationBranch(record.ID), Artifact: *record.Artifact,
 		Title: title,
@@ -310,15 +314,4 @@ func publishBindingFailure() run.Failure {
 		Diagnostic: "publication approval binding is invalid",
 		CauseCode:  "publication_binding_mismatch",
 	}
-}
-
-func safePublicationRepository(repository string) string {
-	parsed, err := url.Parse(repository)
-	if err != nil || parsed.Scheme == "" {
-		return repository
-	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String()
 }
