@@ -157,6 +157,11 @@ func PrepareSave(current, next Record) (Record, error) {
 			return Record{}, err
 		}
 	}
+	if current.Status != next.Status && (next.Status == StatusFailed || next.Status == StatusCanceled) {
+		if err := validateTerminalFailureEvidence(current, next); err != nil {
+			return Record{}, err
+		}
+	}
 	if next.UpdatedAt.Before(current.UpdatedAt) {
 		return Record{}, invalidRecord("updated time moved backward")
 	}
@@ -233,14 +238,20 @@ func validateMonotonicEvidence(current, next Record) error {
 
 func validateMonotonicStages(current, next []StageResult) error {
 	nextByKey := make(map[string]StageResult, len(next))
+	currentByKey := make(map[string]StageResult, len(current))
 	latestAttempt := make(map[string]int, len(current))
 	for _, stage := range current {
+		currentByKey[stageKey(stage)] = stage
 		if stage.Attempts > latestAttempt[stage.Name] {
 			latestAttempt[stage.Name] = stage.Attempts
 		}
 	}
 	for _, stage := range next {
 		nextByKey[stageKey(stage)] = stage
+		if _, exists := currentByKey[stageKey(stage)]; !exists &&
+			latestAttempt[stage.Name] != 0 && stage.Attempts <= latestAttempt[stage.Name] {
+			return invalidRecord("stage attempt was inserted into historical range")
+		}
 	}
 	for _, existing := range current {
 		candidate, ok := nextByKey[stageKey(existing)]
@@ -289,7 +300,8 @@ func validateMonotonicFailure(current, next Record) error {
 			return nil
 		}
 		latest, found := latestStage(next.Stages, next.Failure.Stage)
-		if !found || latest.Failure == nil || !reflect.DeepEqual(latest.Failure, next.Failure) {
+		if !found || latest.Failure == nil || !reflect.DeepEqual(latest.Failure, next.Failure) ||
+			!stageIntroducedOrProgressed(current.Stages, next.Stages, latest) {
 			return invalidRecord("new top-level failure is not bound to latest stage attempt")
 		}
 		return nil
@@ -320,15 +332,70 @@ func validateMonotonicFailure(current, next Record) error {
 		return invalidRecord("failure changed without a newer stage attempt")
 	}
 	if next.Failure == nil {
-		if nextLatest.Failure != nil {
+		if nextLatest.Failure != nil ||
+			!stageIntroducedOrProgressed(current.Stages, next.Stages, nextLatest) {
 			return invalidRecord("cleared top-level failure differs from latest stage")
 		}
 		return nil
 	}
-	if nextLatest.Failure == nil || !reflect.DeepEqual(nextLatest.Failure, next.Failure) {
+	if nextLatest.Failure == nil || !reflect.DeepEqual(nextLatest.Failure, next.Failure) ||
+		!stageIntroducedOrProgressed(current.Stages, next.Stages, nextLatest) {
 		return invalidRecord("top-level failure differs from latest stage")
 	}
 	return nil
+}
+
+func stageIntroducedOrProgressed(current, next []StageResult, candidate StageResult) bool {
+	var existing StageResult
+	found := false
+	priorMaximum := 0
+	for _, stage := range current {
+		if stage.Name == candidate.Name && stage.Attempts > priorMaximum {
+			priorMaximum = stage.Attempts
+		}
+		if stage.Name == candidate.Name && stage.Attempts == candidate.Attempts {
+			existing = stage
+			found = true
+		}
+	}
+	if !found {
+		return candidate.Attempts > priorMaximum
+	}
+	if existing.Attempts != priorMaximum || existing.Status != StageRunning ||
+		candidate.Status == StageRunning || candidate.FinishedAt.IsZero() ||
+		!candidate.StartedAt.Equal(existing.StartedAt) {
+		return false
+	}
+	for _, stage := range next {
+		if stage.Name == candidate.Name && stage.Attempts == candidate.Attempts {
+			return reflect.DeepEqual(stage, candidate)
+		}
+	}
+	return false
+}
+
+func validateTerminalFailureEvidence(current, next Record) error {
+	if next.Failure == nil {
+		return invalidRecord("terminal failure evidence is required")
+	}
+	nextLatest, found := latestStage(next.Stages, next.Failure.Stage)
+	if !found || !stageFinished(nextLatest) || nextLatest.Failure == nil ||
+		!reflect.DeepEqual(nextLatest.Failure, next.Failure) {
+		return invalidRecord("terminal failure is not bound to latest finished stage")
+	}
+	currentLatest, currentFound := latestStage(current.Stages, next.Failure.Stage)
+	if currentFound && stageFinished(currentLatest) && currentLatest.Failure != nil &&
+		current.Failure != nil && reflect.DeepEqual(currentLatest.Failure, current.Failure) &&
+		reflect.DeepEqual(current.Failure, next.Failure) {
+		return nil
+	}
+	if stageIntroducedOrProgressed(current.Stages, next.Stages, nextLatest) {
+		return nil
+	}
+	if currentFound && isRetryExhaustion(currentLatest, nextLatest) {
+		return nil
+	}
+	return invalidRecord("terminal failure did not come from current or new latest evidence")
 }
 
 func latestStage(stages []StageResult, name string) (StageResult, bool) {
@@ -364,6 +431,23 @@ func validateTerminalUpdate(current, next Record) error {
 	case !reflect.DeepEqual(nonFinalizeStages(current.Stages), nonFinalizeStages(next.Stages)):
 		return invalidRecord("terminal non-finalize stages are immutable")
 	}
+	finalizeChanged := !reflect.DeepEqual(finalizeStages(current.Stages), finalizeStages(next.Stages))
+	bookkeepingChanged := current.OutcomeMemorySaved != next.OutcomeMemorySaved || finalizeChanged
+	if !bookkeepingChanged {
+		if !next.UpdatedAt.Equal(current.UpdatedAt) {
+			return invalidRecord("terminal updated time changed without bookkeeping")
+		}
+		return nil
+	}
+	if current.Status == StatusSucceeded {
+		return invalidRecord("successful terminal record does not allow bookkeeping updates")
+	}
+	if current.Status != StatusFailed && current.Status != StatusCanceled && current.Status != StatusDeclined {
+		return invalidRecord("terminal status is not eligible for finalization bookkeeping")
+	}
+	if !next.UpdatedAt.After(current.UpdatedAt) {
+		return invalidRecord("terminal bookkeeping must advance updated time")
+	}
 	return validateMonotonicStages(current.Stages, next.Stages)
 }
 
@@ -371,6 +455,16 @@ func nonFinalizeStages(stages []StageResult) []StageResult {
 	result := make([]StageResult, 0, len(stages))
 	for _, stage := range stages {
 		if stage.Name != "finalize" {
+			result = append(result, stage)
+		}
+	}
+	return result
+}
+
+func finalizeStages(stages []StageResult) []StageResult {
+	result := make([]StageResult, 0, len(stages))
+	for _, stage := range stages {
+		if stage.Name == "finalize" {
 			result = append(result, stage)
 		}
 	}

@@ -397,6 +397,181 @@ func TestPrepareSaveBindsNewTopLevelFailureToLatestAttempt(t *testing.T) {
 	}
 }
 
+func TestPrepareSaveRejectsHistoricalFailureResurrection(t *testing.T) {
+	t.Parallel()
+	historicalFailure := Failure{Stage: "execute", Class: FailureAgent, Diagnostic: "old", CauseCode: "old_exit"}
+	current := validRecord(StatusExecuting)
+	current.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt,
+		FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &historicalFailure,
+	}}
+
+	resurrected := CloneRecord(current)
+	failureCopy := historicalFailure
+	resurrected.Failure = &failureCopy
+	if _, err := PrepareSave(current, resurrected); err == nil {
+		t.Fatal("PrepareSave() resurrected unchanged historical failure")
+	}
+
+	terminalized, err := Transition(resurrected, StatusFailed, current.UpdatedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareSave(current, terminalized); err == nil {
+		t.Fatal("PrepareSave() terminalized from resurrected historical failure")
+	}
+}
+
+func TestPrepareSaveTerminalizesOnlyFromCurrentOrNewLatestFailureEvidence(t *testing.T) {
+	t.Parallel()
+	oldFailure := Failure{Stage: "execute", Class: FailureAgent, Diagnostic: "old", CauseCode: "old_exit"}
+	current := validRecord(StatusExecuting)
+	current.Failure = &oldFailure
+	current.Stages = []StageResult{
+		{Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &oldFailure},
+		{Name: "execute", Status: StageSucceeded, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 2},
+	}
+	staleTerminal, err := Transition(current, StatusFailed, current.UpdatedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareSave(current, staleTerminal); err == nil {
+		t.Fatal("PrepareSave() terminalized from stale non-latest failure evidence")
+	}
+
+	latestFailure := oldFailure
+	current.Failure = &latestFailure
+	current.Stages[1].Status = StageFailed
+	current.Stages[1].Failure = &latestFailure
+	latestTerminal, err := Transition(current, StatusFailed, current.UpdatedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareSave(current, latestTerminal); err != nil {
+		t.Fatalf("PrepareSave() rejected current latest terminal evidence: %v", err)
+	}
+}
+
+func TestPrepareSaveAllowsFailureBindingOnlyFromNewOrProgressedLatestAttempt(t *testing.T) {
+	t.Parallel()
+	baseFailure := Failure{Stage: "execute", Class: FailureAgent, Diagnostic: "failed", CauseCode: "exit"}
+	current := validRecord(StatusExecuting)
+	current.Stages = []StageResult{{
+		Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt,
+		FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &baseFailure,
+	}}
+
+	newAttempt := CloneRecord(current)
+	newFailure := Failure{Stage: "execute", Class: FailureAgent, Retryable: true, Diagnostic: "new", CauseCode: "temporary"}
+	newAttempt.Failure = &newFailure
+	stageFailure := newFailure
+	newAttempt.Stages = append(newAttempt.Stages, StageResult{
+		Name: "execute", Status: StageFailed, StartedAt: current.UpdatedAt.Add(time.Minute),
+		FinishedAt: current.UpdatedAt.Add(2 * time.Minute), Attempts: 2, Failure: &stageFailure,
+	})
+	newAttempt.UpdatedAt = current.UpdatedAt.Add(2 * time.Minute)
+	if _, err := PrepareSave(current, newAttempt); err != nil {
+		t.Fatalf("PrepareSave() rejected new-attempt failure binding: %v", err)
+	}
+
+	running := validRecord(StatusExecuting)
+	running.Stages = []StageResult{{
+		Name: "execute", Status: StageRunning, StartedAt: running.CreatedAt, Attempts: 1,
+	}}
+	progressed := CloneRecord(running)
+	progressedFailure := Failure{Stage: "execute", Class: FailureAgent, Diagnostic: "failed", CauseCode: "exit"}
+	progressed.Failure = &progressedFailure
+	stageProgressedFailure := progressedFailure
+	progressed.Stages[0].Status = StageFailed
+	progressed.Stages[0].FinishedAt = progressed.UpdatedAt
+	progressed.Stages[0].Failure = &stageProgressedFailure
+	if _, err := PrepareSave(running, progressed); err != nil {
+		t.Fatalf("PrepareSave() rejected running-to-finished failure binding: %v", err)
+	}
+}
+
+func TestPrepareSaveRejectsFailureSwitchToUnchangedOtherStage(t *testing.T) {
+	t.Parallel()
+	resolveFailure := Failure{Stage: "resolve", Class: FailureEnvironment, Diagnostic: "old", CauseCode: "network"}
+	executeFailure := Failure{Stage: "execute", Class: FailureAgent, Diagnostic: "current", CauseCode: "exit"}
+	current := validRecord(StatusExecuting)
+	current.Failure = &executeFailure
+	current.Stages = []StageResult{
+		{Name: "resolve", Status: StageFailed, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &resolveFailure},
+		{Name: "execute", Status: StageFailed, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 1, Failure: &executeFailure},
+	}
+	next := CloneRecord(current)
+	rebound := resolveFailure
+	next.Failure = &rebound
+	if _, err := PrepareSave(current, next); err == nil {
+		t.Fatal("PrepareSave() rebound top-level failure to unchanged other-stage evidence")
+	}
+}
+
+func TestPrepareSaveRejectsInsertionIntoHistoricalAttemptGap(t *testing.T) {
+	t.Parallel()
+	current := validRecord(StatusExecuting)
+	current.Stages = []StageResult{
+		{Name: "execute", Status: StageSucceeded, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 1},
+		{Name: "execute", Status: StageSucceeded, StartedAt: current.CreatedAt, FinishedAt: current.UpdatedAt, Attempts: 3},
+	}
+	inserted := CloneRecord(current)
+	inserted.Stages = []StageResult{current.Stages[0], {
+		Name: "execute", Status: StageSucceeded, StartedAt: current.CreatedAt,
+		FinishedAt: current.UpdatedAt, Attempts: 2,
+	}, current.Stages[1]}
+	if _, err := PrepareSave(current, inserted); err == nil {
+		t.Fatal("PrepareSave() inserted a missing historical attempt")
+	}
+
+	appended := CloneRecord(current)
+	appended.Stages = append(appended.Stages, StageResult{
+		Name: "execute", Status: StageRunning, StartedAt: current.UpdatedAt.Add(time.Minute), Attempts: 4,
+	})
+	appended.UpdatedAt = current.UpdatedAt.Add(time.Minute)
+	if _, err := PrepareSave(current, appended); err != nil {
+		t.Fatalf("PrepareSave() rejected appended higher attempt: %v", err)
+	}
+}
+
+func TestTerminalBookkeepingRequiresEligibleStatusAndAdvancedTime(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	failed := withFailure(validRecord(StatusFailed))
+
+	sameTime := CloneRecord(failed)
+	sameTime.OutcomeMemorySaved = true
+	if _, err := PrepareSave(failed, sameTime); err == nil {
+		t.Fatal("PrepareSave() accepted terminal bookkeeping without advancing UpdatedAt")
+	}
+
+	updatedOnly := CloneRecord(failed)
+	updatedOnly.UpdatedAt = updatedOnly.UpdatedAt.Add(time.Minute)
+	if _, err := PrepareSave(failed, updatedOnly); err == nil {
+		t.Fatal("PrepareSave() accepted terminal UpdatedAt-only mutation")
+	}
+
+	noOp, err := PrepareSave(failed, CloneRecord(failed))
+	if err != nil {
+		t.Fatalf("PrepareSave() rejected coherent terminal no-op: %v", err)
+	}
+	if noOp.Version != failed.Version+1 || !noOp.UpdatedAt.Equal(failed.UpdatedAt) {
+		t.Fatalf("terminal no-op = version %d updated %v", noOp.Version, noOp.UpdatedAt)
+	}
+
+	ref := artifact.Reference{RunID: "run-1", Digest: strings.Repeat("a", 64), Size: 1}
+	succeeded := withOutcomeSaved(withFinalize(withArtifact(withMode(validRecord(StatusSucceeded), "artifact"), ref)))
+	nextSucceeded := CloneRecord(succeeded)
+	nextSucceeded.UpdatedAt = now.Add(time.Minute)
+	nextSucceeded.Stages = append(nextSucceeded.Stages, StageResult{
+		Name: "finalize", Status: StageSucceeded, StartedAt: now,
+		FinishedAt: now.Add(time.Minute), Attempts: 2,
+	})
+	if _, err := PrepareSave(succeeded, nextSucceeded); err == nil {
+		t.Fatal("PrepareSave() accepted succeeded terminal bookkeeping")
+	}
+}
+
 func TestTransitionValidatesSourceBeforeRepairingStatus(t *testing.T) {
 	t.Parallel()
 	record := withFailure(validRecord(Status("unknown")))
