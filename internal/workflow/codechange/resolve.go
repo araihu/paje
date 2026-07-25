@@ -1,0 +1,270 @@
+package codechange
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"time"
+
+	"github.com/araihu/paje/internal/run"
+	templatecodechange "github.com/araihu/paje/internal/template/codechange"
+)
+
+var immutableRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// Resolve validates and freezes all context needed by later phase retries.
+func (s *Service) Resolve(ctx context.Context, raw json.RawMessage) (PhaseResult, error) {
+	input, canonical, inputHash, err := s.decodeInput(raw)
+	if err != nil {
+		return PhaseResult{}, err
+	}
+	record, created, err := s.runs.Reserve(ctx, run.Reservation{
+		NewRunID: s.newID(), Template: templatecodechange.ID,
+		IdempotencyKey: input.IdempotencyKey, InputHash: inputHash,
+		Input: canonical, RepositoryURI: input.RepositoryURI,
+		BaseRef: input.BaseRef, PublicationMode: input.Publication.Mode,
+		CreatedAt: s.clock(),
+	})
+	if err != nil {
+		return phaseResult(record), err
+	}
+	if !created && (record.BaseSHA != "" || record.Terminal()) {
+		return phaseResult(record), nil
+	}
+	return s.resolveReserved(ctx, record.ID, input)
+}
+
+func (s *Service) decodeInput(raw json.RawMessage) (templatecodechange.Input, json.RawMessage, string, error) {
+	definition, err := s.templates.Resolve(templatecodechange.ID)
+	if err != nil {
+		return templatecodechange.Input{}, nil, "", err
+	}
+	if err := definition.Validate(raw); err != nil {
+		return templatecodechange.Input{}, nil, "", err
+	}
+	input, err := templatecodechange.Decode(raw)
+	if err != nil {
+		return templatecodechange.Input{}, nil, "", err
+	}
+	if _, ok := s.profiles[input.Profile]; !ok {
+		return templatecodechange.Input{}, nil, "", fmt.Errorf("resolve code-change input: profile %q is unavailable", input.Profile)
+	}
+	canonical, err := canonicalInput(input)
+	if err != nil {
+		return templatecodechange.Input{}, nil, "", fmt.Errorf("canonicalize code-change input: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return input, canonical, hex.EncodeToString(sum[:]), nil
+}
+
+func canonicalInput(input templatecodechange.Input) (json.RawMessage, error) {
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	memoryLimit, err := json.Marshal(input.MemoryLimit)
+	if err != nil {
+		return nil, err
+	}
+	fields["memory_limit"] = memoryLimit
+	encoded, err = json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+	return run.CanonicalInput(encoded)
+}
+
+func (s *Service) resolveReserved(ctx context.Context, runID string, input templatecodechange.Input) (PhaseResult, error) {
+	record, started, err := s.beginStage(ctx, runID, "resolve", run.StatusResolving)
+	if err != nil {
+		return phaseResult(record), err
+	}
+	if !started {
+		if record.BaseSHA != "" || record.Terminal() {
+			return phaseResult(record), nil
+		}
+		return phaseInProgress(record)
+	}
+	if record.BaseSHA != "" || record.Terminal() {
+		return phaseResult(record), nil
+	}
+
+	revision, err := s.resolver.Resolve(ctx, input.RepositoryURI, input.BaseRef)
+	if err != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureEnvironment, Retryable: true,
+			Diagnostic: "repository revision is temporarily unavailable", CauseCode: "repository_unavailable",
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			failure = canceledFailure("resolve")
+		}
+		return s.finishFailure(ctx, runID, failure, err)
+	}
+	if revision.SourceDirty {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInput, Retryable: false,
+			Diagnostic: "local repository source is dirty", CauseCode: "source_dirty",
+		}
+		return s.finishFailure(ctx, runID, failure, errors.New("local repository source is dirty"))
+	}
+	if revision.RepositoryURI != input.RepositoryURI ||
+		revision.Ref != input.BaseRef ||
+		!immutableRevisionPattern.MatchString(revision.SHA) {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInternal, Retryable: false,
+			Diagnostic: "repository resolver returned an invalid immutable revision", CauseCode: "invalid_revision",
+		}
+		return s.finishFailure(ctx, runID, failure, errors.New("repository resolver returned an invalid revision"))
+	}
+
+	query := input.MemoryQuery
+	if query == "" {
+		query = input.TaskDescription
+	}
+	memories, err := s.memory.Search(ctx, query, input.MemoryLimit, cloneStringMap(input.Tags))
+	if err != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInternal, Retryable: true,
+			Diagnostic: "scoped memory is temporarily unavailable", CauseCode: "memory_unavailable",
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			failure = canceledFailure("resolve")
+		}
+		return s.finishFailure(ctx, runID, failure, err)
+	}
+
+	record, err = s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.BaseSHA != "" || current.Terminal() {
+			return current, false, nil
+		}
+		next := run.CloneRecord(current)
+		next.BaseSHA = revision.SHA
+		next.MemorySnapshot = cloneMemories(memories)
+		next.Failure = nil
+		finished := run.StageResult{
+			Name: "resolve", Status: run.StageSucceeded,
+			StartedAt:  latestStageStart(current, "resolve"),
+			FinishedAt: s.clock(), Attempts: stageAttempt(current, "resolve"),
+			Evidence: map[string]string{
+				"base_sha": revision.SHA, "memory_count": fmt.Sprintf("%d", len(memories)),
+			},
+		}
+		next, err := run.UpsertStage(next, finished)
+		if err != nil {
+			return run.Record{}, false, err
+		}
+		next, err = run.Transition(next, run.StatusExecuting, s.clock())
+		return next, true, err
+	})
+	if err != nil {
+		return phaseResult(record), err
+	}
+	return phaseResult(record), nil
+}
+
+func (s *Service) beginStage(ctx context.Context, runID, name string, status run.Status) (run.Record, bool, error) {
+	started := false
+	record, err := s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
+		started = false
+		if current.Terminal() {
+			return current, false, nil
+		}
+		if name == "resolve" && current.BaseSHA != "" {
+			return current, false, nil
+		}
+		if name == "execute" && current.Artifact != nil {
+			return current, false, nil
+		}
+		if latest, found := latestStage(current, name); found && latest.Status == run.StageRunning {
+			return current, false, nil
+		}
+		next := run.CloneRecord(current)
+		var mutationErr error
+		if next.Status != status {
+			next, mutationErr = run.Transition(next, status, s.clock())
+			if mutationErr != nil {
+				return run.Record{}, false, mutationErr
+			}
+		}
+		next.Failure = nil
+		stage := run.StageResult{
+			Name: name, Status: run.StageRunning, StartedAt: s.clock(),
+			Attempts: stageAttempt(current, name) + 1,
+		}
+		next, mutationErr = run.UpsertStage(next, stage)
+		if mutationErr != nil {
+			return run.Record{}, false, mutationErr
+		}
+		next.UpdatedAt = s.clock()
+		started = true
+		return next, true, nil
+	})
+	return record, started, err
+}
+
+func (s *Service) finishFailure(ctx context.Context, runID string, failure run.Failure, cause error) (PhaseResult, error) {
+	persistCtx := ctx
+	cancel := func() {}
+	if ctx.Err() != nil {
+		persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	}
+	defer cancel()
+	record, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.Terminal() {
+			return current, false, nil
+		}
+		next := run.CloneRecord(current)
+		failureCopy := failure
+		next.Failure = &failureCopy
+		stage := run.StageResult{
+			Name: failure.Stage, Status: run.StageFailed,
+			StartedAt:  latestStageStart(current, failure.Stage),
+			FinishedAt: s.clock(), Attempts: stageAttempt(current, failure.Stage),
+			Failure: &failureCopy,
+		}
+		var upsertErr error
+		next, upsertErr = run.UpsertStage(next, stage)
+		if upsertErr != nil {
+			return run.Record{}, false, upsertErr
+		}
+		next.UpdatedAt = s.clock()
+		if !failure.Retryable {
+			status := run.StatusFailed
+			if failure.Class == run.FailureCanceled {
+				status = run.StatusCanceled
+			}
+			next, upsertErr = run.Transition(next, status, s.clock())
+			if upsertErr != nil {
+				return run.Record{}, false, upsertErr
+			}
+		}
+		return next, true, nil
+	})
+	if err != nil {
+		return phaseResult(record), errors.Join(newPhaseError(failure, cause), err)
+	}
+	return phaseResult(record), newPhaseError(failure, cause)
+}
+
+func latestStageStart(record run.Record, name string) time.Time {
+	var started time.Time
+	attempt := 0
+	for _, stage := range record.Stages {
+		if stage.Name == name && stage.Attempts >= attempt {
+			attempt = stage.Attempts
+			started = stage.StartedAt
+		}
+	}
+	if started.IsZero() {
+		started = record.UpdatedAt
+	}
+	return started
+}

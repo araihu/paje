@@ -1,0 +1,261 @@
+// Package codechange coordinates the provider-neutral code-change@v1 phases.
+package codechange
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"time"
+
+	"github.com/araihu/paje/internal/artifact"
+	"github.com/araihu/paje/internal/artifact/gitcapture"
+	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/memory"
+	"github.com/araihu/paje/internal/policy"
+	"github.com/araihu/paje/internal/publisher"
+	"github.com/araihu/paje/internal/repository"
+	"github.com/araihu/paje/internal/run"
+	"github.com/araihu/paje/internal/runner"
+	"github.com/araihu/paje/internal/template"
+	templatecodechange "github.com/araihu/paje/internal/template/codechange"
+	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workspace"
+)
+
+const (
+	maxCASAttempts      = 3
+	maxAgentPromptBytes = 1 << 20
+	maxCaptureBytes     = 10 << 20
+	cleanupTimeout      = 30 * time.Second
+)
+
+// ErrPhaseInProgress asks an outer adapter to retry rather than launch a
+// duplicate side-effecting attempt.
+var ErrPhaseInProgress = errors.New("workflow phase already in progress")
+
+// Dependencies is the complete provider-neutral port bundle used by the
+// code-change service.
+type Dependencies struct {
+	Templates    *template.Registry
+	Runs         run.Store
+	Memory       memory.Store
+	Resolver     repository.Resolver
+	Workspaces   workspace.Manager
+	Profiles     map[string]repository.Profile
+	Environments environment.Builder
+	Agent        runner.Runner
+	Verifier     verification.Runner
+	Capturer     gitcapture.Capturer
+	Policy       policy.Evaluator
+	Artifacts    artifact.Store
+	Publisher    publisher.Publisher
+	Clock        func() time.Time
+	NewID        func() string
+}
+
+// PhaseResult contains only durable values safe to pass between adapters.
+type PhaseResult struct {
+	RunID        string              `json:"run_id"`
+	Status       run.Status          `json:"status"`
+	Artifact     *artifact.Reference `json:"artifact,omitempty"`
+	FailureClass run.FailureClass    `json:"failure_class,omitempty"`
+	Retryable    bool                `json:"retryable"`
+}
+
+// Service implements the provider-neutral workflow phases.
+type Service struct {
+	templates    *template.Registry
+	runs         run.Store
+	memory       memory.Store
+	resolver     repository.Resolver
+	workspaces   workspace.Manager
+	profiles     map[string]repository.Profile
+	environments environment.Builder
+	agent        runner.Runner
+	verifier     verification.Runner
+	capturer     gitcapture.Capturer
+	policy       policy.Evaluator
+	artifacts    artifact.Store
+	publisher    publisher.Publisher
+	clock        func() time.Time
+	newID        func() string
+}
+
+// New validates and snapshots the workflow dependency bundle.
+func New(dependencies Dependencies) (*Service, error) {
+	required := []struct {
+		name  string
+		value any
+	}{
+		{"template registry", dependencies.Templates},
+		{"run store", dependencies.Runs},
+		{"memory store", dependencies.Memory},
+		{"repository resolver", dependencies.Resolver},
+		{"workspace manager", dependencies.Workspaces},
+		{"environment builder", dependencies.Environments},
+		{"agent runner", dependencies.Agent},
+		{"verification runner", dependencies.Verifier},
+		{"Git capturer", dependencies.Capturer},
+		{"change policy", dependencies.Policy},
+		{"artifact store", dependencies.Artifacts},
+		{"publisher", dependencies.Publisher},
+	}
+	for _, dependency := range required {
+		if isNil(dependency.value) {
+			return nil, fmt.Errorf("create code-change service: %s is required", dependency.name)
+		}
+	}
+	if dependencies.Clock == nil {
+		return nil, fmt.Errorf("create code-change service: clock is required")
+	}
+	if dependencies.NewID == nil {
+		return nil, fmt.Errorf("create code-change service: ID generator is required")
+	}
+	if _, err := dependencies.Templates.Resolve(templatecodechange.ID); err != nil {
+		return nil, fmt.Errorf("create code-change service: built-in template: %w", err)
+	}
+
+	profiles := make(map[string]repository.Profile, len(dependencies.Profiles))
+	for _, name := range []string{"generic", "go"} {
+		profile, ok := dependencies.Profiles[name]
+		if !ok || isNil(profile) || profile.Name() != name {
+			return nil, fmt.Errorf("create code-change service: profile %q is required", name)
+		}
+		profiles[name] = profile
+	}
+	if len(dependencies.Profiles) != len(profiles) {
+		for name, profile := range dependencies.Profiles {
+			if _, supported := profiles[name]; !supported || isNil(profile) || profile.Name() != name {
+				return nil, fmt.Errorf("create code-change service: invalid profile %q", name)
+			}
+		}
+	}
+
+	return &Service{
+		templates: dependencies.Templates, runs: dependencies.Runs,
+		memory: dependencies.Memory, resolver: dependencies.Resolver,
+		workspaces: dependencies.Workspaces, profiles: profiles,
+		environments: dependencies.Environments, agent: dependencies.Agent,
+		verifier: dependencies.Verifier, capturer: dependencies.Capturer,
+		policy: dependencies.Policy, artifacts: dependencies.Artifacts,
+		publisher: dependencies.Publisher, clock: dependencies.Clock,
+		newID: dependencies.NewID,
+	}, nil
+}
+
+func isNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflection := reflect.ValueOf(value)
+	switch reflection.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflection.IsNil()
+	default:
+		return false
+	}
+}
+
+func phaseResult(record run.Record) PhaseResult {
+	result := PhaseResult{RunID: record.ID, Status: record.Status}
+	if record.Artifact != nil {
+		reference := *record.Artifact
+		result.Artifact = &reference
+	}
+	if record.Failure != nil {
+		result.FailureClass = record.Failure.Class
+		result.Retryable = record.Failure.Retryable
+	}
+	return result
+}
+
+func phaseInProgress(record run.Record) (PhaseResult, error) {
+	result := phaseResult(record)
+	result.FailureClass = run.FailureInternal
+	result.Retryable = true
+	return result, ErrPhaseInProgress
+}
+
+type phaseError struct {
+	failure run.Failure
+	cause   error
+}
+
+func (e *phaseError) Error() string {
+	return fmt.Sprintf("%s phase failed (%s): %s", e.failure.Stage, e.failure.CauseCode, e.failure.Diagnostic)
+}
+
+func (e *phaseError) Unwrap() error { return e.cause }
+
+func newPhaseError(failure run.Failure, cause error) error {
+	return &phaseError{failure: failure, cause: cause}
+}
+
+type recordMutation func(run.Record) (run.Record, bool, error)
+
+func (s *Service) mutate(ctx context.Context, runID string, mutation recordMutation) (run.Record, error) {
+	var last error
+	for attempt := 0; attempt < maxCASAttempts; attempt++ {
+		current, err := s.runs.Load(ctx, runID)
+		if err != nil {
+			return run.Record{}, err
+		}
+		next, changed, err := mutation(current)
+		if err != nil {
+			return run.Record{}, err
+		}
+		if !changed {
+			return current, nil
+		}
+		saved, err := s.runs.Save(ctx, next, current.Version)
+		if err == nil {
+			return saved, nil
+		}
+		if !errors.Is(err, run.ErrVersionConflict) {
+			return run.Record{}, err
+		}
+		last = err
+	}
+	return run.Record{}, fmt.Errorf("persist run after %d CAS attempts: %w", maxCASAttempts, last)
+}
+
+func stageAttempt(record run.Record, name string) int {
+	attempt := 0
+	for _, stage := range record.Stages {
+		if stage.Name == name && stage.Attempts > attempt {
+			attempt = stage.Attempts
+		}
+	}
+	return attempt
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneMemories(source []memory.Memory) []memory.Memory {
+	if source == nil {
+		return []memory.Memory{}
+	}
+	cloned := make([]memory.Memory, len(source))
+	for index, item := range source {
+		cloned[index] = item
+		cloned[index].Metadata = cloneStringMap(item.Metadata)
+	}
+	return cloned
+}
+
+func canceledFailure(stage string) run.Failure {
+	return run.Failure{
+		Stage: stage, Class: run.FailureCanceled, Retryable: false,
+		Diagnostic: "caller canceled", CauseCode: "caller_canceled",
+	}
+}
