@@ -38,6 +38,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end }}
 
-{{- define "paje.secretName" -}}
-{{- default (include "paje.fullname" .) .Values.secrets.existingSecret }}
+{{- define "paje.hatchetSecretName" -}}
+{{- default (printf "%s-hatchet" (include "paje.fullname" .)) .Values.secrets.hatchet.existingSecret }}
+{{- end }}
+
+{{- define "paje.mem0SecretName" -}}
+{{- default (printf "%s-mem0" (include "paje.fullname" .)) .Values.secrets.mem0.existingSecret }}
+{{- end }}
+
+{{- define "paje.githubSecretName" -}}
+{{- default (printf "%s-github" (include "paje.fullname" .)) .Values.secrets.github.existingSecret }}
+{{- end }}
+
+{{- define "paje.pvcName" -}}
+{{- default (include "paje.fullname" .) .Values.persistence.existingClaim }}
 {{- end }}

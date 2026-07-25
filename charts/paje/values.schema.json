@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "replicaCount",
+    "adapters",
+    "publisher",
+    "persistence",
+    "limits",
+    "environment",
+    "secrets",
+    "codexAuth"
+  ],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "const": 1,
+      "description": "The beta uses process-local compare-and-swap and supports exactly one worker replica."
+    },
+    "adapters": {
+      "type": "object",
+      "required": ["memory", "workspace", "runner"],
+      "properties": {
+        "memory": {"type": "string", "enum": ["mock", "mem0"]},
+        "workspace": {"type": "string", "enum": ["mock", "git"]},
+        "runner": {"type": "string", "enum": ["mock", "local", "codex"]}
+      }
+    },
+    "publisher": {
+      "type": "object",
+      "required": ["adapter", "githubAPIURL"],
+      "properties": {
+        "adapter": {"type": "string", "enum": ["mock", "github"]},
+        "githubAPIURL": {"type": "string", "minLength": 1}
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "required": ["enabled", "existingClaim", "size", "accessModes"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "existingClaim": {"type": "string"},
+        "size": {"type": "string", "minLength": 1},
+        "storageClass": {"type": "string"},
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["artifactBytes", "commandOutputBytes"],
+      "properties": {
+        "artifactBytes": {"type": "integer", "minimum": 1},
+        "commandOutputBytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["allowlist"],
+      "properties": {
+        "allowlist": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "required": ["hatchet", "mem0", "github"],
+      "properties": {
+        "hatchet": {"$ref": "#/definitions/credential"},
+        "mem0": {"$ref": "#/definitions/credential"},
+        "github": {"$ref": "#/definitions/credential"}
+      }
+    },
+    "codexAuth": {
+      "type": "object",
+      "required": ["existingSecret"],
+      "properties": {
+        "existingSecret": {"type": "string"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "properties": {
+        "secrets": {
+          "properties": {
+            "hatchet": {"$ref": "#/definitions/configuredCredential"}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adapters": {
+            "properties": {"memory": {"const": "mem0"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "secrets": {
+            "properties": {
+              "mem0": {"$ref": "#/definitions/configuredCredential"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "publisher": {
+            "properties": {"adapter": {"const": "github"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "secrets": {
+            "properties": {
+              "github": {"$ref": "#/definitions/configuredCredential"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adapters": {
+            "properties": {"runner": {"const": "codex"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "codexAuth": {
+            "properties": {
+              "existingSecret": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "credential": {
+      "type": "object",
+      "required": ["existingSecret", "key", "value"],
+      "properties": {
+        "existingSecret": {"type": "string"},
+        "key": {"type": "string", "minLength": 1},
+        "value": {"type": "string"}
+      }
+    },
+    "configuredCredential": {
+      "allOf": [
+        {"$ref": "#/definitions/credential"},
+        {
+          "anyOf": [
+            {"properties": {"existingSecret": {"minLength": 1}}},
+            {"properties": {"value": {"minLength": 1}}}
+          ]
+        }
+      ]
+    }
+  }
+}

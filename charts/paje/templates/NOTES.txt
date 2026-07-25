@@ -9,3 +9,28 @@ Configured adapters:
   memory:    {{ .Values.adapters.memory }}
   workspace: {{ .Values.adapters.workspace }}
   runner:    {{ .Values.adapters.runner }}
+  publisher: {{ .Values.publisher.adapter }}
+
+Persistence:
+  enabled: {{ .Values.persistence.enabled }}
+{{- if .Values.persistence.enabled }}
+  claim:   {{ include "paje.pvcName" . }}
+{{- else }}
+  Runs and artifacts use ephemeral pod storage. Enable persistence before using
+  the beta workflow for durable work.
+{{- end }}
+
+Credential Secrets:
+  Hatchet: {{ include "paje.hatchetSecretName" . }}
+{{- if eq .Values.adapters.memory "mem0" }}
+  Mem0:    {{ include "paje.mem0SecretName" . }}
+{{- end }}
+{{- if eq .Values.publisher.adapter "github" }}
+  GitHub:  {{ include "paje.githubSecretName" . }}
+{{- end }}
+{{- if eq .Values.adapters.runner "codex" }}
+  Codex:   {{ .Values.codexAuth.existingSecret }} (read-only seed copied to writable CODEX_HOME)
+{{- end }}
+
+The beta uses process-local compare-and-swap and is intentionally limited to
+one replica.
