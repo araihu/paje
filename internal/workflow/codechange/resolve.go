@@ -56,7 +56,7 @@ func (s *Service) resolve(
 		return phaseResult(record), err
 	}
 	if requireOwner && !created && record.ID != runID {
-		return phaseResult(record), fmt.Errorf(
+		return PhaseResult{}, fmt.Errorf(
 			"resolve code-change input: durable run %q is owned by another trigger: %w",
 			record.ID,
 			run.ErrIdempotencyConflict,

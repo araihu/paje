@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -44,7 +45,11 @@ func resolveHandler(service phaseService) func(taskContext, map[string]any) (cod
 			return codechange.PhaseResult{}, err
 		}
 		return runPhase(ctx, service, "resolve", resolveRetries, func() (codechange.PhaseResult, error) {
-			return service.ResolveWithRunID(ctx, runID, raw)
+			result, resolveErr := service.ResolveWithRunID(ctx, runID, raw)
+			if errors.Is(resolveErr, run.ErrIdempotencyConflict) {
+				return codechange.PhaseResult{}, resolveErr
+			}
+			return result, resolveErr
 		})
 	}
 }

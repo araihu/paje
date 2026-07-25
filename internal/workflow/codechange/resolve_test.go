@@ -118,8 +118,8 @@ func TestResolveWithRunIDEnforcesSingleDurableOwner(t *testing.T) {
 	if !errors.Is(err, run.ErrIdempotencyConflict) {
 		t.Fatalf("ResolveWithRunID(observer) result=%#v error=%v, want %v", observer, err, run.ErrIdempotencyConflict)
 	}
-	if observer.RunID != "run-owner" {
-		t.Fatalf("observer conflict run ID = %q, want owner", observer.RunID)
+	if observer != (PhaseResult{}) {
+		t.Fatalf("observer conflict result = %#v, want no owner state", observer)
 	}
 	if fixture.resolver.calls != 1 || fixture.mem.calls != 1 {
 		t.Fatalf("observer reached external ports: resolver=%d memory=%d", fixture.resolver.calls, fixture.mem.calls)

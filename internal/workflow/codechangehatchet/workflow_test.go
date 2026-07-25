@@ -214,6 +214,55 @@ func TestDuplicateHatchetObserverCannotExhaustOwnerOnLastRetry(t *testing.T) {
 	}
 }
 
+func TestDuplicateHatchetObserverCannotInheritRetryableOwnerOnLastRetry(t *testing.T) {
+	service := &fakeService{
+		resolve: func(_ context.Context, _ string, _ json.RawMessage) (workflow.PhaseResult, error) {
+			return workflow.PhaseResult{
+				RunID: "run-owner", Status: run.StatusExecuting,
+				Retryable: true, FailureClass: run.FailureEnvironment,
+			}, run.ErrIdempotencyConflict
+		},
+	}
+	input := map[string]any{
+		"run_id": "run-observer",
+		"input":  map[string]any{"task_description": "same durable request"},
+	}
+
+	result, err := resolveHandler(service)(testTaskContext{retryCount: resolveRetries}, input)
+	if !errors.Is(err, run.ErrIdempotencyConflict) {
+		t.Fatalf("observer error = %v, want %v", err, run.ErrIdempotencyConflict)
+	}
+	if result != (workflow.PhaseResult{}) {
+		t.Fatalf("observer result = %#v, want empty result", result)
+	}
+	if got, want := service.calls, []serviceCall{{method: "resolve", runID: "run-observer"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("observer calls = %#v, want no owner Exhaust call", got)
+	}
+}
+
+func TestDuplicateHatchetObserverCannotInheritTerminalOwner(t *testing.T) {
+	service := &fakeService{
+		resolve: func(_ context.Context, _ string, _ json.RawMessage) (workflow.PhaseResult, error) {
+			return workflow.PhaseResult{RunID: "run-owner", Status: run.StatusFailed}, run.ErrIdempotencyConflict
+		},
+	}
+	input := map[string]any{
+		"run_id": "run-observer",
+		"input":  map[string]any{"task_description": "same durable request"},
+	}
+
+	result, err := resolveHandler(service)(testTaskContext{}, input)
+	if !errors.Is(err, run.ErrIdempotencyConflict) {
+		t.Fatalf("observer error = %v, want %v", err, run.ErrIdempotencyConflict)
+	}
+	if result != (workflow.PhaseResult{}) {
+		t.Fatalf("observer result = %#v, want no successful terminal parent result", result)
+	}
+	if got, want := service.calls, []serviceCall{{method: "resolve", runID: "run-observer"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("observer calls = %#v, want %#v", got, want)
+	}
+}
+
 func TestDownstreamHandlersPassOnlyParentRunID(t *testing.T) {
 	service := &fakeService{}
 	ctx := testTaskContext{parent: workflow.PhaseResult{RunID: "run-123"}}
