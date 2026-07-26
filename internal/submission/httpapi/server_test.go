@@ -466,6 +466,7 @@ func validSubmissionBody(description string) []byte {
     "repository_uri":"https://github.com/example/service.git",
     "base_ref":"main",
     "tags":{"user_id":"codex@example.com","app_id":"service"},
+    "worker_profile":"codex-go@1",
     "profile":"generic",
     "checks":[{"name":"test","directory":".","executable":"npm","args":["test"],"timeout":"10m","required":true}],
     "publication":{"mode":"artifact"}

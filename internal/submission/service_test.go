@@ -320,7 +320,8 @@ func testInput(repositoryURI, userID, appID, mode string) json.RawMessage {
 			"user_id": userID,
 			"app_id":  appID,
 		},
-		Profile: "generic",
+		WorkerProfile: "codex-go@1",
+		Profile:       "generic",
 		Checks: []verification.CommandSpec{{
 			Name:       "test",
 			Directory:  ".",
@@ -513,6 +514,7 @@ func TestSubmitStrictValidationAndSafeErrors(t *testing.T) {
 		principal func(submission.Principal) submission.Principal
 		request   func(submission.SubmitRequest) submission.SubmitRequest
 		marker    string
+		wantCause string
 	}{
 		{
 			name:      "missing idempotency key",
@@ -591,11 +593,13 @@ func TestSubmitStrictValidationAndSafeErrors(t *testing.T) {
 					"repository_uri":"https://github.com/example/service.git",
 					"base_ref":"main",
 					"tags":{"user_id":"codex@example.com","app_id":"service"},
+					"worker_profile":"codex-go@1",
 					"profile":"generic",
 					"publication":{"mode":"artifact"}
 				}`)
 				return request
 			},
+			wantCause: "generic profile requires at least one check",
 		},
 		{
 			name:      "shell-shaped check",
@@ -606,6 +610,7 @@ func TestSubmitStrictValidationAndSafeErrors(t *testing.T) {
 					"repository_uri":"https://github.com/example/service.git",
 					"base_ref":"main",
 					"tags":{"user_id":"codex@example.com","app_id":"service"},
+					"worker_profile":"codex-go@1",
 					"profile":"generic",
 					"checks":[{
 						"name":"test","directory":".","executable":"sh",
@@ -615,7 +620,8 @@ func TestSubmitStrictValidationAndSafeErrors(t *testing.T) {
 				}`)
 				return request
 			},
-			marker: "secret-marker",
+			marker:    "secret-marker",
+			wantCause: "executable must be one shell-free program",
 		},
 	}
 
@@ -632,8 +638,31 @@ func TestSubmitStrictValidationAndSafeErrors(t *testing.T) {
 			if test.marker != "" && strings.Contains(err.Error(), test.marker) {
 				t.Fatalf("Submit() error leaked %q: %v", test.marker, err)
 			}
+			if test.wantCause != "" && !errorTreeContains(err, test.wantCause) {
+				t.Fatalf("Submit() error tree = %v, want cause containing %q", err, test.wantCause)
+			}
 		})
 	}
+}
+
+func errorTreeContains(err error, marker string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), marker) {
+		return true
+	}
+	switch unwrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, cause := range unwrapped.Unwrap() {
+			if errorTreeContains(cause, marker) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return errorTreeContains(unwrapped.Unwrap(), marker)
+	}
+	return false
 }
 
 func TestSubmitCanonicalIdempotencyBinding(t *testing.T) {
@@ -658,6 +687,7 @@ func TestSubmitCanonicalIdempotencyBinding(t *testing.T) {
 				"required":true,"timeout":"10m","args":["test"],
 				"executable":"npm","directory":".","name":"test"
 			}],
+			"worker_profile":"codex-go@1",
 			"profile":"generic",
 			"tags":{"app_id":"service","user_id":"codex@example.com"},
 			"base_ref":"main",
@@ -827,6 +857,7 @@ func TestSubmitCanonicalIdempotencyBinding(t *testing.T) {
 			"base_ref":"main",
 			"memory_limit":0,
 			"tags":{"user_id":"codex@example.com","app_id":"service"},
+			"worker_profile":"codex-go@1",
 			"profile":"generic",
 			"checks":[{
 				"name":"test","directory":".","executable":"npm",

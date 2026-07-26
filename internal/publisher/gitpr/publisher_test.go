@@ -393,8 +393,6 @@ func TestNewRejectsMissingExecutorRegistryWithoutHostRunnerFallback(t *testing.T
 	fixture := newPublicationFixture(t)
 	dependencies := fixture.dependencies()
 	dependencies.Executors = nil
-	dependencies.VerificationEnvironment = make(map[string]string)
-	dependencies.VerificationEnvironment["GH_TOKEN"] = "must-not-reach-repository-code"
 	if got, err := New(dependencies); err == nil {
 		t.Fatalf("New() = %#v, nil error", got)
 	}

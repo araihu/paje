@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +25,12 @@ import (
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	"github.com/araihu/paje/internal/config"
 	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/executor/dockerengine"
+	"github.com/araihu/paje/internal/executor/host"
+	executormock "github.com/araihu/paje/internal/executor/mock"
+	"github.com/araihu/paje/internal/harness"
+	harnesscodex "github.com/araihu/paje/internal/harness/codex"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/memory/mem0"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
@@ -40,34 +47,81 @@ import (
 	codexrunner "github.com/araihu/paje/internal/runner/codex"
 	"github.com/araihu/paje/internal/runner/local"
 	runnermock "github.com/araihu/paje/internal/runner/mock"
+	"github.com/araihu/paje/internal/secret"
+	secretfilesystem "github.com/araihu/paje/internal/secret/filesystem"
+	secretprovider "github.com/araihu/paje/internal/secret/provider"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
+	workerprofilefilesystem "github.com/araihu/paje/internal/workerprofile/filesystem"
 	"github.com/araihu/paje/internal/workflow"
 	"github.com/araihu/paje/internal/workflow/codechange"
 	"github.com/araihu/paje/internal/workflow/codechangehatchet"
 	"github.com/araihu/paje/internal/workspace"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 	workspacemock "github.com/araihu/paje/internal/workspace/mock"
+	"golang.org/x/sys/unix"
 )
 
 const workerName = "paje-worker"
 
+const (
+	defaultSecretLeaseTTL    = 30 * time.Minute
+	maxRegistryAuthFileBytes = 1 << 20
+)
+
+var errCodeChangeCompatibilityDisabled = errors.New("portable code-change legacy compatibility port is disabled")
+
+// disabledCodeChangeRunner keeps the legacy runner-shaped compatibility port
+// fail-closed while portable execution is owned by the selected worker profile,
+// harness, and executor.
+type disabledCodeChangeRunner struct{}
+
+func (disabledCodeChangeRunner) Run(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
+	return runner.ExecutionResult{}, errCodeChangeCompatibilityDisabled
+}
+
+// disabledCodeChangeEnvironment prevents the portable workflow from acquiring
+// any ambient environment through its pre-migration compatibility port.
+type disabledCodeChangeEnvironment struct{}
+
+func (disabledCodeChangeEnvironment) Build(
+	context.Context,
+	environment.Request,
+) (environment.Result, error) {
+	return environment.Result{}, errCodeChangeCompatibilityDisabled
+}
+
+func (disabledCodeChangeEnvironment) Cleanup(context.Context, string) error {
+	return errCodeChangeCompatibilityDisabled
+}
+
+var (
+	_ runner.Runner       = disabledCodeChangeRunner{}
+	_ environment.Builder = disabledCodeChangeEnvironment{}
+)
+
 type runtimeDependencies struct {
-	memory        memory.Store
-	workspaces    workspace.Manager
-	resolver      repository.Resolver
-	runner        runner.Runner
-	runs          runpkg.Store
-	artifacts     artifact.Store
-	environments  environment.Builder
-	verifier      verification.Runner
-	profiles      map[string]repository.Profile
-	templates     *template.Registry
-	publisher     publisher.Publisher
-	orchestrator  *workflow.Orchestrator
-	codeChanges   *codechange.Service
-	closeArtifact func() error
+	memory         memory.Store
+	workspaces     workspace.Manager
+	resolver       repository.Resolver
+	runner         runner.Runner
+	runs           runpkg.Store
+	artifacts      artifact.Store
+	environments   environment.Builder
+	verifier       verification.Runner
+	profiles       map[string]repository.Profile
+	workerProfiles workerprofile.Registry
+	secretBindings secret.Registry
+	secrets        secret.Broker
+	executors      *executor.Registry
+	harnesses      *harness.Registry
+	templates      *template.Registry
+	publisher      publisher.Publisher
+	orchestrator   *workflow.Orchestrator
+	codeChanges    *codechange.Service
+	closeArtifact  func() error
 }
 
 func main() {
@@ -129,11 +183,12 @@ func run(ctx context.Context, getenv func(string) string) error {
 	}
 
 	log.Printf(
-		"paje: starting worker %q with memory=%s workspace=%s runner=%s",
+		"paje: starting worker %q with memory=%s workspace=%s runner=%s code_change_executor=%s",
 		workerName,
 		cfg.MemoryAdapter,
 		cfg.WorkspaceAdapter,
 		cfg.RunnerAdapter,
+		cfg.CodeChangeExecutor,
 	)
 	if err := worker.StartBlocking(ctx); err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
@@ -280,6 +335,15 @@ func buildBetaServices(cfg config.Config, dependencies *runtimeDependencies) err
 		return fmt.Errorf("build template registry: %w", err)
 	}
 	dependencies.templates = templates
+	workerProfiles, secretBindings, secrets, executors, harnesses, err := buildPortableRuntime(cfg)
+	if err != nil {
+		return err
+	}
+	dependencies.workerProfiles = workerProfiles
+	dependencies.secretBindings = secretBindings
+	dependencies.secrets = secrets
+	dependencies.executors = executors
+	dependencies.harnesses = harnesses
 
 	capturer, err := gitcapture.New()
 	if err != nil {
@@ -303,8 +367,10 @@ func buildBetaServices(cfg config.Config, dependencies *runtimeDependencies) err
 	service, err := codechange.New(codechange.Dependencies{
 		Templates: templates, Runs: dependencies.runs, Memory: dependencies.memory,
 		Resolver: dependencies.resolver, Workspaces: dependencies.workspaces,
-		Profiles: dependencies.profiles, Environments: environments,
-		Agent: dependencies.runner, Verifier: verifier, Capturer: capturer,
+		Profiles: dependencies.profiles, WorkerProfiles: workerProfiles,
+		SecretBindings: secretBindings, Secrets: secrets,
+		Executors: executors, Harnesses: harnesses, Environments: disabledCodeChangeEnvironment{},
+		Agent: disabledCodeChangeRunner{}, Verifier: verifier, Capturer: capturer,
 		Policy: changePolicy, Artifacts: dependencies.artifacts,
 		Publisher: publisherAdapter, Clock: time.Now, NewID: uuid.NewString,
 	})
@@ -313,6 +379,145 @@ func buildBetaServices(cfg config.Config, dependencies *runtimeDependencies) err
 	}
 	dependencies.codeChanges = service
 	return nil
+}
+
+func buildPortableRuntime(cfg config.Config) (
+	workerprofile.Registry,
+	secret.Registry,
+	secret.Broker,
+	*executor.Registry,
+	*harness.Registry,
+	error,
+) {
+	workerProfiles, err := workerprofilefilesystem.New(
+		cfg.WorkerProfileDirectory,
+		workerprofile.DefaultLimits(),
+	)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("build worker profile registry: %w", err)
+	}
+	secretBindings, err := secretfilesystem.New(
+		cfg.SecretBindingDirectory,
+		secretfilesystem.Config{AllowedEnvironmentTargets: cfg.SecretEnvironmentTargetAllowlist},
+	)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("build secret binding registry: %w", err)
+	}
+
+	providers := make(map[string]secret.Provider, 2)
+	if len(cfg.SecretFilesystemRoots) > 0 {
+		filesystemProvider, providerErr := secretprovider.NewFilesystem(secretprovider.FilesystemConfig{
+			AllowedRoots: cfg.SecretFilesystemRoots,
+			MaxBytes:     cfg.SecretProviderMaxBytes, MaxEntries: cfg.SecretProviderMaxEntries,
+			OwnerUID: os.Getuid(),
+		})
+		if providerErr != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("build filesystem secret provider: %w", providerErr)
+		}
+		providers["filesystem"] = filesystemProvider
+	}
+	if len(cfg.SecretEnvironmentSourceAllowlist) > 0 {
+		maxBytes := int(cfg.SecretProviderMaxBytes)
+		if maxBytes <= 0 || int64(maxBytes) != cfg.SecretProviderMaxBytes {
+			return nil, nil, nil, nil, nil, fmt.Errorf("build environment secret provider: byte limit is unsupported")
+		}
+		values := make(map[string]string, len(cfg.SecretEnvironment))
+		for key, value := range cfg.SecretEnvironment {
+			values[key] = value
+		}
+		environmentProvider, providerErr := secretprovider.NewEnvironment(secretprovider.EnvironmentConfig{
+			AllowedKeys: cfg.SecretEnvironmentSourceAllowlist,
+			MaxBytes:    maxBytes,
+			Lookup: func(key string) (string, bool) {
+				value, ok := values[key]
+				return value, ok
+			},
+		})
+		if providerErr != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("build environment secret provider: %w", providerErr)
+		}
+		providers["environment"] = environmentProvider
+	}
+	broker, err := secret.NewBroker(secretBindings, providers, secret.BrokerConfig{LeaseTTL: defaultSecretLeaseTTL})
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("build secret broker: %w", err)
+	}
+
+	codexHarness, err := harnesscodex.New(harnesscodex.SupportedVersion)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("build Codex harness: %w", err)
+	}
+	harnesses, err := harness.NewRegistry(codexHarness)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("build harness registry: %w", err)
+	}
+
+	registrations := make([]executor.Registration, 0, 2)
+	switch cfg.CodeChangeExecutor {
+	case "mock":
+		target := executormock.New()
+		registrations = append(registrations,
+			executor.Registration{RuntimeKind: workerprofile.RuntimeHost, Executor: target},
+			executor.Registration{RuntimeKind: workerprofile.RuntimeOCI, Executor: target},
+		)
+	case "host":
+		target, targetErr := host.New(host.Config{
+			Enabled: cfg.HostExecutorEnabled, ProductionOnly: cfg.ProductionOnly,
+		})
+		if targetErr != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("build host executor: %w", targetErr)
+		}
+		registrations = append(registrations,
+			executor.Registration{RuntimeKind: workerprofile.RuntimeHost, Executor: target},
+		)
+	case "docker":
+		registryAuth, authErr := readRegistryAuthFile(cfg.DockerRegistryAuthFile)
+		if authErr != nil {
+			return nil, nil, nil, nil, nil, authErr
+		}
+		target, targetErr := dockerengine.New(dockerengine.Config{
+			Endpoint: cfg.DockerEndpoint, RegistryAuth: registryAuth,
+		})
+		if targetErr != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("build Docker executor: %w", targetErr)
+		}
+		registrations = append(registrations,
+			executor.Registration{RuntimeKind: workerprofile.RuntimeOCI, Executor: target},
+		)
+	default:
+		return nil, nil, nil, nil, nil, fmt.Errorf("build portable runtime: unknown code-change executor %q", cfg.CodeChangeExecutor)
+	}
+	executors, err := executor.NewRegistry(registrations...)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("build executor registry: %w", err)
+	}
+	return workerProfiles, secretBindings, broker, executors, harnesses, nil
+}
+
+func readRegistryAuthFile(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return "", fmt.Errorf("build Docker executor: registry authorization file is invalid")
+	}
+	file := os.NewFile(uintptr(fd), "docker-registry-auth")
+	if file == nil {
+		_ = unix.Close(fd)
+		return "", fmt.Errorf("build Docker executor: registry authorization file is invalid")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("build Docker executor: registry authorization file is invalid")
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, maxRegistryAuthFileBytes+1))
+	auth := strings.TrimSpace(string(contents))
+	if err != nil || auth == "" || len(contents) > maxRegistryAuthFileBytes || strings.IndexByte(auth, 0) >= 0 {
+		return "", fmt.Errorf("build Docker executor: registry authorization file is invalid")
+	}
+	return auth, nil
 }
 
 func buildPublisher(
@@ -337,9 +542,8 @@ func buildPublisher(
 		}
 		adapter, err := gitpr.New(gitpr.Dependencies{
 			Artifacts: dependencies.artifacts, Workspaces: dependencies.workspaces,
-			Changes: capturer, Verification: dependencies.verifier,
-			VerificationEnvironment: publisherVerificationEnvironment(cfg.Environment),
-			PullRequests:            client, Credentials: credentials, PushURL: githubpublisher.PushURL,
+			Changes: capturer, Executors: dependencies.executors,
+			PullRequests: client, Credentials: credentials, PushURL: githubpublisher.PushURL,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("build GitHub Git-PR publisher: %w", err)
@@ -396,16 +600,4 @@ func (deterministicResolver) Resolve(
 		Ref:           ref,
 		SHA:           hex.EncodeToString(digest[:]),
 	}, nil
-}
-
-func publisherVerificationEnvironment(source map[string]string) map[string]string {
-	result := make(map[string]string)
-	for key, value := range source {
-		if strings.HasPrefix(key, "HATCHET_") || strings.HasPrefix(key, "MEM0_") ||
-			strings.HasPrefix(key, "GITHUB_") || key == "GH_TOKEN" || key == "CODEX_HOME" {
-			continue
-		}
-		result[key] = value
-	}
-	return result
 }

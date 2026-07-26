@@ -147,6 +147,9 @@ func TestResolveHandlerUnwrapsExactTemplateInputWithPreallocatedRunID(t *testing
 			if string(fields["task_description"]) != `"change it"` {
 				t.Fatalf("task_description = %s", fields["task_description"])
 			}
+			if string(fields["worker_profile"]) != `"codex-go@1"` {
+				t.Fatalf("worker_profile = %s", fields["worker_profile"])
+			}
 			if string(fields["future_field"]) != `{"nested":true}` {
 				t.Fatalf("future_field = %s", fields["future_field"])
 			}
@@ -158,6 +161,7 @@ func TestResolveHandlerUnwrapsExactTemplateInputWithPreallocatedRunID(t *testing
 		"input": map[string]any{
 			"task_description": "change it",
 			"repository_uri":   "https://example.test/repo.git",
+			"worker_profile":   "codex-go@1",
 			"future_field":     map[string]any{"nested": true},
 		},
 	}
@@ -199,7 +203,7 @@ func TestDuplicateHatchetObserverCannotExhaustOwnerOnLastRetry(t *testing.T) {
 	}
 	input := map[string]any{
 		"run_id": "run-observer",
-		"input":  map[string]any{"task_description": "same durable request"},
+		"input":  map[string]any{"task_description": "same durable request", "worker_profile": "codex-go@1"},
 	}
 
 	result, err := resolveHandler(service)(testTaskContext{retryCount: resolveRetries}, input)
@@ -225,7 +229,7 @@ func TestDuplicateHatchetObserverCannotInheritRetryableOwnerOnLastRetry(t *testi
 	}
 	input := map[string]any{
 		"run_id": "run-observer",
-		"input":  map[string]any{"task_description": "same durable request"},
+		"input":  map[string]any{"task_description": "same durable request", "worker_profile": "codex-go@1"},
 	}
 
 	result, err := resolveHandler(service)(testTaskContext{retryCount: resolveRetries}, input)
@@ -248,7 +252,7 @@ func TestDuplicateHatchetObserverCannotInheritTerminalOwner(t *testing.T) {
 	}
 	input := map[string]any{
 		"run_id": "run-observer",
-		"input":  map[string]any{"task_description": "same durable request"},
+		"input":  map[string]any{"task_description": "same durable request", "worker_profile": "codex-go@1"},
 	}
 
 	result, err := resolveHandler(service)(testTaskContext{}, input)

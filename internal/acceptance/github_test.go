@@ -11,11 +11,14 @@ import (
 	"github.com/araihu/paje/internal/artifact"
 	artifactfilesystem "github.com/araihu/paje/internal/artifact/filesystem"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
+	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/executor/host"
 	"github.com/araihu/paje/internal/publisher"
 	githubpublisher "github.com/araihu/paje/internal/publisher/github"
 	"github.com/araihu/paje/internal/publisher/gitpr"
 	"github.com/araihu/paje/internal/template"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 )
 
@@ -96,9 +99,8 @@ func TestGitHubPublicationAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capture GitHub acceptance artifact: %v", err)
 	}
-	executionMetadata, err := json.Marshal(artifact.ExecutionEvidence{
-		ExitCode: 0, Duration: 0, Started: true, Completed: true,
-	})
+	profile, executionEvidence, executors := githubAcceptancePortableRuntime(t, runID)
+	executionMetadata, err := json.Marshal(executionEvidence)
 	if err != nil {
 		t.Fatalf("encode GitHub acceptance execution metadata: %v", err)
 	}
@@ -107,7 +109,7 @@ func TestGitHubPublicationAcceptance(t *testing.T) {
 		t.Fatalf("create GitHub acceptance artifact store: %v", err)
 	}
 	t.Cleanup(func() { _ = artifactStore.Close() })
-	reference, err := artifactStore.Save(ctx, artifact.Bundle{
+	bundle := artifact.Bundle{
 		Manifest: artifact.Manifest{
 			RunID: runID, Template: template.ID{Name: "code-change", Version: 1},
 			Repository: repositoryURI, BaseSHA: revision.SHA, TreeSHA: captured.TreeSHA,
@@ -118,7 +120,8 @@ func TestGitHubPublicationAcceptance(t *testing.T) {
 		Verification:      []verification.Result{checkResult},
 		Preflight:         map[string]string{"base_sha": revision.SHA},
 		Warnings:          []string{},
-	})
+	}
+	reference, err := artifactStore.Save(ctx, bundle)
 	if err != nil {
 		t.Fatalf("persist GitHub acceptance artifact: %v", err)
 	}
@@ -137,7 +140,7 @@ func TestGitHubPublicationAcceptance(t *testing.T) {
 	}
 	publication, err := gitpr.New(gitpr.Dependencies{
 		Artifacts: artifactStore, Workspaces: workspaces, Changes: capturer,
-		Verification: verifier, VerificationEnvironment: verificationEnvironment,
+		Executors:    executors,
 		PullRequests: pullRequests, Credentials: credentials, PushURL: githubpublisher.PushURL,
 	})
 	if err != nil {
@@ -146,9 +149,11 @@ func TestGitHubPublicationAcceptance(t *testing.T) {
 	request := publisher.Request{
 		RunID: runID, Repository: repositoryURI, BaseSHA: revision.SHA,
 		TargetRef: baseRef, Branch: branch, Artifact: reference,
-		Title: "Pajé beta acceptance " + runID,
-		Body:  "Dedicated Pajé beta publication acceptance. Do not merge.",
-		Draft: true,
+		ArtifactManifest: bundle.Manifest, WorkerProfile: profile,
+		ExecutionEvidence: executionEvidence,
+		Title:             "Pajé beta acceptance " + runID,
+		Body:              "Dedicated Pajé beta publication acceptance. Do not merge.",
+		Draft:             true,
 	}
 
 	first, err := publication.Publish(ctx, request)
@@ -175,6 +180,59 @@ func TestGitHubPublicationAcceptance(t *testing.T) {
 	assertDirectoryEmpty(t, filepath.Join(workspaceRoot, "worktrees"))
 }
 
+func githubAcceptancePortableRuntime(
+	t *testing.T,
+	runID string,
+) (workerprofile.Snapshot, artifact.ExecutionEvidence, *executor.Registry) {
+	t.Helper()
+	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
+		APIVersion: workerprofile.APIVersionV1Alpha1,
+		Kind:       workerprofile.KindWorkerProfile,
+		Metadata:   workerprofile.ProfileID{Name: "github-acceptance", Revision: 1},
+		Runtime:    workerprofile.Runtime{Kind: workerprofile.RuntimeHost},
+		Harness:    workerprofile.Harness{ID: "codex", Version: "0.144.5"},
+	})
+	if err != nil {
+		t.Fatalf("canonicalize GitHub acceptance worker profile: %v", err)
+	}
+	target, err := host.New(host.Config{Enabled: true})
+	if err != nil {
+		t.Fatalf("create GitHub acceptance host executor: %v", err)
+	}
+	executors, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeHost,
+		Executor:    target,
+	})
+	if err != nil {
+		t.Fatalf("create GitHub acceptance executor registry: %v", err)
+	}
+	tools := artifact.ToolEvidenceList{}
+	attempts := artifact.AttemptEvidenceList{{
+		ID: executor.AttemptID{
+			RunID: runID, Stage: "execute", Attempt: 1,
+			StartedAt: time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC),
+			Purpose:   executor.PurposeAgent,
+		},
+		Created: true, Started: true, Completed: true,
+	}}
+	agentKeys := artifact.EnvironmentKeyList{}
+	verificationKeys := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
+	evidence := artifact.ExecutionEvidence{
+		ExitCode: 0, Started: true, Completed: true,
+		Profile: &artifact.WorkerProfileEvidence{
+			Name: profile.Metadata.Name, Revision: profile.Metadata.Revision, Digest: profile.Digest,
+		},
+		Runtime: &artifact.RuntimeEvidence{Kind: workerprofile.RuntimeHost},
+		Harness: &artifact.HarnessEvidence{
+			ID: profile.Harness.ID, DeclaredVersion: profile.Harness.Version,
+			ProbedVersion: profile.Harness.Version, ProbePassed: true,
+		},
+		Tools: &tools, Attempts: &attempts,
+		AgentEnvironmentKeys: &agentKeys, VerificationEnvironmentKeys: &verificationKeys,
+	}
+	return profile, evidence, executors
+}
+
 func assertPublicationBinding(
 	t *testing.T,
 	request publisher.Request,
@@ -190,7 +248,8 @@ func assertPublicationBinding(
 	wantMessage := request.Title + "\n\n" +
 		"Paje-Run-ID: " + request.RunID + "\n" +
 		"Paje-Base-SHA: " + request.BaseSHA + "\n" +
-		"Paje-Artifact-Digest: " + request.Artifact.Digest
+		"Paje-Artifact-Digest: " + request.Artifact.Digest + "\n" +
+		"Paje-Publisher-Verification-Digest: " + result.VerificationDigest
 	if remote.commitMessage != wantMessage {
 		t.Fatalf("remote commit message does not exactly match the deterministic title and trailers")
 	}

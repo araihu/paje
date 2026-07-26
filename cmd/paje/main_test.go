@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,19 +15,24 @@ import (
 	artifactfilesystem "github.com/araihu/paje/internal/artifact/filesystem"
 	"github.com/araihu/paje/internal/config"
 	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	executormock "github.com/araihu/paje/internal/executor/mock"
 	"github.com/araihu/paje/internal/memory/mem0"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
 	publishermock "github.com/araihu/paje/internal/publisher/mock"
 	runpkg "github.com/araihu/paje/internal/run"
 	runfilesystem "github.com/araihu/paje/internal/run/filesystem"
+	"github.com/araihu/paje/internal/runner"
 	codexrunner "github.com/araihu/paje/internal/runner/codex"
 	"github.com/araihu/paje/internal/runner/local"
 	runnermock "github.com/araihu/paje/internal/runner/mock"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 	workspacemock "github.com/araihu/paje/internal/workspace/mock"
 	hatchet "github.com/hatchet-dev/hatchet/sdks/go"
+	"golang.org/x/sys/unix"
 )
 
 func TestRunHardenedFailsBeforeReadingConfiguration(t *testing.T) {
@@ -90,6 +96,10 @@ func TestBuildDependenciesUsesMocksByDefault(t *testing.T) {
 	if dependencies.orchestrator == nil || dependencies.codeChanges == nil {
 		t.Fatalf("workflow services = legacy:%p beta:%p", dependencies.orchestrator, dependencies.codeChanges)
 	}
+	if dependencies.workerProfiles == nil || dependencies.secretBindings == nil ||
+		dependencies.secrets == nil || dependencies.executors == nil || dependencies.harnesses == nil {
+		t.Fatal("portable code-change dependencies are incomplete")
+	}
 	if _, err := dependencies.templates.Resolve(templatecodechange.ID); err != nil {
 		t.Errorf("resolve code-change@v1: %v", err)
 	}
@@ -125,26 +135,195 @@ func TestBuildDependenciesUsesConfiguredRealAdapters(t *testing.T) {
 func TestBuildDependenciesUsesCodexRunner(t *testing.T) {
 	t.Parallel()
 
-	dependencies, err := buildDependencies(config.Config{
-		MemoryAdapter:           "mock",
-		WorkspaceAdapter:        "mock",
-		RunnerAdapter:           "codex",
-		PublisherAdapter:        "mock",
-		WorkspaceRoot:           filepathForTestRoot(t, "workspaces"),
-		RunRoot:                 filepathForTestRoot(t, "runs"),
-		ArtifactRoot:            filepathForTestRoot(t, "artifacts"),
-		RuntimeRoot:             filepathForTestRoot(t, "runtime"),
-		ArtifactLimitBytes:      10 << 20,
-		CommandOutputLimitBytes: 1 << 20,
-		RunnerCommand:           os.Args[0],
-		CodexHome:               "/codex-home",
-	})
+	cfg := mockConfig(t)
+	cfg.RunnerAdapter = "codex"
+	cfg.RunnerCommand = os.Args[0]
+	cfg.CodexHome = "/codex-home"
+	dependencies, err := buildDependencies(cfg)
 	if err != nil {
 		t.Fatalf("buildDependencies() error = %v", err)
 	}
 	if _, ok := dependencies.runner.(*codexrunner.Runner); !ok {
 		t.Errorf("runner dependency = %T, want *codex.Runner", dependencies.runner)
 	}
+	profile, err := dependencies.workerProfiles.Resolve(
+		context.Background(), workerprofile.ProfileID{Name: "codex-go", Revision: 1},
+	)
+	if err != nil {
+		t.Fatalf("resolve portable profile: %v", err)
+	}
+	portableExecutor, err := dependencies.executors.Resolve(profile)
+	if err != nil {
+		t.Fatalf("resolve portable executor: %v", err)
+	}
+	if _, ok := portableExecutor.(*executormock.Executor); !ok {
+		t.Errorf("portable executor = %T, want *executor/mock.Executor", portableExecutor)
+	}
+}
+
+func TestBuildDependenciesKeepsPortableCodeChangeIndependentFromLegacyRunner(t *testing.T) {
+	for _, runnerAdapter := range []string{"mock", "local", "codex"} {
+		runnerAdapter := runnerAdapter
+		t.Run(runnerAdapter, func(t *testing.T) {
+			cfg := mockConfig(t)
+			legacyCommand := t.TempDir() + "/legacy-runner"
+			if err := os.WriteFile(legacyCommand, []byte("#!/bin/sh\n: > \"$0.invoked\"\nexit 97\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cfg.RunnerAdapter = runnerAdapter
+			cfg.RunnerCommand = legacyCommand
+			cfg.RunnerArgs = []string{"legacy-config"}
+			cfg.CodexHome = "/legacy-codex-home"
+			cfg.Environment = map[string]string{
+				"PATH": "/legacy-only/bin", "LEGACY_ONLY": "legacy-secret",
+			}
+			cfg.EnvironmentAllowlist = []string{"LEGACY_ONLY"}
+
+			dependencies, err := buildDependencies(cfg)
+			if err != nil {
+				t.Fatalf("buildDependencies() error = %v", err)
+			}
+			t.Cleanup(func() { _ = dependencies.Close() })
+			if err := os.MkdirAll(cfg.WorkspaceRoot+"/workspace-1", 0o700); err != nil {
+				t.Fatal(err)
+			}
+			assertCodeChangeCompatibilityPortsFailClosed(t, dependencies.codeChanges)
+
+			profile, err := dependencies.workerProfiles.Resolve(
+				context.Background(), workerprofile.ProfileID{Name: "codex-go", Revision: 1},
+			)
+			if err != nil {
+				t.Fatalf("resolve portable profile: %v", err)
+			}
+			portable, err := dependencies.executors.Resolve(profile)
+			if err != nil {
+				t.Fatalf("resolve portable executor: %v", err)
+			}
+			target, ok := portable.(*executormock.Executor)
+			if !ok {
+				t.Fatalf("portable executor = %T, want *executor/mock.Executor", portable)
+			}
+			revision, err := (deterministicResolver{}).Resolve(
+				context.Background(), "https://example.test/repository.git", "main",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+				result := executor.Result{Created: true, Started: true, Completed: true}
+				switch {
+				case request.Attempt.Purpose == executor.PurposeProbe && request.Command.Executable == "codex":
+					result.Stdout = []byte("codex " + harnessCodexVersion)
+					result.SafeFacts = map[string]string{
+						"runtime_kind": "host", "isolated": "false", "certified": "false",
+					}
+				case request.Attempt.Purpose == executor.PurposeProbe &&
+					request.Command.Executable == "git" && len(request.Command.Args) > 0 &&
+					request.Command.Args[0] == "rev-parse":
+					result.Stdout = []byte(revision.SHA + "\n")
+				case request.Attempt.Purpose == executor.PurposeAgent:
+					result.Stdout = []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"portable agent ran\"}}\n{\"type\":\"turn.completed\"}\n")
+				}
+				target.SetResult(request.Attempt, result, nil)
+			})
+
+			resolved, err := dependencies.codeChanges.Resolve(context.Background(), json.RawMessage(`{
+				"task_description":"exercise portable code change",
+				"repository_uri":"https://example.test/repository.git",
+				"base_ref":"main",
+				"tags":{"user_id":"test-user","app_id":"test-app"},
+				"worker_profile":"codex-go@1",
+				"profile":"generic",
+				"checks":[{"name":"test","directory":".","executable":"go","args":["test"],"timeout":"1m","required":true}],
+				"publication":{"mode":"artifact"}
+			}`))
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+			executed, executeErr := dependencies.codeChanges.Execute(context.Background(), resolved.RunID)
+
+			requests := target.Requests()
+			sawHarnessProbe := false
+			sawAgent := false
+			for _, request := range requests {
+				if request.Environment["PATH"] != "/usr/local/bin:/usr/bin:/bin" ||
+					request.Environment["CODEX_HOME"] != "" || request.Environment["LEGACY_ONLY"] != "" {
+					t.Errorf("portable request environment = %#v, want fixed secret-free sandbox baseline", request.Environment)
+				}
+				if request.Attempt.Purpose == executor.PurposeProbe && request.Command.Executable == "codex" {
+					sawHarnessProbe = true
+				}
+				if request.Attempt.Purpose == executor.PurposeAgent {
+					sawAgent = true
+					if request.Command.Executable != "codex" ||
+						!containsAll(request.Command.Args, "exec", "--ephemeral", "--ignore-user-config") {
+						t.Errorf("portable agent command = %q %#v", request.Command.Executable, request.Command.Args)
+					}
+				}
+				request.Destroy()
+			}
+			if !sawHarnessProbe || !sawAgent {
+				record, _ := dependencies.runs.Load(context.Background(), resolved.RunID)
+				t.Fatalf(
+					"Execute() = (%#v, %v), record failure = %#v, portable request count = %d, want Codex harness probe and agent execution",
+					executed, executeErr, record.Failure, len(requests),
+				)
+			}
+			if _, err := os.Stat(legacyCommand + ".invoked"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("legacy runner invocation marker error = %v, want not-exist", err)
+			}
+		})
+	}
+}
+
+const harnessCodexVersion = "0.144.5"
+
+func assertCodeChangeCompatibilityPortsFailClosed(t *testing.T, service any) {
+	t.Helper()
+	value := reflect.ValueOf(service).Elem()
+	agentType := value.FieldByName("agent").Elem().Type()
+	environmentType := value.FieldByName("environments").Elem().Type()
+	if agentType.String() != "main.disabledCodeChangeRunner" ||
+		environmentType.String() != "main.disabledCodeChangeEnvironment" {
+		t.Errorf(
+			"code-change compatibility ports = %s/%s, want fixed disabled ports",
+			agentType, environmentType,
+		)
+		return
+	}
+	agent := reflect.Zero(agentType).Interface().(runner.Runner)
+	result, err := agent.Run(context.Background(), runner.RunRequest{
+		TaskDescription: "must fail", WorkspacePath: t.TempDir(), Env: map[string]string{"PATH": "/bin"},
+	})
+	if err == nil || result != (runner.ExecutionResult{}) {
+		t.Fatalf("disabled compatibility runner = (%#v, %v), want zero result and error", result, err)
+	}
+	environments := reflect.Zero(environmentType).Interface().(environment.Builder)
+	built, err := environments.Build(context.Background(), environment.Request{
+		RunID: "run-compatibility", Stage: environment.StageAgent,
+	})
+	if err == nil || len(built.Values) != 0 {
+		t.Fatalf("disabled compatibility environment Build() = (%#v, %v), want no values and error", built, err)
+	}
+	if err := environments.Cleanup(context.Background(), "run-compatibility"); err == nil {
+		t.Fatal("disabled compatibility environment Cleanup() error = nil")
+	}
+}
+
+func containsAll(values []string, required ...string) bool {
+	for _, want := range required {
+		found := false
+		for _, value := range values {
+			if value == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func TestBuildDependenciesIsolatesAgentEnvironment(t *testing.T) {
@@ -319,32 +498,128 @@ func TestBuildDependenciesRejectsUnknownRunnerSelection(t *testing.T) {
 	}
 }
 
-func mockConfig(t *testing.T) config.Config {
-	t.Helper()
-	root := t.TempDir()
-	return config.Config{
-		HatchetClientToken:      "hatchet-token",
-		MemoryAdapter:           "mock",
-		WorkspaceAdapter:        "mock",
-		RunnerAdapter:           "mock",
-		PublisherAdapter:        "mock",
-		WorkspaceRoot:           root + "/workspaces",
-		RunRoot:                 root + "/runs",
-		ArtifactRoot:            root + "/artifacts",
-		RuntimeRoot:             root + "/runtime",
-		ArtifactLimitBytes:      10 << 20,
-		CommandOutputLimitBytes: 1 << 20,
-		RunnerCommand:           "codex",
-		RunnerArgs:              []string{"exec"},
-		EnvironmentAllowlist:    []string{},
-		Environment:             map[string]string{"PATH": os.Getenv("PATH")},
-		GitHubAPIURL:            "https://api.github.com",
+func TestReadRegistryAuthFileRejectsEmptyOrInsecureMaterial(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		body string
+		mode os.FileMode
+	}{
+		{name: "empty", body: " \n", mode: 0o600},
+		{name: "group-readable", body: "registry-auth", mode: 0o640},
+		{name: "oversized", body: strings.Repeat("a", maxRegistryAuthFileBytes+1), mode: 0o600},
+		{name: "nul", body: "registry\x00auth", mode: 0o600},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := t.TempDir() + "/registry-auth"
+			if err := os.WriteFile(path, []byte(test.body), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readRegistryAuthFile(path); err == nil {
+				t.Fatal("readRegistryAuthFile() error = nil")
+			}
+		})
 	}
 }
 
-func filepathForTestRoot(t *testing.T, name string) string {
+func TestReadRegistryAuthFileLoadsOnlyThePrivateRegularFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := root + "/registry-auth"
+	if err := os.WriteFile(path, []byte("registry-auth\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readRegistryAuthFile(path)
+	if err != nil {
+		t.Fatalf("readRegistryAuthFile() error = %v", err)
+	}
+	if got != "registry-auth" {
+		t.Fatal("readRegistryAuthFile() did not return the exact trimmed authorization")
+	}
+	link := root + "/registry-auth-link"
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readRegistryAuthFile(link); err == nil {
+		t.Fatal("readRegistryAuthFile(symlink) error = nil")
+	}
+	if _, err := readRegistryAuthFile(root); err == nil {
+		t.Fatal("readRegistryAuthFile(directory) error = nil")
+	}
+}
+
+func TestReadRegistryAuthFileRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := t.TempDir() + "/registry-auth-fifo"
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := readRegistryAuthFile(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("readRegistryAuthFile(FIFO) error = nil")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("readRegistryAuthFile(FIFO) blocked waiting for a writer")
+	}
+}
+
+func mockConfig(t *testing.T) config.Config {
 	t.Helper()
-	return t.TempDir() + "/" + name
+	root := t.TempDir()
+	profileRoot := root + "/worker-profiles"
+	bindingRoot := root + "/secret-bindings"
+	if err := os.MkdirAll(profileRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bindingRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(profileRoot+"/codex-go.yaml", []byte(`api_version: paje.araihu.com/v1alpha1
+kind: WorkerProfile
+metadata:
+  name: codex-go
+  revision: 1
+runtime:
+  kind: host
+harness:
+  id: codex
+  version: 0.144.5
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return config.Config{
+		HatchetClientToken:       "hatchet-token",
+		MemoryAdapter:            "mock",
+		WorkspaceAdapter:         "mock",
+		RunnerAdapter:            "mock",
+		PublisherAdapter:         "mock",
+		WorkspaceRoot:            root + "/workspaces",
+		RunRoot:                  root + "/runs",
+		ArtifactRoot:             root + "/artifacts",
+		RuntimeRoot:              root + "/runtime",
+		ArtifactLimitBytes:       10 << 20,
+		CommandOutputLimitBytes:  1 << 20,
+		RunnerCommand:            "codex",
+		RunnerArgs:               []string{"exec"},
+		EnvironmentAllowlist:     []string{},
+		Environment:              map[string]string{"PATH": os.Getenv("PATH")},
+		GitHubAPIURL:             "https://api.github.com",
+		WorkerProfileDirectory:   profileRoot,
+		SecretBindingDirectory:   bindingRoot,
+		CodeChangeExecutor:       "mock",
+		SecretProviderMaxBytes:   1 << 20,
+		SecretProviderMaxEntries: 1024,
+		SecretEnvironment:        map[string]string{},
+	}
 }
 
 func persistentTestBundle() artifact.Bundle {

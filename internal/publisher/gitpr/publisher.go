@@ -65,18 +65,13 @@ type Credentials interface {
 
 // Dependencies are the ports needed for immutable Git publication.
 type Dependencies struct {
-	Artifacts  artifact.Store
-	Workspaces workspace.Manager
-	Changes    gitcapture.Capturer
-	Executors  *executor.Registry
-	// Verification and VerificationEnvironment remain only so the frozen
-	// composition/acceptance fixtures can migrate in PW-11/12. They are never
-	// retained or used by the publisher.
-	Verification            verification.Runner
-	VerificationEnvironment map[string]string
-	PullRequests            PullRequests
-	Credentials             Credentials
-	PushURL                 func(repository string) (string, error)
+	Artifacts    artifact.Store
+	Workspaces   workspace.Manager
+	Changes      gitcapture.Capturer
+	Executors    *executor.Registry
+	PullRequests PullRequests
+	Credentials  Credentials
+	PushURL      func(repository string) (string, error)
 }
 
 // Publisher applies, verifies, and publishes an artifact.
