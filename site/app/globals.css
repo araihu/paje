@@ -66,8 +66,38 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 .desktop-nav a { transition: color 160ms ease; }
 .desktop-nav a:hover { color: var(--blue); }
 
-.github-button {
+.topbar-actions {
   justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.language-switcher {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, .42);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .045em;
+}
+
+.language-switcher a {
+  padding: 7px 8px;
+  border-radius: 2px;
+  color: #686d71;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+.language-switcher a:hover { color: var(--blue); }
+.language-switcher a.selected { background: var(--ink); color: white; }
+.language-switcher a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.github-button {
   display: inline-flex;
   align-items: center;
   gap: 14px;
@@ -181,6 +211,7 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 .text-button.light { color: white; }
 
 .hero-note { display: flex; align-items: center; gap: 12px; margin-top: 42px; color: #74787c; font-family: var(--font-geist-mono), monospace; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.hero-principle { display: inline-flex; align-items: center; gap: 12px; }
 .hero-note i { width: 3px; height: 3px; border-radius: 50%; background: #9da09f; }
 
 .run-card {
@@ -193,7 +224,7 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 }
 
 .run-card::after {
-  content: "PERSISTED";
+  content: attr(data-stamp);
   position: absolute;
   right: -30px;
   top: 84px;
@@ -363,7 +394,10 @@ footer > div a { color: var(--ink); display: inline-flex; gap: 7px; }
   .topbar { height: 70px; }
   .brand { font-size: 17px; }
   .brand-mark { width: 31px; height: 31px; }
-  .github-button { padding: 9px 11px; gap: 8px; }
+  .topbar-actions { gap: 7px; }
+  .language-switcher { font-size: 8px; }
+  .language-switcher a { padding: 7px 6px; }
+  .github-button { padding: 9px 9px; gap: 6px; }
   .hero { min-height: auto; padding: 62px 0 72px; gap: 62px; }
   .status-pill { margin-bottom: 28px; }
   .hero h1 { font-size: clamp(51px, 15vw, 74px); }

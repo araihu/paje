@@ -1,6 +1,11 @@
 import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import { Geist, Geist_Mono } from "next/font/google";
+import {
+  catalogs,
+  localeFromRequestHeader,
+  type Locale,
+} from "./i18n/catalogs";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -20,33 +25,54 @@ async function metadataBase() {
   return new URL(`${protocol}://${host}`);
 }
 
+async function requestLocale(): Promise<Locale> {
+  const incoming = await headers();
+  return localeFromRequestHeader(incoming.get("x-paje-locale"));
+}
+
 export async function generateMetadata(): Promise<Metadata> {
+  const locale = await requestLocale();
+  const copy = catalogs[locale];
+  const canonical = `/${locale}`;
+  const alternateLocales = ["en_US", "pt_BR", "es_ES"].filter(
+    (candidate) => candidate !== copy.metadata.openGraphLocale,
+  );
+
   return {
     metadataBase: await metadataBase(),
-    title: "Pajé — Orquestração durável pilotada pelo agente",
-    description:
-      "Projetado para o agente pilotar via hooks e skills. Pajé torna mudanças duráveis em qualquer linguagem, com Codex como primeiro harness.",
+    title: copy.metadata.title,
+    description: copy.metadata.description,
     applicationName: "Pajé",
-    alternates: { canonical: "/" },
+    alternates: {
+      canonical,
+      languages: {
+        en: "/en",
+        "pt-BR": "/pt-br",
+        es: "/es",
+        "x-default": "/en",
+      },
+    },
     openGraph: {
       type: "website",
-      locale: "pt_BR",
+      url: canonical,
+      locale: copy.metadata.openGraphLocale,
+      alternateLocale: alternateLocales,
       siteName: "Pajé",
-      title: "Pajé — Do pedido ao pull request. Sem perder o fio.",
-      description: "Projetado para o agente pilotar, independente da linguagem e com Codex como primeiro harness.",
+      title: copy.metadata.openGraphTitle,
+      description: copy.metadata.openGraphDescription,
       images: [
         {
           url: "/og.png",
           width: 1731,
           height: 909,
-          alt: "Pajé — Do pedido ao pull request. Sem perder o fio.",
+          alt: copy.metadata.socialImageAlt,
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
-      title: "Pajé — Do pedido ao pull request. Sem perder o fio.",
-      description: "Projetado para o agente pilotar, independente da linguagem e com Codex como primeiro harness.",
+      title: copy.metadata.openGraphTitle,
+      description: copy.metadata.openGraphDescription,
       images: ["/og.png"],
     },
   };
@@ -57,9 +83,11 @@ export const viewport: Viewport = {
   themeColor: "#f2efe7",
 };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+  const locale = await requestLocale();
+
   return (
-    <html lang="pt-BR">
+    <html lang={catalogs[locale].htmlLang}>
       <body className={`${geistSans.variable} ${geistMono.variable}`}>{children}</body>
     </html>
   );
