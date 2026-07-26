@@ -7,36 +7,57 @@ independent positioning audit of repository commit `df9137b`. This document
 supersedes ambiguous product-positioning language; it does not replace the
 durable `code-change@v1` design.
 
+Corrected on 2026-07-25 to make agent-facing orchestration explicit core scope.
+The earlier submit/status/wait/cancel proposal remains a required leaf-run
+surface, but submission alone is not orchestration. This revision productizes
+the durable coordination behavior defined by the installed
+`orchestrating-control-planes` protocol while preserving the approved portable
+worker, secret-broker, isolated-executor, approval, artifact, and publisher
+boundaries.
+The installed skill is the behavioral reference used to write this contract,
+not a runtime dependency or a provider-specific API imported by Pajé.
+
 The repository state inspected for this design is `86537ae`. The current beta
 implementation remains the source of truth for shipped behavior until the
 implementation plan for this design is completed.
 
 ## Canonical Product Position
 
-Pajé is a self-hosted durable orchestration system for code agents. Pajé is
-implemented in Go, while its workflow contract is repository-language-neutral:
-`code-change@v1` supports an explicit `generic` profile for any toolchain
-available in the worker image and a first-class `go` profile with Go-specific
-discovery and defaults.
+Pajé is a self-hosted durable Agent Control Plane for code agents. It lets one
+control agent turn a long specification into a dependency graph, coordinate
+parallel child sessions across one or more unrelated projects, steer and
+integrate their work, survive coordinator restart, and prove that every
+placement reached its capability-appropriate terminal state and every
+persistent child session was archived. Pajé is implemented in Go, while its
+workflow and agent-harness contracts are repository-language-neutral:
+`code-change@v1`
+supports an explicit `generic` profile for any toolchain available in the
+worker image and a first-class `go` profile with Go-specific discovery and
+defaults.
 
 Pajé is designed to be piloted by an agent through an installable harness
-integration. The current beta is still triggered directly through Hatchet.
-Codex is the first dedicated execution harness and will become the first fully
-integrated harness when the agent-side submission skill and lifecycle hooks in
-this design ship. Additional dedicated harnesses are a planned extension point,
-not a currently shipped capability.
+integration. The current beta is still triggered directly through Hatchet and
+executes one Codex process at a time. Codex becomes the first fully integrated
+harness only when the plugin, deterministic client, durable Agent Control Plane,
+capability-aware agent-work adapter, and live multi-agent acceptance in this
+design ship.
+Additional dedicated harnesses are a planned extension point, not a currently
+shipped capability.
 
 The canonical short form is:
 
 > Pajé is implemented in Go, works with repositories in any language through
-> explicit profiles and checks, and makes agent-driven code changes durable.
-> The beta uses Hatchet as its direct trigger and Codex as its first dedicated
-> execution harness. A scoped agent-side submission surface and additional
-> certified harnesses are planned capabilities.
+> explicit profiles and checks, and provides a durable Agent Control Plane for
+> long-running, multi-agent code changes. The beta uses Hatchet as its direct
+> leaf-workflow trigger and Codex as its first dedicated execution harness.
+> Scoped agent-side orchestration, including capability-aware placement,
+> persistent child-session lifecycle, and multi-project coordination, is planned
+> by this design.
 
 ## Why This Design Exists
 
-The independent audit found four different truths being collapsed into one
+The independent audit and subsequent control-plane review found six different
+truths being collapsed into one
 marketing claim:
 
 1. Pajé currently launches an agent; the agent does not yet have a supported
@@ -47,17 +68,36 @@ marketing claim:
    harness, although the low-level `local` runner existed first.
 4. The core runner port admits more adapters, but no second dedicated harness
    has been selected, packaged, or accepted.
+5. A submit/status/wait/cancel API makes one durable leaf run accessible; it
+   does not let a control agent create, message, steer, reconcile, integrate, or
+   archive a graph of child sessions.
+6. Fixed internal workflow phases and one black-box Codex process do not model
+   multi-project ownership, dependency handoffs, restart-safe child identity,
+   callback recovery, or graph closure.
 
-The missing product layer is therefore not another workflow template. It is a
-safe control plane between an agent harness and the existing Hatchet trigger,
-plus an explicit definition of what “supported harness” means.
+The missing product layer is therefore not another workflow template or only a
+submission gateway. It is a provider-neutral durable Agent Control Plane
+between an agent harness, session runtimes, and existing leaf workflows, plus
+an explicit definition of what "supported harness" means.
 
 ## Goals
 
-- Let an external code agent deliberately submit, inspect, wait for, and cancel
-  a Pajé run through its harness integration.
-- Ship an installable Codex integration made of a focused skill, lifecycle
-  hooks, and a deterministic client.
+- Let one external control agent deliberately create and resume a durable
+  `ControlRun` from a long specification.
+- Persist the task graph, exact projects, dependencies, ownership, child
+  sessions, placement attempts, scoped messages, evidence, dispositions,
+  integration order, and close state independently of one coordinator process.
+- Let the control agent discover per-primitive capabilities and dispatch,
+  observe, send to, wait for, interrupt/cancel, and close work, including
+  persistent child-session archive, without receiving a runtime-provider or
+  Hatchet credential.
+- Support ready independent children across multiple and unrelated projects
+  concurrently, with separate workspaces, credentials, ownership, and scoped
+  communication.
+- Preserve deliberate submit, inspect, wait, and cancel as the leaf
+  `code-change@v1` run surface.
+- Ship an installable Codex integration made of focused Pajé skills, bounded
+  lifecycle hooks, and a deterministic `paje-agent` client.
 - Put a narrow Pajé authorization boundary in front of Hatchet so an agent
   never receives a worker, publisher, memory, or Hatchet service credential.
 - Preserve the existing outer Hatchet envelope and the provider-neutral
@@ -82,8 +122,9 @@ plus an explicit definition of what “supported harness” means.
 - Automatically inferring that any user prompt should become a Pajé run.
 - Allowing repository-owned files or hooks to mint, widen, or read submission
   credentials.
-- Adding a general workflow DSL, arbitrary shell commands, multiple worker
-  replicas, automatic merge, or direct pushes to target branches.
+- Adding an arbitrary workflow or shell-command DSL, multiple worker replicas,
+  automatic merge, or direct pushes to target branches. The bounded
+  `TaskGraph` is an agent-coordination model, not a command DSL.
 - Bundling every repository-language toolchain in the standard worker image.
 - Calling the generic `local` process adapter a certified harness.
 - Selecting or implementing a second dedicated harness before the evidence
@@ -98,6 +139,76 @@ plus an explicit definition of what “supported harness” means.
 A trigger accepts a validated request to start a durable workflow. Hatchet is
 the current trigger provider. The planned submission service is the stable
 Pajé-facing boundary over that provider.
+
+### Agent Control Plane
+
+The provider-neutral durable service that owns a `ControlRun`, its `TaskGraph`,
+placement attempts, persistent `AgentSession` lifecycles, scoped mailboxes,
+evidence, dispositions, and close gate. Hatchet may schedule leaf workflows,
+but Hatchet tasks and events are not the public Agent Control Plane model.
+
+### Control run
+
+A durable orchestration instance created from one long goal or specification.
+It owns a graph revision, safe principal and policy binding, project
+references, event cursor, task, placement-attempt, and persistent-session state,
+integration evidence, and close state.
+
+### Project reference
+
+An immutable, principal-scoped repository identity and exact base SHA plus its
+workspace and credential policy. Two `ProjectRef` values may name unrelated
+repositories. A child receives only the references assigned to its task.
+
+### Task graph and task
+
+`TaskGraph` is a versioned DAG of bounded `Task` records. A task contains one
+goal, predecessor IDs, assigned projects, frozen inputs, exclusive ownership,
+forbidden paths, acceptance gates, integration order, and current state. Graph
+updates use durable compare-and-swap and may not invalidate an active task's
+frozen boundary.
+
+### Ownership
+
+A validated set of exclusive mutable paths or resources plus explicit
+parent-owned and forbidden paths. Ready tasks with overlapping ownership do
+not run concurrently. Shared integration files remain parent-owned unless
+exactly one task owns them and every other task is forbidden from editing them.
+
+### Agent session
+
+A persistent, separately addressable logical child bound to one task and one
+runtime-returned child ID. It records capability snapshot, dispatch
+fingerprint, runtime-ID acknowledgement, lifecycle state, mailbox cursor,
+completion state, disposition, and archive receipt. `AgentSession` is created
+only for `persistent_session`; an ephemeral subagent, native fan-out item, or
+execution-harness process is not automatically an `AgentSession`.
+
+### Placement attempt
+
+A durable execution record created for every task placement. It binds the
+selected primitive, capability snapshot, rationale, lifecycle owner, action
+IDs, optional runtime work IDs, observation cursor, terminal evidence,
+disposition, and primitive-specific close evidence. It never invents a session
+or child identity that the harness did not return.
+
+### Mailbox and event cursor
+
+An append-only, control-run-scoped stream of bounded messages and lifecycle
+events. Every read and wait accepts an `after_cursor`; every returned event has
+a monotonic cursor. A task or session can address only its parent, children,
+declared dependencies, and explicitly shared control-run channels.
+
+### Evidence, disposition, and close state
+
+Evidence binds exact branches, SHAs, artifacts, test results, reports, reviews,
+and integration gates to their producing task and placement attempt. A
+terminal attempt receives exactly one disposition: `integrated`, `handed_off`,
+or `discarded` with proof that no unique work remains. A control run closes
+only after every task and placement attempt is terminal, every persistent
+session is dispositioned and archived, every ephemeral runtime is closed,
+every native fan-out is terminally aggregated, no local task remains active,
+combined gates pass, and the durable typed pending-work gate is zero.
 
 ### Repository profile
 
@@ -121,8 +232,9 @@ acceptance.
 ### Fully integrated harness
 
 An execution-certified harness that also ships an installable agent-side
-integration with a certified skill, hooks, submission client, recursion
-protection, and live agent-to-Pajé acceptance.
+integration with certified orchestration and leaf skills, hooks, deterministic
+control/submission client, recursion protection, and live leaf plus multi-agent
+Agent Control Plane acceptance.
 
 ## Current and Future Support Matrix
 
@@ -136,7 +248,10 @@ Status terms are deliberately limited to `current`, `planned by this design`,
 | Direct `paje-code-change-v1` Hatchet workflow trigger | current | current, retained for operators | Provider-specific outer adapter |
 | Pajé submission HTTP API | absent | planned by this design | Stable agent and automation boundary |
 | `paje-agent` submit/status/wait/cancel client | absent | planned by this design | Deterministic client over the HTTP API |
-| Codex skill-driven submission | absent | planned by this design | First supported agent-piloted entrypoint |
+| Pajé Agent Control Plane API | absent | planned by this design | Durable graph, placement attempt, persistent session, mailbox, evidence, and close boundary |
+| `paje-agent` capabilities and work dispatch/observe/send/wait/interrupt/close lifecycle | absent | planned by this design | Deterministic client over provider-neutral control APIs |
+| Codex skill-driven leaf submission | absent | planned by this design | Deliberate single-run entrypoint |
+| Codex long-spec multi-agent orchestration | absent | planned by this design | First supported Agent Control Plane entrypoint |
 | Generic webhook, CRD, or arbitrary event router | absent | not planned in this milestone | Separate future adapters |
 
 ### Repository language and profile support
@@ -154,8 +269,9 @@ Status terms are deliberately limited to `current`, `planned by this design`,
 | Harness surface | Status at `86537ae` | Target status | Support label |
 | --- | --- | --- | --- |
 | Codex worker-side adapter | current, dedicated and live-tested | formally recertified | execution-certified |
-| Codex agent-side skill and hooks | absent | planned by this design | required for full integration |
-| Codex end-to-end agent-piloted flow | absent | planned by this design | first fully integrated harness |
+| Codex agent-side skills, hooks, and client | absent | planned by this design | required for full integration |
+| Codex agent-work lifecycle adapter | absent | planned by this design | capability-aware work operations plus persistent-session specialization |
+| Codex end-to-end Agent Control Plane flow | absent | planned by this design | first fully integrated harness |
 | `local` runner | current | current | low-level adapter, not a certified harness |
 | Second dedicated harness | unselected | future after evidence gate | no support claim before live acceptance |
 | Additional unnamed harnesses | architectural extension point | future direction | not current support |
@@ -183,7 +299,8 @@ for reinterpretation:
   and only in the isolated publisher process and trusted publisher-owned Git
   configuration.
 - Agent and verification children cannot read Hatchet, Mem0, GitHub,
-  submission-gateway, Git, or SSH credentials.
+  submission-gateway, runtime-provider service, executor, Git, or SSH
+  credentials.
 - Token-bearing operations never execute in a repository or worktree that ran
   repository-controlled code.
 - The packaged Linux worker fails closed if its process-inspection guard cannot
@@ -192,19 +309,32 @@ for reinterpretation:
 
 ## Approaches Considered
 
-### 1. Pajé submission gateway plus installable harness integration
+### 1. Durable Agent Control Plane, leaf gateway, and installable harness integration
 
 A separate `paje-gateway` process authenticates a narrowly scoped Pajé token,
-validates and binds the submission, computes lineage and depth, and calls a
-provider-neutral trigger port. A Hatchet adapter implements that port. An
-installable Codex plugin ships a skill and hooks that call a small
-`paje-agent` HTTP client.
+persists the agent-control graph and placement-attempt lifecycle, validates and
+binds leaf submissions, computes lineage and depth, and calls provider-neutral
+agent-harness and trigger ports. A Hatchet adapter implements the leaf trigger.
+An installable
+Codex plugin ships orchestration and leaf skills plus hooks that call a small
+`paje-agent` HTTP client and map negotiated placement to discovered runtime
+capabilities.
 
 This is the selected approach. It provides a stable Pajé protocol, keeps broad
-Hatchet credentials server-side, gives idempotency and recursion policy one
-authoritative owner, and leaves the code-change core unchanged.
+Hatchet and runtime-provider credentials out of the agent, gives graph,
+placement, idempotency, recursion, recovery, and closure policy authoritative
+owners, and leaves the code-change and isolated-execution cores unchanged.
 
-### 2. Let the agent trigger Hatchet directly
+### 2. Ship only submit/status/wait/cancel
+
+The plugin and client could expose one durable `code-change@v1` run while
+leaving multi-agent coordination to conversation prose. This is rejected
+because it has no durable graph, placement decision, session identity,
+mailbox/cursor, steering, dependency handoff, integration evidence, restart
+recovery, disposition, archival, or close gate. A submission API remains a
+required leaf surface, not the orchestration product.
+
+### 3. Let the agent trigger Hatchet directly
 
 The skill could call the Hatchet SDK or API with `paje-code-change-v1`.
 This avoids a new server, but exposes Hatchet concepts and credentials to the
@@ -213,7 +343,7 @@ idempotency/depth rules in each harness integration.
 
 This approach is rejected.
 
-### 3. Embed agent submission in the worker process
+### 4. Embed agent submission in the worker process
 
 The worker could expose HTTP alongside its Hatchet listener and reuse the
 worker token and in-memory composition. This reduces deployment objects, but it
@@ -227,38 +357,408 @@ service accounts, credentials, and Kubernetes workloads.
 ## Architecture
 
 ```text
-Codex conversation
+Codex control conversation
   -> Pajé Codex plugin
-       -> skill
-       -> lifecycle hooks
+       -> orchestration and leaf-run skills
+       -> bounded lifecycle hooks
        -> paje-agent client
             -> HTTPS + scoped Pajé bearer token
                  -> paje-gateway HTTP adapter
                       -> token authenticator
-                      -> provider-neutral submission.Service
-                           -> submission.Store
-                           -> submission.Trigger port
-                                -> Hatchet trigger adapter
-                                     -> paje-code-change-v1
-                                          -> provider-neutral code-change service
-                                               -> certified runner adapter
+                      -> provider-neutral controlplane.Service
+                           -> controlplane.Store
+                           -> AgentHarness port
+                                -> Codex capability-aware work lifecycle
+                           -> provider-neutral submission.Service
+                                -> submission.Trigger port
+                                     -> Hatchet trigger adapter
+                                          -> paje-code-change-v1 leaf workflow
+                                               -> worker profile + secret broker
+                                               -> isolated executor
+                                               -> execution harness adapter
 ```
 
-There are three independently testable planes:
+There are five independently testable planes:
 
-1. **Submission plane:** authenticates a principal, validates a request, binds
-   idempotency and lineage, starts or reuses a workflow, exposes safe status,
-   and requests cancellation.
-2. **Durable workflow plane:** the existing typed `code-change@v1` phases,
+1. **Agent Control Plane:** persists `ControlRun`, `TaskGraph`, `Task`,
+   `ProjectRef`, ownership, `PlacementAttempt`, persistent `AgentSession`,
+   mailbox/event cursor, evidence, disposition, and close state.
+2. **Agent harness plane:** discovers semantic capabilities and dispatches,
+   observes, sends to, waits for, interrupts, and closes work according to the
+   selected primitive. It does not execute repository commands or manufacture
+   session semantics for runtimes that do not expose them.
+3. **Submission plane:** authenticates a principal, validates one leaf request,
+   binds idempotency and lineage, starts or reuses a workflow, exposes safe
+   status, and requests cancellation.
+4. **Durable workflow plane:** the existing typed `code-change@v1` phases,
    stores, artifacts, approval, and publication.
-3. **Harness plane:** worker-side execution adapter plus optional agent-side
-   skill, hooks, and client.
+5. **Execution plane:** worker profiles, secret broker, executor, and
+   execution-harness command/parser adapter for isolated leaf work.
 
 Failure or replacement in one plane must not require provider types in another.
 
-## Provider-Neutral Submission Domain
+The worker-profile, secret-broker, and isolated-executor work is a required
+lower-layer foundation. It is not deleted or redesigned here. It proves how one
+leaf command runs safely; it does not prove child-session orchestration.
 
-`internal/submission` owns the stable application contract:
+## Provider-Neutral Durable Agent Control Plane
+
+### Durable model
+
+The core model is provider-neutral and safe to persist:
+
+```go
+type ControlRun struct {
+    ID              string
+    PrincipalID     string
+    GoalDigest      string
+    GraphRevision   uint64
+    Status          ControlStatus
+    EventCursor     uint64
+    Close           CloseState
+}
+
+type TaskGraph struct {
+    ControlRunID    string
+    Revision        uint64
+    Tasks           []Task
+    IntegrationOrder []string
+    CombinedGates   []Gate
+}
+
+type Task struct {
+    ID              string
+    Goal            string
+    DependsOn       []string
+    Projects        []ProjectRef
+    Ownership       Ownership
+    Placement       ExecutionPlacement
+    FrozenInputs    []FrozenInput
+    Acceptance      []Gate
+    State           TaskState
+}
+
+type PlacementAttempt struct {
+    ID                 string
+    TaskID             string
+    Primitive          string
+    CapabilitySnapshot CapabilitySnapshot
+    LifecycleOwner     string
+    RuntimeWorkIDs     []string
+    LastCursor         string
+    State              AttemptState
+    TerminalEvidence   EvidenceRef
+    CloseEvidence      WorkCloseEvidence
+}
+
+type AgentSession struct {
+    ID                    string
+    TaskID                string
+    HarnessID             string
+    RuntimeChildID        string
+    RuntimeIDAcknowledged bool
+    LastCursor            string
+    State                 SessionState
+    Disposition           Disposition
+    ArchiveReceipt        string
+}
+```
+
+`PlacementAttempt` is created for every selected primitive, including
+`local_sequential`, and is the durable execution/audit record for placement.
+`RuntimeWorkIDs` is empty unless the harness actually returns identities.
+`AgentSession` is a persistent specialization referenced only by a
+`persistent_session` attempt.
+
+`ProjectRef` binds canonical repository identity, immutable base ref and SHA,
+workspace policy, credential scope, and allowed ownership. `Ownership` includes
+exclusive mutable paths or resources, parent-owned paths, and forbidden paths.
+The real records also bind stable schema versions, request digests, timestamps,
+attempts, safe diagnostics, and compare-and-swap versions.
+
+`ControlRun` states are `open`, `closing`, `closed`, `blocked`, and `canceled`.
+Task states are `pending`, `ready`, `dispatched`, `active`, `needs_input`,
+`completed`, `failed`, and `canceled`. Persistent session state is recorded
+independently because a task can require a replacement session without losing
+the original session's evidence.
+
+### Graph, readiness, and multi-project isolation
+
+Before dispatch, Pajé validates:
+
+- every predecessor and immutable input is complete;
+- every `ProjectRef` resolves to its exact base SHA;
+- ready writers have disjoint ownership;
+- the task has standalone acceptance, known integration order, and a combined
+  parent gate;
+- the selected dispatch or local lifecycle is authorized by principal, harness,
+  project, and action scope; and
+- expected work repays its primitive-specific setup, monitoring, review, and
+  cleanup cost.
+
+Tasks in unrelated repositories may run concurrently. Their workspaces,
+worker profiles, credentials, messages, evidence namespaces, and ownership are
+isolated. A child assigned project A cannot read or address project B merely
+because both belong to one control run. Cross-project communication requires a
+declared dependency or a parent-authored handoff containing only bounded safe
+evidence.
+
+Graph revisions use compare-and-swap. A revision may add a newly discovered
+task or dependency, but it cannot rewrite the goal, base SHA, ownership, or
+frozen inputs of an active task. A changed contract pauses dependent tasks and
+creates a new explicit handoff checkpoint.
+
+### Capability negotiation and execution placement
+
+Every `Task` records a placement decision before it becomes ready:
+
+```go
+type ExecutionPlacement struct {
+    ParallelismPrimitive   string
+    ExecutionPlacement     string
+    Rationale              string
+    CapabilityRequirements []string
+    LifecycleOwner         string
+    Fallback               string
+}
+```
+
+The durable JSON field names are `parallelism_primitive`,
+`execution_placement`, `placement_rationale`, `capability_requirements`,
+`lifecycle_owner`, and `fallback`. Missing or implied values invalidate
+dispatch.
+
+Placement is provider-neutral and selects exactly one primitive:
+
+1. `persistent_session`: a separately addressable, restartable, normally
+   worktree-backed child session;
+2. `ephemeral_subagent`: bounded work inside the current session with strongly
+   shared context and no independent durable lifecycle;
+3. `harness_native_parallel`: another bounded fan-out primitive advertised by
+   the harness; or
+4. `local_sequential`: execution by the control agent without parallel
+   dispatch.
+
+The decision evaluates at least:
+
+- expected duration, complexity, and likelihood of scope growth;
+- need for a separate filesystem, branch, worktree, or unrelated project;
+- ownership independence and conflict risk;
+- how much parent context must be shared;
+- restart/survival and durable audit requirements;
+- communication, steering, monitoring, and handoff needs;
+- creation and cleanup cost;
+- runtime and principal concurrency limits; and
+- integration dependencies and combined-gate order.
+
+The default policy is:
+
+| Primitive | Choose when | Reject when |
+| --- | --- | --- |
+| `persistent_session` | Work is long, restartable, mutating, independently owned, worktree-isolated, cross-project, communication-heavy, or audit-critical. | Required create/read/send/wait/interrupt/archive or isolation capability is absent and no equivalent certified capability exists. |
+| `ephemeral_subagent` | Investigation, short review, read-only analysis, or tightly bounded work benefits from strongly shared context and needs no independent restart. | Work may outlive the parent turn, needs a separate project/worktree, has conflicting mutable ownership, or needs durable steering/archival. |
+| `harness_native_parallel` | The harness advertises a bounded homogeneous fan-out with exact inputs, bounded results, and independent proof; setup cost is lower than sessions. | Items mutate overlapping state, require bespoke steering, or the primitive lacks bounded cancellation/result identity. |
+| `local_sequential` | Dependencies, shared files, uncertain boundaries, integration ownership, low task value, or capability/setup cost makes parallelism unsafe or uneconomic. | None; this is the fail-safe placement when continuing locally is authorized and safe. |
+
+For Codex, the concrete mapping is:
+
+- a user-visible Codex task/thread with an isolated worktree maps to
+  `persistent_session`; it must expose runtime IDs and the discovered
+  create/read/send/wait/interrupt/archive lifecycle;
+- a Codex local subagent maps to `ephemeral_subagent`; it is preferred for
+  short read-only investigation or review with shared context and no conflicting
+  writer;
+- Codex-advertised bounded parallel tool calls, batch waits, or other
+  semantically equivalent fan-out map to `harness_native_parallel` only after
+  capability discovery records their identity, limits, cancellation, and
+  result semantics; and
+- work performed by the current Codex control agent maps to
+  `local_sequential`.
+
+Verification must prove the chosen Codex primitive actually satisfies every
+recorded capability requirement. A label is not evidence.
+
+Placement is re-evaluated when duration, scope, ownership, dependencies,
+capabilities, or concurrency limits change. An ephemeral subagent that grows
+into mutating, long-running, cross-project, restartable, or independently
+steered work is stopped at a safe checkpoint and promoted to a new persistent
+session through an explicit evidence handoff. It does not continue mutating in
+parallel with its replacement.
+
+Fallbacks are explicit and fail closed:
+
+- if persistent-session capability is missing, cross-project or
+  isolation-required mutation remains pending or blocked; it is never silently
+  downgraded to a same-session subagent;
+- if harness-native fan-out is unavailable, the task runs sequentially or uses
+  persistent sessions when their cost is justified;
+- if ephemeral subagents are unavailable, short work runs sequentially; and
+- if concurrency is exhausted, ready tasks remain queued in deterministic
+  priority order rather than exceeding the limit.
+
+Every mutable ownership unit has at most one active lifecycle owner across all
+placements. Ephemeral subagents are read-only by default; a mutating subagent
+must hold an exclusive task ownership lease, and two subagents may never mutate
+the same files or resources concurrently.
+
+### Capability-aware agent harness boundary
+
+The provider-neutral agent harness is distinct from the execution harness:
+
+```go
+type AgentHarness interface {
+    Capabilities(context.Context, Principal, string) (HarnessCapabilities, error)
+    Dispatch(context.Context, DispatchWorkRequest) (DispatchWorkResult, error)
+    Observe(context.Context, ObserveWorkRequest) (WorkEvents, error)
+    Send(context.Context, SendWorkRequest) (MessageReceipt, error)
+    Wait(context.Context, WaitWorkRequest) (WorkEvents, error)
+    Interrupt(context.Context, InterruptWorkRequest) (InterruptReceipt, error)
+    Close(context.Context, CloseWorkRequest) (WorkCloseEvidence, error)
+}
+```
+
+`HarnessCapabilities` is discovered at runtime per primitive. It records
+dispatch, observe/read, wait, optional runtime identity, acknowledgement,
+send, callback, cursor, interrupt/cancel, idempotency, restart, runtime close,
+persistent archive, deterministic aggregation, isolation, and concurrency
+semantics. It also records whether local/sequential execution remains
+available. `Dispatch`, `Observe`, `Send`, `Wait`, `Interrupt`, and `Close` are
+capability-gated operations: a primitive may support only the subset its
+recorded contract requires. The service rejects an unsupported operation; it
+never simulates one or invents a child/session identity.
+
+Requests contain a `ControlRun` ID, task ID, `ProjectRef` IDs, exact dispatch
+prompt digest, ownership and frozen-input digest, stable action ID, and bounded
+timeouts. They never contain an executable, shell fragment, raw service
+credential, or provider-native object. Repository and verification commands
+remain shell-free `executor.Command` values behind the isolated executor
+layer.
+
+The four primitive contracts are executable and distinct:
+
+- `persistent_session` requires dispatch/create, an exact runtime-ID handshake,
+  cursor-aware observe/read and wait, send, interrupt, completion callback plus
+  independent polling, and a confirmed archive receipt. It creates an
+  `AgentSession`.
+- `ephemeral_subagent` requires bounded dispatch and wait/read observation.
+  The parent records a runtime child ID when the harness returns one, but
+  acknowledgement, send, cursor, callback, and interrupt are used only when
+  advertised. Completion requires terminal result evidence and confirmed
+  runtime close; it never requires archive and never becomes an
+  `AgentSession`.
+- `harness_native_parallel` requires one bounded deterministic dispatch,
+  declared concurrency, exact input/result correspondence, deterministic
+  terminal aggregation, and defined cancel semantics. Pajé records runtime item
+  IDs only when returned and otherwise does not create child or session
+  identities. Its close evidence is the terminal aggregate or cancel receipt,
+  never archive.
+- `local_sequential` creates no runtime child and calls no harness dispatch.
+  The control agent owns the durable `PlacementAttempt`; its terminal evidence
+  and inactive local-work marker close the attempt.
+
+Codex is the first `AgentHarness`. The plugin discovers current Codex task,
+subagent, and bounded-parallel capabilities semantically and uses `paje-agent`
+to durably prepare and record each supported action. If the Codex runtime later
+exposes a direct stable server-side API, that adapter may move behind the
+gateway without changing the domain contract.
+
+### Runtime identity and primitive-specific acknowledgement
+
+Pajé durably reserves the `PlacementAttempt`, action, and dispatch fingerprint
+before invoking the runtime. For `persistent_session`, the actual child ID is
+never inferred from parent, source thread, worktree, or prompt metadata:
+
+1. call the discovered create capability once with the reserved action;
+2. register the exact runtime-returned child ID immediately;
+3. send a registration message containing the exact parent and child IDs;
+4. require the child to acknowledge that exact ID; and
+5. reject a completion envelope that uses an unregistered or unacknowledged ID.
+
+If the coordinator fails after create but before registration, it does not
+blindly create a second child. It reconciles by stable action ID or dispatch
+fingerprint through available list/read capabilities. If the runtime cannot
+prove the result, Pajé records `ambiguous_create`, blocks the task, and requires
+operator disposition.
+
+For `ephemeral_subagent`, Pajé registers the exact runtime child ID only when
+one is returned. It requests acknowledgement or sends messages only when those
+capabilities were advertised. A native fan-out without returned item identity
+is tracked by attempt/action ID and exact item ordinals, not synthetic child
+IDs. `local_sequential` performs no child registration.
+
+### Callback, cursor-aware recovery, aggregation, and steering
+
+A persistent-session prompt contains the parent address and a compact
+completion envelope with child ID, terminal status, branch, base/head/pushed
+SHA, owned paths, test evidence, handoffs, concerns, report, and recommended
+parent action. The persistent child sends that callback before its final
+response. The parent still stores a monotonic mailbox/event cursor and
+independently performs bounded cursor-aware wait/read recovery; callbacks are
+primary notification, not the only source of truth.
+
+An ephemeral subagent uses callback, acknowledgement, send, or cursor semantics
+only when its capability snapshot advertises them. Its required completion path
+is bounded wait/read observation followed by terminal-result and runtime-close
+evidence. Native fan-out completes through deterministic aggregation of every
+declared item or a durable cancel receipt. Duplicate events are idempotent by
+attempt plus runtime event identity when available, otherwise by the stable
+action and result digest.
+
+Parent steering is an append-only message event bound to one task revision.
+Steering may clarify the goal, provide an approved frozen checkpoint, request
+fixes, interrupt obsolete work, or publish a dependency handoff. It may not
+silently widen project scope or ownership. Dependency handoffs bind producer
+task, exact evidence digest, consumer task, and acknowledgement.
+
+### Evidence, integration, restart recovery, and closure
+
+`Evidence` records exact branch and SHA, owned-path diff digest, artifact or
+report reference, command/result summaries, review findings, and integration
+gate results. The parent verifies reported state and integrates in graph order;
+focused child tests never replace combined gates.
+
+On coordinator restart Pajé reloads the graph, placement attempts, capability
+snapshots, action ledger, returned runtime IDs, applicable acknowledgement
+flags, cursors, callbacks, aggregation state, dispositions, and close evidence.
+It resumes each primitive through its advertised observe/wait contract, never
+repeats a completed lifecycle action, and fail-closes an ambiguous dispatch,
+interrupt/cancel, runtime-close, aggregate, or persistent archive outcome until
+reconciliation.
+
+Closure is a durable transition, not a UI convention. `CloseState` proves:
+
+1. all graph tasks are terminal;
+2. every placement attempt has terminal evidence and exactly one disposition;
+3. every persistent session has exactly one disposition and confirmed archive
+   receipt;
+4. all dependency handoffs and combined gates are acknowledged and complete;
+5. every ephemeral subagent has terminal-result and runtime-close evidence;
+6. every native fan-out has a terminal deterministic aggregate or cancel
+   receipt;
+7. no local/sequential placement remains active; and
+8. the durable typed pending-work gate is exactly zero.
+
+```go
+type PendingWorkGate struct {
+    PersistentSessionsUnarchived int
+    EphemeralAttemptsOpen        int
+    NativeFanoutsUnaggregated    int
+    LocalAttemptsActive          int
+    TotalPendingWork             int
+}
+```
+
+All five fields must be zero. A missing persistent archive receipt, ephemeral
+runtime-close proof, native aggregate/cancel receipt, or inactive-local marker
+leaves the run `closing` with `cleanup_incomplete`; Pajé must not claim clean
+completion.
+
+## Provider-Neutral Leaf Submission Domain
+
+`internal/submission` owns the stable application contract for one durable leaf
+workflow. It is consumed by the Agent Control Plane when a task needs
+`code-change@v1`, but it does not own the task graph, placement attempts, or
+persistent child-session lifecycle:
 
 ```go
 type Principal struct {
@@ -329,9 +829,36 @@ parsed canonical repository identities, never unvalidated string prefixes.
 
 No HTTP or Hatchet value appears in `codechange.Input`.
 
-## Submission HTTP Contract
+## Agent-Facing HTTP Contract
 
-The gateway exposes only versioned JSON endpoints:
+The gateway exposes only versioned JSON endpoints. Agent-control endpoints are:
+
+```text
+GET  /v1/capabilities
+POST /v1/control-runs
+GET  /v1/control-runs/{control_run_id}
+POST /v1/control-runs/{control_run_id}/tasks
+POST /v1/control-runs/{control_run_id}/tasks/{task_id}/attempts
+GET  /v1/control-runs/{control_run_id}/attempts/{attempt_id}?after_cursor=...
+POST /v1/control-runs/{control_run_id}/attempts/{attempt_id}/messages
+POST /v1/control-runs/{control_run_id}/attempts:wait
+POST /v1/control-runs/{control_run_id}/attempts/{attempt_id}/interrupt
+POST /v1/control-runs/{control_run_id}/attempts/{attempt_id}/close
+POST /v1/control-runs/{control_run_id}/evidence
+POST /v1/control-runs/{control_run_id}/close
+```
+
+Every mutating request requires a stable action idempotency key. Reads and waits
+accept an event cursor when the selected primitive advertises one and return
+the next cursor. Attempt creation durably records placement before dispatch.
+The action result records only runtime identities actually returned. Message,
+interrupt/cancel, runtime-close, aggregate, and persistent archive evidence bind
+the action ID, attempt ID, applicable runtime IDs, and resulting cursor or
+provider revision. `close` is primitive-specific; it maps to persistent archive,
+ephemeral runtime close, native terminal aggregation/cancel, or a local inactive
+marker.
+
+The existing leaf-run endpoints remain:
 
 ```text
 POST /v1/submissions
@@ -343,7 +870,9 @@ GET  /readyz
 
 There is no generic workflow-name endpoint, arbitrary event endpoint, admin
 endpoint, approval endpoint, artifact-file endpoint, or credential-minting
-endpoint in the agent-facing server.
+endpoint in the agent-facing server. There is also no endpoint that accepts an
+arbitrary executable or command line; command execution remains an executor
+responsibility.
 
 ### Submit request
 
@@ -467,11 +996,13 @@ Errors use a bounded stable shape:
 
 The stable codes are `invalid_request`, `unauthenticated`, `forbidden`,
 `not_found`, `idempotency_conflict`, `depth_exceeded`,
-`run_not_cancelable`, `provider_unavailable`, and `internal`.
+`run_not_cancelable`, `capability_unavailable`, `concurrency_exhausted`,
+`placement_invalid`, `ambiguous_create`, `cleanup_incomplete`,
+`provider_unavailable`, and `internal`.
 Diagnostics never include bearer tokens, service credentials, raw provider
 bodies, repository credentials, or unbounded transcripts.
 
-## Scoped Submission Credentials
+## Scoped Agent Credentials
 
 The gateway uses high-entropy static v1 bearer tokens because the beta is a
 single self-hosted installation. This is not an OAuth or multi-tenant identity
@@ -490,8 +1021,13 @@ The gateway Secret stores only:
 - human subject
 - exact `user_id` and `app_id`
 - allowed canonical repositories
-- allowed actions: `submit:artifact`, `submit:pull_request`, `read`, `cancel`
+- allowed leaf actions: `submit:artifact`, `submit:pull_request`, `read`,
+  `cancel`
+- allowed control actions: `control:create`, `task:create`, `work:dispatch`,
+  `work:observe`, `work:send`, `work:wait`, `work:interrupt`, `work:close`,
+  `evidence:write`, and `control:close`
 - allowed harness IDs
+- allowed project identities and cross-project communication edges
 - maximum child depth
 - optional expiry
 
@@ -577,6 +1113,10 @@ The service rejects a child when:
 
 The default credential limit is `0`, which permits root submissions only. The
 v1 system maximum is `1`. Raising either value is an explicit operator action.
+This lineage depth applies to nested leaf workflow submissions. It does not
+limit the number of sibling `AgentSession` records in a `ControlRun`; session
+fan-out is instead bounded by principal policy, graph readiness, ownership,
+per-project concurrency, and global session quotas.
 
 Defense in depth at the harness layer:
 
@@ -624,16 +1164,22 @@ The gateway:
 - runs as the same non-root UID/GID and read-only-root security posture as the
   worker;
 - has its own ServiceAccount with token automount disabled;
-- receives no Mem0, GitHub, Codex, worker Hatchet, repository, Git, or SSH
-  credential;
+- receives no Mem0, GitHub, Codex runtime-provider service, worker Hatchet,
+  repository, executor, Git, or SSH credential;
 - receives a distinct Hatchet producer Secret and submission-policy Secret;
-- persists submission reservations and provider bindings atomically;
+- persists control graphs, placement records, action ledgers, event cursors,
+  evidence, dispositions, primitive-specific close evidence including
+  persistent archive receipts, submission reservations, and provider bindings
+  atomically;
+- uses distinct non-overlapping control and submission roots on the persistent
+  volume;
 - supports exactly one replica in v1 because the filesystem store uses
   process-local compare-and-swap;
 - exposes only the documented HTTP paths;
 - sets request-body, header, timeout, connection, and response-size limits;
-- logs request ID, credential ID, run ID, action, result code, and duration,
-  never authorization headers or input bodies.
+- logs request ID, credential ID, safe control/run/task/attempt IDs, optional
+  persistent-session ID, action, result code, and duration, never authorization
+  headers or input bodies.
 
 TLS terminates at an operator-controlled ingress or trusted private network
 boundary. The chart does not create public ingress by default.
@@ -646,6 +1192,19 @@ and does not contain Hatchet code.
 Commands:
 
 ```text
+paje-agent capabilities
+paje-agent control create --file <path-or->
+paje-agent control status --control-run <id> [--after-cursor <cursor>]
+paje-agent task create --control-run <id> --file <path-or->
+paje-agent work dispatch --control-run <id> --task <id> --file <path-or->
+paje-agent work observe --control-run <id> --attempt <id> [--after-cursor <cursor>]
+paje-agent work send --control-run <id> --attempt <id> --file <path-or->
+paje-agent work wait --control-run <id> --file <path-or->
+paje-agent work interrupt --control-run <id> --attempt <id>
+paje-agent work close --control-run <id> --attempt <id> --file <path-or->
+paje-agent session create|read|send|wait|interrupt|archive ... # persistent-session shortcuts
+paje-agent evidence add --control-run <id> --file <path-or->
+paje-agent control close --control-run <id>
 paje-agent submit --file <path-or-> [--idempotency-key <key>]
 paje-agent status --run <run-id>
 paje-agent wait --run <run-id> --timeout <duration>
@@ -654,6 +1213,12 @@ paje-agent hook session-start
 paje-agent hook user-prompt-submit
 paje-agent hook stop
 ```
+
+Lifecycle mutations use explicit two-phase forms: `--prepare` returns the
+stable action document, and `--complete --action <id> --file <result-or->`
+records the bounded result of the dynamically discovered runtime capability.
+Read and wait use the same pattern when the runtime call occurs in the plugin.
+The exact action ID binds both phases and prevents implicit repeat.
 
 Configuration:
 
@@ -676,6 +1241,24 @@ The client:
 - preserves caller cancellation;
 - verifies that every response run ID matches the requested run;
 - treats malformed or successful-but-incomplete terminal responses as errors.
+- derives a stable action ID from control run, task/attempt, lifecycle verb,
+  graph revision, and canonical request digest;
+- records only exact runtime-returned IDs and uses acknowledgement only when the
+  primitive advertises it, rather than deriving IDs from surrounding metadata;
+- passes stored event cursors on observe and wait when advertised, deduplicates
+  repeated events, and never substitutes cadence polling for required callback
+  recovery;
+- never repeats an ambiguous dispatch, interrupt/cancel, runtime-close,
+  aggregation, or archive action without reconciliation evidence; and
+- refuses `control close` unless the server returns durable combined-gate,
+  disposition, primitive-specific close evidence, and a zero typed
+  `PendingWorkGate`.
+
+For Codex, lifecycle commands are two-phase. `paje-agent` durably prepares the
+action, the skill invokes the matching dynamically discovered runtime
+capability, and the client records the bounded result. The client never shells
+out to manufacture a runtime action and never receives a Codex service
+credential.
 
 ## Installable Codex Integration
 
@@ -688,6 +1271,10 @@ integrations/codex/paje/
 ├── hooks/
 │   └── hooks.json
 └── skills/
+    ├── orchestrating-with-paje/
+    │   ├── SKILL.md
+    │   └── agents/
+    │       └── openai.yaml
     └── using-paje/
         ├── SKILL.md
         └── agents/
@@ -701,7 +1288,8 @@ definitions.
 
 This layout follows the documented Codex plugin, skill, and hook surfaces:
 
-- skills are focused `SKILL.md` workflows;
+- skills are focused `SKILL.md` workflows: one for durable multi-agent
+  control, one for a deliberate leaf run;
 - installable packages use `.codex-plugin/plugin.json`;
 - plugin hooks default to `hooks/hooks.json`;
 - hook commands receive `PLUGIN_ROOT` and `PLUGIN_DATA`;
@@ -709,8 +1297,46 @@ This layout follows the documented Codex plugin, skill, and hook surfaces:
 
 ### Codex skill behavior
 
-`using-paje` triggers when a user explicitly asks Codex to delegate a suitable
-code change to Pajé or invokes the skill by name. It must:
+`orchestrating-with-paje` triggers when a user gives Codex a substantial
+multi-step specification and asks Pajé to coordinate it, or invokes the skill
+by name. `using-paje` remains the explicit single-leaf-run skill.
+
+The orchestration skill must:
+
+1. Confirm explicit orchestration intent and create or resume one `ControlRun`.
+2. Discover the available primitive-specific dispatch, observe/read, send,
+   wait, interrupt/cancel, callback, aggregation, runtime-close, and persistent
+   archive capabilities semantically; never assume provider tool names.
+3. Materialize the complete graph, exact project/base SHAs, ownership,
+   frozen inputs, dispatch prompts, primitive-specific identity and completion
+   rules, integration order, combined gates, polling cursors, and cleanup owner
+   before dispatch.
+4. Negotiate capabilities and record each task's
+   `execution_placement`, `parallelism_primitive`, rationale, capability
+   requirements, lifecycle owner, and fallback using the verified Codex
+   mapping; re-evaluate and promote growing subagent work when required.
+5. Dispatch only ready tasks with disjoint ownership and standalone proof,
+   including tasks in unrelated projects only when credentials and
+   communication scopes are separate.
+6. For persistent sessions, register and acknowledge every runtime-returned
+   child ID and pair callbacks with cursor-aware read/wait recovery. For
+   ephemeral subagents, register an ID and use ack/send/callback only when
+   advertised, then require wait/read terminal and runtime-close evidence. For
+   native fan-out, require deterministic terminal aggregation/cancel without
+   invented identities. For local work, create no child.
+7. Send parent steering and dependency handoffs through scoped mailboxes and
+   durably record acknowledgements.
+8. Verify child branches, SHAs, owned diffs, tests, and evidence before assigning
+   an `integrated`, `handed_off`, or proven-safe `discarded` disposition.
+9. Integrate in graph order, run combined gates, survive client or coordinator
+   restart from durable attempts and applicable cursors, and collect the exact
+   close evidence required by each primitive.
+10. Refuse clean completion until every persistent session has an archive
+    receipt, every ephemeral subagent has runtime-close evidence, every native
+    fan-out is terminally aggregated or canceled, no local work is active, and
+    every field of `PendingWorkGate` is zero.
+
+The leaf `using-paje` skill must:
 
 1. Confirm explicit submission intent; never infer it solely from repository
    presence.
@@ -734,13 +1360,16 @@ code change to Pajé or invokes the skill by name. It must:
 
 Hooks support the skill but never create authority or automatic side effects:
 
-- `SessionStart` loads safe active-run context from `PLUGIN_DATA`, optionally
-  checks status, and emits a concise system message.
+- `SessionStart` loads safe active `ControlRun` and leaf-run context from
+  `PLUGIN_DATA`, optionally performs one cursor-aware read, and emits a concise
+  resume message.
 - `UserPromptSubmit` records only `session_id`, `turn_id`, `cwd`, and active
-  run ID in a mode-`0600` context file. It does not store prompt text.
-- `Stop` performs at most one bounded status check for an active run and emits
-  a system message. It does not block stop indefinitely and does not submit,
-  cancel, approve, publish, or trust another hook.
+  control/run IDs and last safe cursor in a mode-`0600` context file. It does
+  not store prompt text.
+- `Stop` performs at most one bounded control or leaf status check and emits a
+  system message. It does not block stop indefinitely and does not dispatch,
+  send, interrupt/cancel, close work, archive a persistent session, close a
+  control run, submit, cancel, approve, publish, or trust another hook.
 
 Hook state excludes tokens, prompts, raw transcripts, repository credentials,
 and workflow input. Malformed state is ignored with a safe warning, not
@@ -768,13 +1397,27 @@ Codex becomes the first fully integrated harness only when:
 
 1. the execution adapter passes the formal conformance suite;
 2. the plugin is installable and discoverable;
-3. the skill submits only on explicit intent and produces a canonical request;
-4. the hooks obey their bounded, non-submitting lifecycle contract;
-5. a scoped token cannot exceed its repository, identity, action, harness, or
-   depth policy;
-6. a live Codex session submits through the plugin, Pajé completes the durable
-   workflow with the Codex runner, and the originating session observes the
-   terminal result without any worker service-token exposure.
+3. the skills act only on explicit intent and produce canonical control or
+   leaf requests;
+4. the agent-harness adapter covers capability discovery and the
+   primitive-specific dispatch, observe, send, wait, interrupt/cancel, close,
+   aggregation, and persistent archive contracts without exposing a Codex
+   service credential;
+5. the hooks obey their bounded, non-submitting lifecycle contract;
+6. the Agent Control Plane preserves placement attempts, capability-gated
+   identity/acknowledgement and messages, required callbacks plus cursor
+   recovery, evidence, disposition, restart recovery, and typed zero-pending-
+   work closure;
+7. a scoped token cannot exceed its project, repository, identity, action,
+   harness, or leaf-depth policy;
+8. a live Codex control session creates at least three persistent child sessions
+   across at least two projects, exercises an ephemeral subagent and native
+   fan-out additionally, exchanges capability-supported messages, handles
+   parent steering, integrates evidence, resumes after coordinator restart,
+   archives every persistent session, and records close evidence for every
+   other attempt;
+9. the same acceptance completes without any Hatchet, worker, runtime-provider,
+   executor, or publisher service-token exposure.
 
 ## Formal Harness Certification
 
@@ -861,23 +1504,28 @@ does not automatically certify another.
 
 #### AP-1: Installable packaging
 
-- The integration has a valid manifest, one focused skill, declared hooks, and
-  documented client dependency.
+- The integration has a valid manifest, focused orchestration and leaf-run
+  skills, declared hooks, and documented deterministic client dependency.
 - Installation, discovery, update, removal, and hook-trust flows are tested.
 
 #### AP-2: Skill behavior
 
 - Explicit and implicit trigger prompts are tested.
-- Ambiguous intent does not submit.
+- Ambiguous intent does not create a control run or submit a leaf run.
 - Canonical profile/check selection, idempotency, status handling, and safe
   failure instructions are tested.
+- Capability discovery, graph/ownership validation, primitive-specific runtime
+  identity and completion, persistent callback recovery, native aggregation,
+  steering, integration, disposition, and typed closure instructions are
+  tested.
 - The skill never handles worker service credentials.
 
 #### AP-3: Hook behavior
 
 - Each supported event receives recorded fixture input and produces valid
   bounded JSON output.
-- Hooks never submit, approve, publish, or cancel.
+- Hooks never dispatch, send, interrupt/cancel, close work, archive a persistent
+  session, close a control run, submit, approve, publish, or cancel.
 - Hook state permissions, corruption handling, concurrent invocation, and
   absence of prompt/transcript/token persistence are tested.
 - Changed hooks require a new trust decision; documentation never recommends
@@ -901,6 +1549,39 @@ does not automatically certify another.
 - The originating session obtains and reports the bound terminal result.
 - Adversarial probes confirm no worker or gateway service credential appears in
   the originating session, worker child, artifact, logs, or hook state.
+
+#### AP-6: Durable multi-agent control
+
+- One real originating Codex control agent receives a long specification and
+  creates at least three acknowledged `persistent_session` children across at
+  least two `ProjectRef` values.
+- The same graph records all placement fields for one short read-only
+  `ephemeral_subagent` task, one bounded `harness_native_parallel` fan-out, and
+  one dependency-conflicted `local_sequential` task.
+- A fixture grows the ephemeral task beyond its original bounds and proves
+  promotion to a persistent session through an explicit handoff with no
+  overlapping mutation. A second fixture removes one advertised capability and
+  exercises the recorded safe fallback.
+- At least two children run concurrently with disjoint ownership; one project
+  is unrelated to the other and has separate workspace and credential scope.
+- Persistent sessions complete the runtime-ID handshake, exchange scoped
+  messages, send completion callbacks, and are independently recovered through
+  cursor-aware wait/read. One child-to-child dependency handoff is acknowledged
+  and the parent sends at least one steering event.
+- The ephemeral subagent records its runtime child ID only if returned, uses
+  ack/send/callback only if advertised, and completes through wait/read plus
+  terminal/runtime-close evidence without archive.
+- Native fan-out proves bounded dispatch, exact result correspondence,
+  deterministic aggregation, and cancel semantics without synthetic child or
+  session identity. Local/sequential placement creates no child.
+- A coordinator restart occurs with children active. The resumed controller
+  uses durable placement attempts, returned runtime IDs, and applicable stored
+  cursors, creates no duplicate work, and retains all evidence.
+- The parent verifies and integrates child evidence in graph order, runs the
+  combined gates, assigns every attempt a disposition, archives every
+  persistent session, proves runtime closure for subagents, terminal aggregation
+  for fan-out, no active local work, and every `PendingWorkGate` field zero
+  before close.
 
 ## Second Dedicated Harness
 
@@ -940,6 +1621,33 @@ bar, not to an unevidenced vendor choice.
 
 ## Test Strategy
 
+### Agent Control Plane
+
+- strict `ControlRun`, `TaskGraph`, `Task`, `ProjectRef`, ownership,
+  `PlacementAttempt`, persistent `AgentSession`, mailbox/event cursor,
+  evidence, disposition, and close-state decoding and canonicalization;
+- required execution-placement fields, capability negotiation, concrete Codex
+  primitive mapping, concurrency limits, and deterministic fallback;
+- promotion of a growing ephemeral subagent to a persistent session with a
+  durable handoff and no overlapping writer;
+- denial of two subagents or mixed primitives attempting to mutate the same
+  ownership unit;
+- graph revision compare-and-swap, dependency readiness, ownership overlap
+  denial, immutable active-task boundaries, and integration ordering;
+- per-primitive capability snapshots and exact dispatch/observe/send/wait/
+  interrupt/close action idempotency;
+- persistent runtime-ID registration/acknowledgement, callback plus polling, and
+  archive receipt; optional ephemeral identity/ack/send/callback plus required
+  wait/read terminal and runtime-close proof;
+- bounded native fan-out dispatch, deterministic aggregation/cancel, no
+  synthetic identity, and local placement with no child creation;
+- cursor-aware recovery where supported, parent steering, dependency handoff
+  scope, multi-project message denial, and per-project concurrency limits;
+- restart at every action/result boundary with no duplicate work, lost
+  evidence, repeated interrupt/close, or cursor regression; and
+- disposition proof, primitive-specific close evidence, combined gates, and
+  every field of the typed pending-work gate exactly zero.
+
 ### Submission domain
 
 - strict decoding, normalization, principal overwrites, repository scope, mode
@@ -973,7 +1681,10 @@ bar, not to an unevidenced vendor choice.
 - stable JSON/exit-code behavior and no token on argv/stdout/stderr;
 - file ownership, mode, and symlink rejection for token files;
 - session/turn idempotency derivation;
-- skill intent, canonical request, wait, resume, conflict, timeout, decline,
+- orchestration skill intent, capability discovery, graph/ownership validation,
+  primitive-specific runtime identity, scoped send/wait/steering, deterministic
+  aggregation, restart resume, disposition/close, and typed close-gate fixtures;
+- leaf skill canonical request, wait, resume, conflict, timeout, decline,
   cancellation, and terminal failure fixtures;
 - hook input/output fixtures, state permissions, corruption, concurrency, and
   bounded runtime;
@@ -986,6 +1697,10 @@ bar, not to an unevidenced vendor choice.
   probes;
 - opt-in live Codex execution;
 - opt-in live Codex agent-piloted round trip;
+- opt-in live Codex multi-agent control with at least three persistent sessions,
+  two projects, additional ephemeral and native fan-out attempts, steering,
+  coordinator restart, evidence integration, persistent archival, subagent
+  runtime close, native terminal aggregation, and no active local work;
 - a second harness may not be labeled supported until the same required suite
   passes.
 
@@ -993,7 +1708,8 @@ bar, not to an unevidenced vendor choice.
 
 - README, Chart metadata, site, and docs use the canonical short form.
 - The support matrix labels direct Hatchet, generic/Go profiles, Codex
-  execution, Codex agent-pilot, local runner, and second harness accurately.
+  execution, Codex leaf agent-pilot, Codex Agent Control Plane, local runner,
+  and second harness accurately.
 - Regression tests reject `Go-native`, generic “all runtimes included,”
   agent-side hooks presented as already shipped before completion, or `local`
   presented as certified.
@@ -1003,8 +1719,9 @@ bar, not to an unevidenced vendor choice.
 
 Implementation must update these surfaces in the same release:
 
-- `README.md`: canonical position, support matrix, gateway/client usage,
-  credential model, idempotency, depth, and migration from direct Hatchet.
+- `README.md`: canonical position, support matrix, control and leaf gateway/
+  client usage, credential model, project and message scope, idempotency,
+  closure, depth, and migration from direct Hatchet.
 - `charts/paje/Chart.yaml`: replace `Go-native` with the canonical durable
   language-neutral description.
 - `charts/paje/values.yaml`, schema, templates, notes, and render tests:
@@ -1013,9 +1730,9 @@ Implementation must update these surfaces in the same release:
   Codex full integration only after live acceptance.
 - `site/README.md`: source-of-truth and toolchain qualification.
 - `site/tests/rendered-html.test.mjs`: product-positioning regressions.
-- `docs/`: submission API, token provisioning, Codex plugin installation,
-  hook trust, support definitions, certification evidence, and second-harness
-  decision record.
+- `docs/`: Agent Control Plane and leaf submission APIs, token provisioning,
+  Codex plugin installation, hook trust, support definitions, certification
+  evidence, restart/cleanup operations, and second-harness decision record.
 
 Public copy changes from “planned” to “current” only in the commit that carries
 the corresponding acceptance evidence.
@@ -1024,19 +1741,24 @@ the corresponding acceptance evidence.
 
 ### Phase 1: Contract and safe submission
 
-Add the provider-neutral submission service, durable reservation store, scoped
-token authentication, Hatchet adapter, HTTP gateway, and client. Keep the
-gateway disabled by default. Direct Hatchet triggering remains supported.
+Add the provider-neutral Agent Control Plane and capability-aware agent-harness
+lifecycle
+contract alongside the leaf submission service, durable stores, scoped token
+authentication, Hatchet adapter, HTTP gateway, and client. Keep the gateway
+disabled by default. Direct Hatchet triggering remains supported.
 
 ### Phase 2: Codex agent pilot
 
-Package the Codex plugin, skill, and bounded hooks. Test local installation and
-explicit submission with mock and real gateway environments.
+Package the Codex plugin, orchestration and leaf skills, bounded hooks, and
+Codex agent-work adapter. Test local installation, explicit control-run
+creation, all four placement lifecycles including persistent sessions, and leaf
+submission with mock and real gateway environments.
 
 ### Phase 3: Formal certification and public graduation
 
 Refactor existing Codex evidence into the shared certification suite, run live
-execution and agent-piloted acceptance, then change Codex from
+execution, leaf agent-pilot, and durable multi-agent control acceptance, then
+change Codex from
 execution-certified/planned-agent-pilot to fully integrated/current.
 
 ### Phase 4: Second-harness evidence gate
@@ -1049,29 +1771,61 @@ changes in this phase.
 
 This design is complete only when evidence proves all of the following:
 
-1. An installed Codex skill can deliberately submit a valid `code-change@v1`
-   request without receiving a Hatchet or worker service token.
-2. An exact retry from one Codex turn returns the same Pajé run; changed input
+1. An installed Codex orchestration skill can deliberately create or resume a
+   `ControlRun` without receiving Hatchet, worker, executor, publisher, or
+   Codex service credentials.
+2. `ControlRun`, `TaskGraph`, `Task`, `ProjectRef`, ownership,
+   `PlacementAttempt`, persistent `AgentSession`, mailbox/event cursor,
+   evidence, disposition, and close state are durable, provider-neutral,
+   strictly validated, and restart-safe.
+3. `AgentHarness` discovers and enforces primitive-specific capabilities over
+   dispatch, observe, send, wait, interrupt/cancel, and close; command execution
+   remains behind the isolated executor.
+4. Persistent sessions use exact runtime-ID registration/acknowledgement,
+   callbacks plus cursor-aware recovery, and archive receipts. Ephemeral
+   subagents use only advertised identity/ack/send/callback capabilities and
+   require wait/read terminal plus runtime-close evidence. Native fan-out uses
+   deterministic aggregation/cancel without invented identity, and local work
+   creates no child. Restart creates no duplicate work.
+5. Parent steering, dependency handoffs, integration order, combined gates,
+   multi-project isolation, and scoped communication are enforced.
+6. Every task records execution placement, parallelism primitive, rationale,
+   capability requirements, lifecycle owner, and fallback; Codex placement,
+   promotion, missing-capability fallback, concurrency limits, and overlapping
+   subagent mutation denial pass acceptance.
+7. A live control agent receives a long specification, creates at least three
+   persistent child sessions across at least two projects, additionally
+   exercises an ephemeral subagent and native fan-out, exchanges
+   capability-supported messages, handles one steering event, integrates
+   evidence, survives coordinator restart, archives every persistent session,
+   closes every nonpersistent attempt with its required evidence, and proves
+   the typed pending-work gate is zero.
+8. An installed Codex leaf skill can deliberately submit a valid
+   `code-change@v1` request without receiving a Hatchet or worker service token.
+9. An exact retry from one Codex turn returns the same Pajé run; changed input
    under the same key returns conflict.
-3. Scope tests prevent identity, repository, publication-mode, harness, action,
+10. Scope tests prevent identity, project, repository, communication,
+   publication-mode, harness, action,
    and depth escalation.
-4. Root-only credentials and server-computed depth prevent recursive runs.
-5. Gateway restart at every reservation/trigger boundary creates neither a
+11. Root-only credentials and server-computed depth prevent recursive leaf
+   runs.
+12. Gateway restart at every reservation/trigger boundary creates neither a
    duplicate Pajé run nor a lost binding.
-6. Cancellation is idempotent, reaches Hatchet and the harness process, kills
+13. Cancellation is idempotent, reaches Hatchet and the execution harness
+   process, kills
    descendants, and becomes terminal only through durable workflow evidence.
-7. Agent, verification, gateway, and publisher processes cannot read one
+14. Agent, verification, gateway, and publisher processes cannot read one
    another's credentials.
-8. Codex passes every execution and agent-pilot certification requirement for
+15. Codex passes every execution and agent-pilot certification requirement for
    exact recorded versions.
-9. A live originating Codex session submits, observes, and reports one durable
+16. A live originating Codex session submits, observes, and reports one durable
    successful result.
-10. Direct Hatchet triggers and existing beta artifact/approval/publication
-    behavior remain compatible.
-11. README, Helm metadata, site, docs, and regression tests present the same
-    current-versus-future matrix.
-12. The second harness remains unnamed until a committed evidence record passes
-    the selection gate.
+17. Direct Hatchet triggers and existing beta artifact/approval/publication
+   behavior remain compatible.
+18. README, Helm metadata, site, docs, and regression tests present the same
+   current-versus-future matrix.
+19. The second harness remains unnamed until a committed evidence record passes
+   the selection gate.
 
 ## External Interface References
 

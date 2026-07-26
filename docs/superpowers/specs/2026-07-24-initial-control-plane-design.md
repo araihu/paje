@@ -5,12 +5,74 @@
 Approved by the supplied consolidated project specification and the instruction
 to continue toward the complete objective.
 
+This document records the first deployable worker slice. Its fixed workflow is
+still a supported leaf-execution foundation, but it is not the complete Pajé
+product boundary. The canonical product scope is corrected by the
+[agent-piloted and Agent Control Plane design](./2026-07-25-agent-piloted-submission-and-harness-support-design.md),
+and its execution substrate is refined by the
+[portable worker design](./2026-07-25-portable-worker-profiles-and-isolated-execution-design.md).
+
 ## Goal
 
-Build the first deployable Pajé worker: a Go-native, self-hosted orchestration
-control plane that coordinates memory retrieval, isolated Git workspaces,
-black-box agent execution, result persistence, and future human approval without
-coupling the application core to Hatchet, Mem0, local processes, or Kubernetes.
+Build the first deployable Pajé worker foundation: a Go-native, self-hosted
+durable workflow service that coordinates memory retrieval, isolated Git
+workspaces, black-box agent execution, result persistence, and future human
+approval without coupling the application core to Hatchet, Mem0, local
+processes, or Kubernetes.
+
+Pajé's complete goal is broader: an agent-facing, provider-neutral durable
+Agent Control Plane must let one control agent decompose a long specification,
+create and steer multiple child agent sessions, coordinate work across multiple
+projects, choose the correct parallelism primitive for each task, integrate
+evidence, recover after restart, and close only after every placement has a
+verified disposition and capability-appropriate terminal evidence.
+
+## Product-Scope Correction
+
+The fixed `Retrieve Memory -> Prepare Workspace -> Run Agent -> Save Memory`
+sequence and a single-process Codex execution are useful execution kernels, but
+they are not sufficient orchestration. They do not model a mutable dependency
+graph, exclusive ownership, child-session lifecycle, scoped mailboxes,
+capability-aware dispatch and observation, steering, integration order, or a
+typed zero-pending-work closure gate.
+
+The canonical Agent Control Plane adds durable `ControlRun`, `TaskGraph`,
+`Task`, `ProjectRef`, ownership, `PlacementAttempt`, persistent
+`AgentSession`, mailbox/event cursor, evidence, disposition, and close state.
+`code-change@v1` remains an admissible durable leaf workflow beneath that
+control plane; it is not the control plane itself.
+
+### Parallelism placement
+
+The corrected product does not equate every graph cut with a new worker
+process. Before a task becomes ready, Pajé negotiates harness capabilities and
+records `execution_placement`, `parallelism_primitive`, placement rationale,
+capability requirements, lifecycle owner, and fallback. The exact durable
+fields are `execution_placement`, `parallelism_primitive`,
+`placement_rationale`, `capability_requirements`, `lifecycle_owner`, and
+`fallback`.
+
+The provider-neutral choices are a persistent worktree-backed session, an
+ephemeral same-session subagent, a bounded harness-native parallel primitive,
+or local/sequential execution. Their exact primitive values are
+`persistent_session`, `ephemeral_subagent`, `harness_native_parallel`, and
+`local_sequential`. The decision weighs duration and complexity,
+filesystem/branch/project isolation, ownership independence, shared context,
+restart survival, steering and monitoring, creation cost, concurrency limits,
+conflict risk, handoff, and audit needs.
+
+For Codex, long, restartable, mutating, isolated, or cross-project work uses a
+user-visible persistent task/session; short read-only investigation or review
+with strongly shared context may use an ephemeral subagent; homogeneous bounded
+fan-out may use another discovered Codex parallel capability; dependent,
+conflicting, integration-owned, or uneconomic work stays with the control agent
+sequentially.
+
+Placement is re-evaluated when work grows or capabilities change. A growing
+subagent is checkpointed and promoted to a persistent session through an
+explicit handoff. Missing capabilities follow the recorded safe fallback, and
+two subagents or other primitives may never hold overlapping mutable ownership.
+These rules are acceptance gates, not scheduling hints.
 
 ## Approaches Considered
 
@@ -20,9 +82,9 @@ Keep the deterministic orchestration sequence in an application service under
 `internal/workflow`. Bind that service to a Hatchet task at the outer edge. The
 daemon constructs adapters, registers the Hatchet task, and starts the worker.
 
-This is the selected approach. It preserves the requested hexagonal boundary,
-makes the workflow testable without Hatchet or PostgreSQL, and still produces a
-real Hatchet listener.
+This is the selected approach for the initial leaf-worker slice. It preserves
+the requested hexagonal boundary, makes the workflow testable without Hatchet
+or PostgreSQL, and still produces a real Hatchet listener.
 
 ### 2. Hatchet-native DAG as the application core
 
@@ -45,6 +107,10 @@ a later milestone. This is simple but does not satisfy the requirement that
 
 Pajé uses ports and adapters:
 
+- The provider-neutral Agent Control Plane owns durable decomposition,
+  capability-aware work coordination, persistent child-session specialization,
+  cross-project scope, evidence integration, and closure. It does not import
+  Hatchet or a specific agent runtime.
 - Core contracts live in `internal/memory`, `internal/workspace`,
   `internal/runner`, and `internal/approval`.
 - In-memory mocks implement every port and are safe for concurrent tests.
@@ -60,6 +126,15 @@ Pajé uses ports and adapters:
 
 Hatchet remains an outer orchestration and queueing adapter. The application
 workflow does not import the Hatchet SDK.
+
+The phrase "orchestration" in this initial slice describes ordering inside one
+leaf workflow. Agent-facing orchestration is the higher-level durable control
+loop that dispatches, observes, sends to, waits for, interrupts/cancels, and
+closes work through a provider-neutral `AgentHarness`. `AgentSession` and
+archive are the specialization for persistent sessions; ephemeral subagents,
+native fan-out, and local work retain their own capability-appropriate
+lifecycle. Shell-free command execution remains behind the separate executor
+layer.
 
 ## Core Contracts
 
@@ -92,7 +167,14 @@ type RunOutput struct {
 saves the execution result, and always attempts workspace cleanup after a
 successful prepare.
 
+These contracts do not become the durable Agent Control Plane by gaining more
+fixed phases. The higher-level model and capability-aware work lifecycle are
+specified in the agent-piloted design and may invoke this workflow as a leaf
+task.
+
 ## Data Flow
+
+### Initial leaf workflow
 
 1. An event producer starts the Hatchet `paje-agent-run` task with `RunInput`.
 2. The Hatchet handler calls `Orchestrator.Run`.
@@ -111,6 +193,31 @@ into the first workflow because the specification defines the first pipeline as
 Retrieve Memory -> Prepare Workspace -> Run Agent -> Save Memory. A later
 workflow can wait for a Hatchet signal and call the approval gate without
 changing the existing ports.
+
+### Canonical agent-control flow
+
+1. A control agent opens a durable `ControlRun` from a long specification.
+2. Pajé validates a `TaskGraph`, exact `ProjectRef` values, dependency cuts,
+   exclusive ownership, frozen inputs, integration order, and combined gates.
+3. For each ready task, Pajé creates a durable `PlacementAttempt` and selects
+   exactly one advertised primitive. A persistent session completes the exact
+   runtime-ID handshake; an ephemeral subagent records a returned runtime ID
+   only when one exists; native fan-out uses bounded dispatch and deterministic
+   aggregation; local/sequential work creates no child.
+4. Persistent sessions use completion callbacks plus independent cursor-aware
+   wait/read recovery. Ephemeral subagents use ack/send/callback only when
+   advertised and complete through wait/read plus terminal/runtime-close
+   evidence. Native fan-out closes with a terminal aggregate or cancel receipt.
+5. Parent steering and dependency handoffs are appended to scoped mailboxes;
+   unrelated projects may proceed concurrently without sharing workspaces,
+   credentials, ownership, or messages.
+6. Pajé records exact evidence and one disposition for every task and placement
+   attempt, survives coordinator restart without duplicating runtime work, and
+   reruns combined gates in integration order.
+7. The `ControlRun` closes only when the graph is terminal, every persistent
+   session has an archive receipt, every ephemeral runtime is closed, every
+   native fan-out is terminally aggregated, no local work is active, and every
+   field of the typed pending-work gate is zero.
 
 ## Error Handling
 
@@ -167,6 +274,14 @@ The repository includes:
 - Local runner tests execute the Go test helper process.
 - Workflow tests verify order, context propagation, cleanup, persistence, and
   stage-specific error behavior.
+- Agent Control Plane acceptance separately verifies capability negotiation,
+  required task placement fields, the concrete Codex primitive mapping,
+  subagent-to-session promotion, missing-capability fallback, concurrency
+  limits, denial of overlapping mutable subagents, a durable placement attempt
+  for all four primitives, persistent runtime-ID/callback/archive semantics,
+  optional ephemeral identity with required runtime close, deterministic
+  fan-out aggregation/cancel, no local child creation, and typed zero-pending-
+  work closure.
 - Hatchet binding tests cover input conversion without starting an external
   service; compilation against the pinned SDK validates registration.
 - Configuration tests cover defaults, required values, and adapter selection.
@@ -179,8 +294,9 @@ The repository includes:
 - Slack or interactive CLI approval adapters.
 - A webhook, CLI submission client, or CRD controller.
 - Bundling Hatchet Server or PostgreSQL inside the Pajé Helm chart.
-- Dynamic concurrency policies beyond what can be added to the registered
-  Hatchet task later.
+- Dynamic agent-session concurrency in this first worker milestone.
 
-These remain explicit future adapters or triggers; none require changes to the
-initial core contracts.
+These were non-goals for the initial worker milestone, not product-wide
+exclusions. The later Agent Control Plane design makes bounded multi-agent and
+multi-project orchestration core scope without weakening the initial
+provider-neutral leaf-workflow contracts.
