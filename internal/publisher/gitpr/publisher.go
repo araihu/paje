@@ -4,6 +4,10 @@ package gitpr
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,12 +19,18 @@ import (
 
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
+	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/executor/commandrunner"
 	"github.com/araihu/paje/internal/publisher"
 	"github.com/araihu/paje/internal/verification"
 	"github.com/araihu/paje/internal/workspace"
 )
 
-const cleanupTimeout = 30 * time.Second
+const (
+	cleanupTimeout                   = 30 * time.Second
+	publisherVerificationOutputLimit = int64(1 << 20)
+	publisherVerificationStage       = "publish-verification"
+)
 
 var gitObjectPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -55,9 +65,13 @@ type Credentials interface {
 
 // Dependencies are the ports needed for immutable Git publication.
 type Dependencies struct {
-	Artifacts               artifact.Store
-	Workspaces              workspace.Manager
-	Changes                 gitcapture.Capturer
+	Artifacts  artifact.Store
+	Workspaces workspace.Manager
+	Changes    gitcapture.Capturer
+	Executors  *executor.Registry
+	// Verification and VerificationEnvironment remain only so the frozen
+	// composition/acceptance fixtures can migrate in PW-11/12. They are never
+	// retained or used by the publisher.
 	Verification            verification.Runner
 	VerificationEnvironment map[string]string
 	PullRequests            PullRequests
@@ -67,15 +81,14 @@ type Dependencies struct {
 
 // Publisher applies, verifies, and publishes an artifact.
 type Publisher struct {
-	artifacts               artifact.Store
-	workspaces              workspace.Manager
-	changes                 gitcapture.Capturer
-	verification            verification.Runner
-	verificationEnvironment map[string]string
-	pullRequests            PullRequests
-	credentials             Credentials
-	pushURL                 func(string) (string, error)
-	git                     *gitClient
+	artifacts    artifact.Store
+	workspaces   workspace.Manager
+	changes      gitcapture.Capturer
+	executors    *executor.Registry
+	pullRequests PullRequests
+	credentials  Credentials
+	pushURL      func(string) (string, error)
+	git          *gitClient
 }
 
 var _ publisher.Publisher = (*Publisher)(nil)
@@ -89,7 +102,7 @@ func New(dependencies Dependencies) (*Publisher, error) {
 		{"artifact store", dependencies.Artifacts},
 		{"workspace manager", dependencies.Workspaces},
 		{"Git change adapter", dependencies.Changes},
-		{"verification runner", dependencies.Verification},
+		{"executor registry", dependencies.Executors},
 		{"pull request provider", dependencies.PullRequests},
 		{"credential provider", dependencies.Credentials},
 	} {
@@ -100,18 +113,14 @@ func New(dependencies Dependencies) (*Publisher, error) {
 	if dependencies.PushURL == nil {
 		return nil, fmt.Errorf("create Git PR publisher: push URL resolver is required")
 	}
-	if err := validateVerificationEnvironment(dependencies.VerificationEnvironment); err != nil {
-		return nil, err
-	}
 	git, err := newGitClient()
 	if err != nil {
 		return nil, err
 	}
 	return &Publisher{
 		artifacts: dependencies.Artifacts, workspaces: dependencies.Workspaces,
-		changes: dependencies.Changes, verification: dependencies.Verification,
-		verificationEnvironment: cloneStrings(dependencies.VerificationEnvironment),
-		pullRequests:            dependencies.PullRequests, credentials: dependencies.Credentials,
+		changes: dependencies.Changes, executors: dependencies.Executors,
+		pullRequests: dependencies.PullRequests, credentials: dependencies.Credentials,
 		pushURL: dependencies.PushURL, git: git,
 	}, nil
 }
@@ -122,7 +131,7 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 	if err := ctx.Err(); err != nil {
 		return publisher.Result{}, err
 	}
-	if err := req.Validate(); err != nil {
+	if err := req.ValidatePortable(); err != nil {
 		return publisher.Result{}, err
 	}
 	if strings.ContainsAny(req.Title, "\r\n") || strings.ContainsAny(req.TargetRef, "\r\n") {
@@ -137,7 +146,11 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 	if err != nil {
 		return publisher.Result{}, fmt.Errorf("prepare publication workspace: %w", err)
 	}
+	workspaceCleaned := false
 	defer func() {
+		if workspaceCleaned {
+			return
+		}
 		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
 		returnErr = errors.Join(returnErr, prepared.Cleanup(cleanupContext))
@@ -149,9 +162,11 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 	}); err != nil {
 		return publisher.Result{}, fmt.Errorf("apply publication artifact: %w", err)
 	}
-	if err := p.runRequiredVerification(ctx, prepared.Path(), bundle.Verification); err != nil {
+	verificationDigest, err := p.runRequiredVerification(ctx, prepared.Path(), req, bundle.Verification)
+	if err != nil {
 		return publisher.Result{}, err
 	}
+	req.VerificationDigest = verificationDigest
 
 	commitSHA, err := p.git.commit(ctx, prepared.Path(), commitMessage(req))
 	if err != nil {
@@ -169,6 +184,13 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 	if err := p.git.verifyLocalCommit(ctx, trusted.path, commitSHA, req, bundle.Manifest.TreeSHA); err != nil {
 		return publisher.Result{}, err
 	}
+	cleanupContext, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	cleanupErr := prepared.Cleanup(cleanupContext)
+	cancelCleanup()
+	if cleanupErr != nil {
+		return publisher.Result{}, fmt.Errorf("cleanup publication verification workspace: %w", cleanupErr)
+	}
+	workspaceCleaned = true
 
 	pushURL, err := p.pushURL(req.Repository)
 	if err != nil {
@@ -239,8 +261,9 @@ func (p *Publisher) Publish(ctx context.Context, req publisher.Request) (result 
 	result = publisher.Result{
 		Provider: "github", Branch: req.Branch, CommitSHA: commitSHA,
 		PullRequestID: pullRequest.ID, PullRequestURL: pullRequest.URL,
+		VerificationDigest: req.VerificationDigest,
 	}
-	if err := result.Validate(req); err != nil {
+	if err := result.ValidateVerified(req); err != nil {
 		return publisher.Result{}, err
 	}
 	return result, nil
@@ -258,6 +281,10 @@ func (p *Publisher) loadBoundArtifact(ctx context.Context, req publisher.Request
 	if reference != req.Artifact {
 		return artifact.Bundle{}, fmt.Errorf("%w: artifact reference is not exact", publisher.ErrConflict)
 	}
+	executionEvidence, err := publisher.DecodeExecutionEvidence(bundle.ExecutionMetadata)
+	if err != nil {
+		return artifact.Bundle{}, fmt.Errorf("%w: artifact execution evidence is invalid", publisher.ErrConflict)
+	}
 	switch {
 	case bundle.Manifest.RunID != req.RunID:
 		return artifact.Bundle{}, fmt.Errorf("%w: artifact run ID does not match", publisher.ErrConflict)
@@ -269,22 +296,41 @@ func (p *Publisher) loadBoundArtifact(ctx context.Context, req publisher.Request
 		return artifact.Bundle{}, fmt.Errorf("%w: artifact tree SHA is invalid", publisher.ErrConflict)
 	case len(bundle.ChangesPatch) == 0:
 		return artifact.Bundle{}, fmt.Errorf("%w: artifact patch is empty", publisher.ErrConflict)
+	case !reflect.DeepEqual(bundle.Manifest, req.ArtifactManifest):
+		return artifact.Bundle{}, fmt.Errorf("%w: artifact manifest is not exact", publisher.ErrConflict)
+	case !reflect.DeepEqual(executionEvidence, req.ExecutionEvidence):
+		return artifact.Bundle{}, fmt.Errorf("%w: artifact execution evidence is not exact", publisher.ErrConflict)
 	}
 	return bundle, nil
 }
 
-func (p *Publisher) runRequiredVerification(ctx context.Context, root string, evidence []verification.Result) error {
-	for _, prior := range evidence {
+func (p *Publisher) runRequiredVerification(
+	ctx context.Context,
+	root string,
+	req publisher.Request,
+	evidence []verification.Result,
+) (string, error) {
+	target, err := p.executors.Resolve(req.WorkerProfile.Clone())
+	if err != nil {
+		return "", fmt.Errorf("resolve publication verification executor: %w", err)
+	}
+	receipt := publisherVerificationReceipt{
+		Version: "paje-publisher-verification-v1", RunID: req.RunID,
+		ArtifactDigest: req.Artifact.Digest, TreeSHA: req.ArtifactManifest.TreeSHA,
+		ProfileDigest: req.WorkerProfile.Digest, Environment: publisherSandboxEnvironment(),
+	}
+	identity := publisherVerificationIdentity(req)
+	for index, prior := range evidence {
 		if !prior.Command.Required {
 			continue
 		}
 		if !prior.Passed {
-			return fmt.Errorf("%w: artifact records failed required verification %q", publisher.ErrConflict, prior.Command.Name)
+			return "", fmt.Errorf("%w: artifact records failed required verification %q", publisher.ErrConflict, prior.Command.Name)
 		}
 		command := prior.Command
-		directory, err := containedDirectory(root, command.Directory)
+		directory, err := repositoryRelativeDirectory(root, command.Directory)
 		if err != nil {
-			return fmt.Errorf("%w: reconstruct verification %q: %v", publisher.ErrConflict, command.Name, err)
+			return "", fmt.Errorf("%w: reconstruct verification %q: %v", publisher.ErrConflict, command.Name, err)
 		}
 		command.Directory = directory
 		command.Args = append([]string(nil), command.Args...)
@@ -295,12 +341,79 @@ func (p *Publisher) runRequiredVerification(ctx context.Context, root string, ev
 			}
 			command.Environment["GOWORK"] = "off"
 		}
-		result := p.verification.Run(ctx, command, cloneStrings(p.verificationEnvironment))
-		if !result.Passed {
-			return fmt.Errorf("required publication verification %q failed: %s/%s", command.Name, result.FailureClass, result.CauseCode)
+		attempt := identity
+		attempt.Sequence = index
+		runner, err := commandrunner.New(commandrunner.Config{
+			Executor: target, Profile: req.WorkerProfile.Clone(), Attempt: attempt,
+			Workspace: root, Environment: publisherSandboxEnvironment(),
+			OutputLimit: publisherVerificationOutputLimit, Writable: false,
+		})
+		if err != nil {
+			return "", fmt.Errorf("construct publication verification %q: %w", command.Name, err)
 		}
+		result := runner.Run(ctx, command)
+		if !result.Passed {
+			return "", fmt.Errorf("required publication verification %q failed: %s/%s", command.Name, result.FailureClass, result.CauseCode)
+		}
+		receipt.Commands = append(receipt.Commands, publisherVerificationCommandReceipt{
+			Index: index, AttemptKey: publisherVerificationAttemptKey(identity, index),
+			Command: command, ExitCode: result.ExitCode, Truncated: result.Truncated,
+			Passed: result.Passed, FailureClass: result.FailureClass, CauseCode: result.CauseCode,
+		})
 	}
-	return nil
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return "", errors.New("encode publisher verification receipt")
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+type publisherVerificationReceipt struct {
+	Version        string                                `json:"version"`
+	RunID          string                                `json:"run_id"`
+	ArtifactDigest string                                `json:"artifact_digest"`
+	TreeSHA        string                                `json:"tree_sha"`
+	ProfileDigest  string                                `json:"profile_digest"`
+	Environment    map[string]string                     `json:"environment"`
+	Commands       []publisherVerificationCommandReceipt `json:"commands"`
+}
+
+type publisherVerificationCommandReceipt struct {
+	Index        int                  `json:"index"`
+	AttemptKey   string               `json:"attempt_key"`
+	Command      verification.Command `json:"command"`
+	ExitCode     int                  `json:"exit_code"`
+	Truncated    bool                 `json:"truncated"`
+	Passed       bool                 `json:"passed"`
+	FailureClass string               `json:"failure_class,omitempty"`
+	CauseCode    string               `json:"cause_code,omitempty"`
+}
+
+func publisherVerificationIdentity(req publisher.Request) executor.AttemptID {
+	digest := sha256.Sum256([]byte(
+		"paje-publisher-verification-v1\x00" + req.RunID + "\x00" + req.Artifact.Digest + "\x00" +
+			req.ArtifactManifest.TreeSHA + "\x00" + req.WorkerProfile.Digest,
+	))
+	seconds := int64(binary.BigEndian.Uint32(digest[0:4]))
+	nanoseconds := int64(binary.BigEndian.Uint32(digest[4:8]) % 1_000_000_000)
+	attempt := int(binary.BigEndian.Uint32(digest[8:12])&0x7fffffff) + 1
+	return executor.AttemptID{
+		RunID: req.RunID, Stage: publisherVerificationStage, Attempt: attempt,
+		StartedAt: time.Unix(946684800+seconds, nanoseconds).UTC(),
+		Purpose:   executor.PurposeVerification,
+	}
+}
+
+func publisherVerificationAttemptKey(identity executor.AttemptID, index int) string {
+	identity.Sequence = index + 1
+	return identity.Key()
+}
+
+func publisherSandboxEnvironment() map[string]string {
+	return map[string]string{
+		"HOME": "/home/paje", "PATH": "/usr/local/bin:/usr/bin:/bin", "TMPDIR": "/tmp",
+	}
 }
 
 func (p *Publisher) findOrCreatePullRequest(
@@ -368,11 +481,27 @@ func containedDirectory(root, relative string) (string, error) {
 	return candidate, nil
 }
 
+func repositoryRelativeDirectory(root, relative string) (string, error) {
+	relative = strings.TrimSpace(relative)
+	if relative == "" {
+		relative = "."
+	}
+	clean := filepath.Clean(relative)
+	if _, err := containedDirectory(root, clean); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(clean), nil
+}
+
 func commitMessage(req publisher.Request) string {
-	return req.Title + "\n\n" +
+	message := req.Title + "\n\n" +
 		"Paje-Run-ID: " + req.RunID + "\n" +
 		"Paje-Base-SHA: " + req.BaseSHA + "\n" +
 		"Paje-Artifact-Digest: " + req.Artifact.Digest
+	if req.VerificationDigest != "" {
+		message += "\nPaje-Publisher-Verification-Digest: " + req.VerificationDigest
+	}
+	return message
 }
 
 func validatePushURL(value string) error {
@@ -414,20 +543,6 @@ func validateCredentialEnvironment(environment map[string]string) error {
 		}
 		if strings.ContainsRune(value, '\x00') {
 			return fmt.Errorf("prepare publication credentials: invalid environment value")
-		}
-	}
-	return nil
-}
-
-func validateVerificationEnvironment(environment map[string]string) error {
-	for key, value := range environment {
-		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, '\x00') {
-			return fmt.Errorf("create Git PR publisher: invalid verification environment")
-		}
-		if strings.HasPrefix(key, "HATCHET_") || strings.HasPrefix(key, "MEM0_") ||
-			strings.HasPrefix(key, "GITHUB_") || strings.HasPrefix(key, "PAJE_GIT_") ||
-			key == "GH_TOKEN" || key == "GIT_ASKPASS" || key == "CODEX_HOME" {
-			return fmt.Errorf("create Git PR publisher: verification environment contains service credential %q", key)
 		}
 	}
 	return nil

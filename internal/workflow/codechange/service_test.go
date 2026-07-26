@@ -34,6 +34,8 @@ import (
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 )
 
+var testPublisherVerificationDigest = strings.Repeat("d", 64)
+
 func TestServiceArtifactOnlyRealGitFlowReloadsFilesystemStores(t *testing.T) {
 	source, baseSHA := createGitSource(t)
 	managerRoot := t.TempDir()
@@ -232,7 +234,8 @@ func TestServicePullRequestApprovalIsArtifactBoundAndPublishesOnce(t *testing.T)
 	pubResult := publisher.Result{
 		Provider: "github", Branch: "paje/code-change/run-123",
 		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-		PullRequestURL: "https://example.test/pull/42",
+		PullRequestURL:     "https://example.test/pull/42",
+		VerificationDigest: testPublisherVerificationDigest,
 	}
 	pub := &sequencePublisher{results: []publisher.Result{pubResult}}
 	fixture.service.publisher = pub
@@ -257,14 +260,32 @@ func TestServicePullRequestApprovalIsArtifactBoundAndPublishesOnce(t *testing.T)
 	if request.AgentSummary == "" || strings.Contains(request.AgentSummary, "agent-secret") {
 		t.Fatalf("unsafe agent summary = %q", request.AgentSummary)
 	}
+	boundInput, err := validateRunBinding(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildPublisherRequestWithBundle(record, boundInput, bundle); err != nil {
+		t.Fatalf("buildPublisherRequestWithBundle() error = %v", err)
+	}
 
 	published, err := fixture.service.Publish(context.Background(), "run-123")
 	if err != nil || published.Status != run.StatusPublishing || pub.CallCount() != 1 {
 		t.Fatalf("Publish() result=%#v error=%v calls=%d", published, err, pub.CallCount())
 	}
-	if got := pub.Requests()[0].Repository; got != request.Repository ||
+	publisherRequest := pub.Requests()[0]
+	if got := publisherRequest.Repository; got != request.Repository ||
 		got != "https://github.com/araihu/paje.git" {
 		t.Fatalf("repository identity approval=%q publisher=%q", request.Repository, got)
+	}
+	executionEvidence, err := publisher.DecodeExecutionEvidence(bundle.ExecutionMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.WorkerProfile == nil ||
+		!reflect.DeepEqual(publisherRequest.WorkerProfile, *record.WorkerProfile) ||
+		!reflect.DeepEqual(publisherRequest.ArtifactManifest, bundle.Manifest) ||
+		!reflect.DeepEqual(publisherRequest.ExecutionEvidence, executionEvidence) {
+		t.Fatalf("publisher request portable binding = %#v", publisherRequest)
 	}
 	again, err := fixture.service.Publish(context.Background(), "run-123")
 	if err != nil || again.Status != run.StatusPublishing || pub.CallCount() != 1 {
@@ -277,6 +298,73 @@ func TestServicePullRequestApprovalIsArtifactBoundAndPublishesOnce(t *testing.T)
 		final.Publication == nil || *final.Publication != pubResult ||
 		final.Approval == nil || !final.Approval.Approved {
 		t.Fatalf("Finalize() result=%#v error=%v", final, err)
+	}
+}
+
+func TestServicePublicationVerificationReceiptIsDurableAndReplayBound(t *testing.T) {
+	fixture := publishedServiceFixture(t)
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, found := latestStage(record, publishStage)
+	if record.Publication == nil ||
+		record.Publication.VerificationDigest != testPublisherVerificationDigest ||
+		!found || stage.Evidence["publisher_verification_digest"] != testPublisherVerificationDigest {
+		t.Fatalf("durable publisher verification receipt = %#v stage=%#v", record.Publication, stage)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*run.Record)
+	}{
+		{
+			name: "missing result receipt",
+			mutate: func(record *run.Record) {
+				record.Publication.VerificationDigest = ""
+			},
+		},
+		{
+			name: "changed evidence receipt",
+			mutate: func(record *run.Record) {
+				for index := range record.Stages {
+					if record.Stages[index].Name == publishStage {
+						record.Stages[index].Evidence["publisher_verification_digest"] = strings.Repeat("e", 64)
+					}
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture.runs.loadMutate = func(record run.Record) run.Record {
+				test.mutate(&record)
+				return record
+			}
+			if _, err := fixture.service.Publish(context.Background(), "run-123"); err == nil {
+				t.Fatal("Publish(replay drift) error = nil")
+			}
+			fixture.runs.loadMutate = nil
+		})
+	}
+}
+
+func TestServiceRejectsPublisherResultWithoutVerificationReceipt(t *testing.T) {
+	fixture := approvedServiceFixture(t)
+	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
+		Provider: "github", Branch: "paje/code-change/run-123",
+		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
+		PullRequestURL: "https://example.test/pull/42",
+	}}}
+	if result, err := fixture.service.Publish(context.Background(), "run-123"); err == nil || result.FailureClass != run.FailurePublication {
+		t.Fatalf("Publish(missing receipt) result=%#v error=%v", result, err)
+	}
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Publication != nil {
+		t.Fatalf("publication without verification receipt persisted: %#v", record.Publication)
 	}
 }
 
@@ -373,7 +461,8 @@ func TestServiceApprovalAndPublishPersistCancellationAfterProviderReturns(t *tes
 			return publisher.Result{
 				Provider: "github", Branch: "paje/code-change/run-123",
 				CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-				PullRequestURL: "https://example.test/pull/42",
+				PullRequestURL:     "https://example.test/pull/42",
+				VerificationDigest: testPublisherVerificationDigest,
 			}, nil
 		})
 		result, err := fixture.service.Publish(ctx, "run-123")
@@ -417,7 +506,8 @@ func TestServiceApprovalAndPublishPersistCancellationAfterProviderReturns(t *tes
 		fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
 			Provider: "github", Branch: "paje/code-change/run-123",
 			CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-			PullRequestURL: "https://example.test/pull/42",
+			PullRequestURL:     "https://example.test/pull/42",
+			VerificationDigest: testPublisherVerificationDigest,
 		}}}
 		result, err := fixture.service.Publish(ctx, "run-123")
 		if err == nil || result.Status != run.StatusCanceled {
@@ -544,7 +634,8 @@ func TestServiceFinalizeRejectsTamperedDurableApprovalBeforeMemoryAndResult(t *t
 	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
 		Provider: "github", Branch: "paje/code-change/run-123",
 		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-		PullRequestURL: "https://example.test/pull/42",
+		PullRequestURL:     "https://example.test/pull/42",
+		VerificationDigest: testPublisherVerificationDigest,
 	}}}
 	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
 		t.Fatal(err)
@@ -1340,7 +1431,8 @@ func TestServicePublishClassifiesConflictAndRetriesTypedOutage(t *testing.T) {
 		success := publisher.Result{
 			Provider: "github", Branch: "paje/code-change/run-123",
 			CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-			PullRequestURL: "https://example.test/pull/42",
+			PullRequestURL:     "https://example.test/pull/42",
+			VerificationDigest: testPublisherVerificationDigest,
 		}
 		pub := &sequencePublisher{
 			results: []publisher.Result{{}, success},
@@ -1365,7 +1457,8 @@ func TestServicePublishClassifiesConflictAndRetriesTypedOutage(t *testing.T) {
 			result: publisher.Result{
 				Provider: "gitlab", Branch: "paje/code-change/run-123",
 				CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-				PullRequestURL: "https://example.test/pull/42",
+				PullRequestURL:     "https://example.test/pull/42",
+				VerificationDigest: testPublisherVerificationDigest,
 			},
 		},
 		{
@@ -1373,7 +1466,8 @@ func TestServicePublishClassifiesConflictAndRetriesTypedOutage(t *testing.T) {
 			result: publisher.Result{
 				Provider: "github", Branch: "paje/code-change/run-123",
 				CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-				PullRequestURL: "https://secret@example.test/pull/42",
+				PullRequestURL:     "https://secret@example.test/pull/42",
+				VerificationDigest: testPublisherVerificationDigest,
 			},
 		},
 	} {
@@ -2415,7 +2509,8 @@ func publishedServiceFixture(t *testing.T) *serviceFixture {
 	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
 		Provider: "github", Branch: "paje/code-change/run-123",
 		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-		PullRequestURL: "https://example.test/pull/42",
+		PullRequestURL:     "https://example.test/pull/42",
+		VerificationDigest: testPublisherVerificationDigest,
 	}}}
 	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
 		t.Fatalf("Publish() error = %v", err)
@@ -2494,7 +2589,8 @@ func approvalRetriedPublishedServiceFixture(t *testing.T) *serviceFixture {
 	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
 		Provider: "github", Branch: "paje/code-change/run-123",
 		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-		PullRequestURL: "https://example.test/pull/42",
+		PullRequestURL:     "https://example.test/pull/42",
+		VerificationDigest: testPublisherVerificationDigest,
 	}}}
 	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
 		t.Fatalf("Publish() error = %v", err)
@@ -2508,7 +2604,8 @@ func publishRetriedServiceFixture(t *testing.T) *serviceFixture {
 	fixture.service.publisher = &sequencePublisher{results: []publisher.Result{{
 		Provider: "github", Branch: "paje/code-change/run-123",
 		CommitSHA: strings.Repeat("c", 40), PullRequestID: "42",
-		PullRequestURL: "https://example.test/pull/42",
+		PullRequestURL:     "https://example.test/pull/42",
+		VerificationDigest: testPublisherVerificationDigest,
 	}}}
 	if _, err := fixture.service.Publish(context.Background(), "run-123"); err != nil {
 		t.Fatalf("Publish(retry) error = %v", err)

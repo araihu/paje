@@ -19,11 +19,234 @@ import (
 	"github.com/araihu/paje/internal/artifact"
 	artifactfs "github.com/araihu/paje/internal/artifact/filesystem"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
+	"github.com/araihu/paje/internal/executor"
+	executormock "github.com/araihu/paje/internal/executor/mock"
 	"github.com/araihu/paje/internal/publisher"
 	"github.com/araihu/paje/internal/template"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
+	"github.com/araihu/paje/internal/workspace"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 )
+
+func TestPublisherVerifiesPersistedProfileInSecretFreeSandboxBeforeCredentials(t *testing.T) {
+	fixture := newPublicationFixture(t)
+	var eventsMu sync.Mutex
+	var events []string
+	var verificationWorkspace string
+	fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		events = append(events, "verify")
+		verificationWorkspace = request.Workspace.HostPath
+		if request.Profile.Digest != fixture.request.WorkerProfile.Digest {
+			t.Errorf("verification profile digest = %q, want %q", request.Profile.Digest, fixture.request.WorkerProfile.Digest)
+		}
+		if len(request.Secrets) != 0 || len(request.Environment) != 3 ||
+			request.Environment["HOME"] != "/home/paje" ||
+			request.Environment["PATH"] != "/usr/local/bin:/usr/bin:/bin" ||
+			request.Environment["TMPDIR"] != "/tmp" {
+			t.Errorf("verification request carries ambient values or secrets: %#v", request)
+		}
+	})
+	fixture.credentials.beforePrepare = func() {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		if verificationWorkspace == "" {
+			t.Error("credentials prepared without a verification workspace")
+		} else if _, err := os.Stat(verificationWorkspace); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("verification workspace still exists before credentials: %v", err)
+		}
+		events = append(events, "credentials")
+	}
+
+	if _, err := fixture.publisher.Publish(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	if strings.Join(events, ",") != "verify,credentials" {
+		t.Fatalf("events = %v, want verification before credentials", events)
+	}
+}
+
+func TestPublisherVerificationAttemptIdentitiesAreDeterministicDistinctAndReplayStable(t *testing.T) {
+	fixture := newPublicationFixture(t)
+	request := fixture.requestWithVerificationCommands([]verification.Command{
+		{
+			Name: "go test", Directory: ".", Executable: "go",
+			Args: []string{"test", "./..."}, Timeout: time.Minute, Required: true,
+		},
+		{
+			Name: "go vet", Directory: ".", Executable: "go",
+			Args: []string{"vet", "./..."}, Timeout: time.Minute, Required: true,
+		},
+	})
+
+	first, err := fixture.publisher.Publish(context.Background(), request)
+	if err != nil {
+		t.Fatalf("first Publish() error = %v", err)
+	}
+	if len(first.VerificationDigest) != 64 {
+		t.Fatalf("publisher verification digest = %q", first.VerificationDigest)
+	}
+	firstRequests := fixture.executor.Requests()
+	if len(firstRequests) != 2 {
+		t.Fatalf("first verification requests = %d, want 2", len(firstRequests))
+	}
+	if firstRequests[0].Attempt.Stage != "publish-verification" ||
+		firstRequests[1].Attempt.Stage != "publish-verification" ||
+		firstRequests[0].Attempt.Sequence != 1 || firstRequests[1].Attempt.Sequence != 2 ||
+		firstRequests[0].Attempt.Key() == firstRequests[1].Attempt.Key() {
+		t.Fatalf("verification attempt identities = %#v, %#v", firstRequests[0].Attempt, firstRequests[1].Attempt)
+	}
+
+	second, err := fixture.publisher.Publish(context.Background(), request)
+	if err != nil || second != first {
+		t.Fatalf("replay Publish() result=%#v error=%v want=%#v", second, err, first)
+	}
+	allRequests := fixture.executor.Requests()
+	if len(allRequests) != 4 ||
+		allRequests[0].Attempt.Key() != allRequests[2].Attempt.Key() ||
+		allRequests[1].Attempt.Key() != allRequests[3].Attempt.Key() {
+		t.Fatalf("replay attempt identities = %#v", allRequests)
+	}
+}
+
+func TestPublisherVerificationFailuresBlockCredentialPreparation(t *testing.T) {
+	providerSecret := "provider-secret-must-not-be-reported"
+	tests := []struct {
+		name       string
+		result     executor.Result
+		executeErr error
+		destroyErr error
+	}{
+		{
+			name:   "nonzero",
+			result: executor.Result{Created: true, Started: true, Completed: true, ExitCode: 1},
+		},
+		{
+			name:       "provider error",
+			executeErr: executor.WrapError("environment", "provider_unavailable", errors.New(providerSecret)),
+		},
+		{
+			name:       "ambiguous attempt",
+			result:     executor.Result{Created: true, Started: true},
+			executeErr: executor.WrapError("internal", "ambiguous_attempt", errors.New(providerSecret)),
+		},
+		{
+			name:       "timeout",
+			result:     executor.Result{Created: true, Started: true},
+			executeErr: context.DeadlineExceeded,
+		},
+		{
+			name:       "cleanup failure",
+			result:     executor.Result{Created: true, Started: true, Completed: true},
+			destroyErr: errors.New("destroy failed"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPublicationFixture(t)
+			target := &faultExecutor{
+				Executor: fixture.executor, result: test.result,
+				executeErr: test.executeErr, destroyErr: test.destroyErr,
+			}
+			registry, err := executor.NewRegistry(executor.Registration{
+				RuntimeKind: workerprofile.RuntimeHost, Executor: target,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.publisher.executors = registry
+
+			if _, err := fixture.publisher.Publish(context.Background(), fixture.request); err == nil {
+				t.Fatal("Publish() error = nil")
+			} else if strings.Contains(err.Error(), providerSecret) {
+				t.Fatalf("Publish() leaked provider detail: %v", err)
+			}
+			if got := fixture.credentials.PrepareCount(); got != 0 {
+				t.Fatalf("credential preparations = %d, want 0", got)
+			}
+			if got := fixture.pullRequests.CreateCount(); got != 0 {
+				t.Fatalf("pull request creates = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestPublisherVerificationWorkspaceCleanupFailureBlocksCredentials(t *testing.T) {
+	fixture := newPublicationFixture(t)
+	fixture.publisher.workspaces = cleanupFailureManager{
+		Manager: fixture.publisher.workspaces, err: errors.New("cleanup not confirmed"),
+	}
+
+	if _, err := fixture.publisher.Publish(context.Background(), fixture.request); err == nil {
+		t.Fatal("Publish() error = nil, want cleanup failure")
+	}
+	if got := fixture.credentials.PrepareCount(); got != 0 {
+		t.Fatalf("credential preparations = %d, want 0", got)
+	}
+	if got := fixture.pullRequests.CreateCount(); got != 0 {
+		t.Fatalf("pull request creates = %d, want 0", got)
+	}
+}
+
+func TestPublisherRejectsPortableBindingDriftBeforeVerificationOrCredentials(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *publisher.Request)
+	}{
+		{
+			name: "profile drift",
+			mutate: func(t *testing.T, request *publisher.Request) {
+				profile := request.WorkerProfile.Clone()
+				profile.Metadata.Revision++
+				profile.Digest = ""
+				canonical, err := workerprofile.Canonicalize(profile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.WorkerProfile = canonical
+			},
+		},
+		{
+			name: "artifact manifest drift",
+			mutate: func(_ *testing.T, request *publisher.Request) {
+				request.ArtifactManifest.TreeSHA = strings.Repeat("f", 40)
+			},
+		},
+		{
+			name: "execution evidence drift",
+			mutate: func(_ *testing.T, request *publisher.Request) {
+				request.ExecutionEvidence.Profile.Digest = strings.Repeat("f", 64)
+			},
+		},
+		{
+			name: "environment evidence drift",
+			mutate: func(_ *testing.T, request *publisher.Request) {
+				keys := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR", "TOKEN"}
+				request.ExecutionEvidence.VerificationEnvironmentKeys = &keys
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPublicationFixture(t)
+			request := publisher.CloneRequest(fixture.request)
+			test.mutate(t, &request)
+			if _, err := fixture.publisher.Publish(context.Background(), request); err == nil {
+				t.Fatal("Publish(drift) error = nil")
+			}
+			if got := len(fixture.executor.Requests()); got != 0 {
+				t.Fatalf("verification requests = %d, want 0", got)
+			}
+			if got := fixture.credentials.PrepareCount(); got != 0 {
+				t.Fatalf("credential preparations = %d, want 0", got)
+			}
+		})
+	}
+}
 
 func TestPublisherPublishesArtifactAndReusesExactRemoteState(t *testing.T) {
 	fixture := newPublicationFixture(t)
@@ -49,14 +272,22 @@ func TestPublisherPublishesArtifactAndReusesExactRemoteState(t *testing.T) {
 		t.Fatalf("commit tree = %q, want artifact tree %q", got, fixture.treeSHA)
 	}
 	message := fixture.git("--git-dir", fixture.remote, "show", "-s", "--format=%B", remoteCommit)
+	verificationDigest := verificationDigestFromCommitMessage(message)
+	if len(verificationDigest) != 64 {
+		t.Fatalf("publisher verification digest = %q", verificationDigest)
+	}
+	if first.VerificationDigest != verificationDigest {
+		t.Fatalf("result verification digest = %q, commit receipt = %q", first.VerificationDigest, verificationDigest)
+	}
 	wantMessage := request.Title + "\n\n" +
 		"Paje-Run-ID: " + request.RunID + "\n" +
 		"Paje-Base-SHA: " + request.BaseSHA + "\n" +
-		"Paje-Artifact-Digest: " + request.Artifact.Digest
+		"Paje-Artifact-Digest: " + request.Artifact.Digest + "\n" +
+		"Paje-Publisher-Verification-Digest: " + verificationDigest
 	if message != wantMessage {
 		t.Fatalf("commit message = %q, want %q", message, wantMessage)
 	}
-	if got := fixture.verifier.CallCount(); got != 1 {
+	if got := len(fixture.executor.Requests()); got != 1 {
 		t.Fatalf("required verification calls = %d, want 1", got)
 	}
 	if got := fixture.pullRequests.CreateCount(); got != 1 {
@@ -127,17 +358,22 @@ func TestPublisherRejectsArtifactBindingMismatchBeforeSideEffects(t *testing.T) 
 	fixture := newPublicationFixture(t)
 	request := fixture.request
 	request.Repository = filepath.Join(t.TempDir(), "other.git")
+	request.ArtifactManifest.Repository = request.Repository
 	if _, err := fixture.publisher.Publish(context.Background(), request); !errors.Is(err, publisher.ErrConflict) {
 		t.Fatalf("Publish(repository mismatch) error = %v, want ErrConflict", err)
 	}
-	if got := fixture.verifier.CallCount(); got != 0 {
+	if got := len(fixture.executor.Requests()); got != 0 {
 		t.Fatalf("verification calls = %d, want 0", got)
 	}
 }
 
 func TestPublisherFailsClosedWhenRequiredVerificationDoesNotPass(t *testing.T) {
 	fixture := newPublicationFixture(t)
-	fixture.verifier.forceFailure = true
+	attempt := publisherVerificationIdentity(fixture.request)
+	attempt.Sequence = 1
+	fixture.executor.SetResult(attempt, executor.Result{
+		Created: true, Started: true, Completed: true, ExitCode: 1,
+	}, nil)
 
 	if _, err := fixture.publisher.Publish(context.Background(), fixture.request); err == nil {
 		t.Fatal("Publish() error = nil, want required verification failure")
@@ -148,11 +384,16 @@ func TestPublisherFailsClosedWhenRequiredVerificationDoesNotPass(t *testing.T) {
 	if got := fixture.pullRequests.CreateCount(); got != 0 {
 		t.Fatalf("pull request creates = %d, want 0", got)
 	}
+	if got := fixture.credentials.PrepareCount(); got != 0 {
+		t.Fatalf("credential preparations = %d, want 0", got)
+	}
 }
 
-func TestNewRejectsServiceCredentialsInVerificationEnvironment(t *testing.T) {
+func TestNewRejectsMissingExecutorRegistryWithoutHostRunnerFallback(t *testing.T) {
 	fixture := newPublicationFixture(t)
 	dependencies := fixture.dependencies()
+	dependencies.Executors = nil
+	dependencies.VerificationEnvironment = make(map[string]string)
 	dependencies.VerificationEnvironment["GH_TOKEN"] = "must-not-reach-repository-code"
 	if got, err := New(dependencies); err == nil {
 		t.Fatalf("New() = %#v, nil error", got)
@@ -174,7 +415,7 @@ func TestPublisherRejectsMultilineTitleBeforeArtifactSideEffects(t *testing.T) {
 	if _, err := fixture.publisher.Publish(context.Background(), request); !errors.Is(err, publisher.ErrInvalidRequest) {
 		t.Fatalf("Publish(multiline title) error = %v, want ErrInvalidRequest", err)
 	}
-	if got := fixture.verifier.CallCount(); got != 0 {
+	if got := len(fixture.executor.Requests()); got != 0 {
 		t.Fatalf("verification calls = %d, want 0", got)
 	}
 }
@@ -195,13 +436,14 @@ func TestPublisherNeverUsesAgentRepositoryConfigWithCredentials(t *testing.T) {
 	if err := os.Chmod(hostileHelper, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fixture.verifier.afterRun = func(workspace string) {
+	fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+		workspace := request.Workspace.HostPath
 		runGit(t, workspace, "config", "--local", "credential.helper", hostileHelper)
 		runGit(t, workspace, "config", "--local", "url."+redirected.URL+".insteadOf", fixture.remote)
 		runGit(t, workspace, "config", "--local", "http.proxy", "http://127.0.0.1:1")
 		runGit(t, workspace, "config", "--local", "http."+redirected.URL+".proxy", "")
 		runGit(t, workspace, "config", "--local", "http.sslVerify", "false")
-	}
+	})
 	const token = "round-one-token-must-remain-private"
 	fixture.publisher.credentials = newTokenCredentials(t, token)
 
@@ -291,9 +533,10 @@ type publicationFixture struct {
 	treeSHA      string
 	store        *artifactfs.Store
 	capturer     *gitcapture.Git
-	verifier     *recordingVerifier
 	pullRequests *recordingPullRequests
 	credentials  *recordingCredentials
+	executor     *executormock.Executor
+	profile      workerprofile.Snapshot
 	publisher    *Publisher
 	request      publisher.Request
 }
@@ -328,28 +571,50 @@ func newPublicationFixture(t *testing.T) *publicationFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor, err := verification.NewExecutor(verification.DefaultLimits)
+	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
+		APIVersion: workerprofile.APIVersionV1Alpha1,
+		Kind:       workerprofile.KindWorkerProfile,
+		Metadata:   workerprofile.ProfileID{Name: "host-dev", Revision: 1},
+		Runtime:    workerprofile.Runtime{Kind: workerprofile.RuntimeHost},
+		Harness:    workerprofile.Harness{ID: "codex", Version: "0.144.5"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	verifier := &recordingVerifier{delegate: executor}
+	targetExecutor := executormock.New()
+	executors, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeHost, Executor: targetExecutor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	pulls := &recordingPullRequests{remote: remote}
 	credentials := &recordingCredentials{}
 
 	fixture := &publicationFixture{
 		t: t, remote: remote, seed: seed, baseSHA: base, store: store,
-		capturer: capturer, verifier: verifier, pullRequests: pulls, credentials: credentials,
+		capturer: capturer, executor: targetExecutor, profile: profile,
+		pullRequests: pulls, credentials: credentials,
 	}
 	ref := fixture.captureArtifact("updated")
+	bundle, err := store.Load(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionEvidence, err := publisher.DecodeExecutionEvidence(bundle.ExecutionMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fixture.request = publisher.Request{
 		RunID: "run-123", Repository: remote, BaseSHA: base, TargetRef: "main",
 		Branch: "paje/code-change/run-123", Artifact: ref,
-		Title: "Update value", Body: "Generated safely by Pajé.", Draft: true,
+		ArtifactManifest: bundle.Manifest, WorkerProfile: profile,
+		ExecutionEvidence: executionEvidence,
+		Title:             "Update value", Body: "Generated safely by Pajé.", Draft: true,
 	}
 	fixture.publisher, err = New(Dependencies{
-		Artifacts: store, Workspaces: manager, Changes: capturer, Verification: verifier,
-		VerificationEnvironment: map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
-		PullRequests:            pulls, Credentials: credentials,
+		Artifacts: store, Workspaces: manager, Changes: capturer, Executors: executors,
+		PullRequests: pulls, Credentials: credentials,
 		PushURL: func(repository string) (string, error) { return repository, nil },
 	})
 	if err != nil {
@@ -361,9 +626,8 @@ func newPublicationFixture(t *testing.T) *publicationFixture {
 func (f *publicationFixture) dependencies() Dependencies {
 	return Dependencies{
 		Artifacts: f.store, Workspaces: f.publisher.workspaces, Changes: f.capturer,
-		Verification:            f.verifier,
-		VerificationEnvironment: map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
-		PullRequests:            f.pullRequests, Credentials: f.credentials,
+		Executors:    f.publisher.executors,
+		PullRequests: f.pullRequests, Credentials: f.credentials,
 		PushURL: func(repository string) (string, error) { return repository, nil },
 	}
 }
@@ -379,8 +643,29 @@ func (f *publicationFixture) captureArtifact(value string) artifact.Reference {
 		f.t.Fatal(err)
 	}
 	f.treeSHA = captured.TreeSHA
+	tools := artifact.ToolEvidenceList{}
+	attempts := artifact.AttemptEvidenceList{{
+		ID: executor.AttemptID{
+			RunID: "run-123", Stage: "execute", Attempt: 1,
+			StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
+		},
+		Created: true, Started: true, Completed: true, Destroyed: true,
+	}}
+	agentEnvironment := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
+	verificationEnvironment := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
 	execution, err := json.Marshal(artifact.ExecutionEvidence{
 		ExitCode: 0, Duration: 1, Started: true, Completed: true,
+		Profile: &artifact.WorkerProfileEvidence{
+			Name: f.profile.Metadata.Name, Revision: f.profile.Metadata.Revision, Digest: f.profile.Digest,
+		},
+		Runtime: &artifact.RuntimeEvidence{Kind: workerprofile.RuntimeHost},
+		Harness: &artifact.HarnessEvidence{
+			ID: f.profile.Harness.ID, DeclaredVersion: f.profile.Harness.Version,
+			ProbedVersion: f.profile.Harness.Version, ProbePassed: true,
+		},
+		Tools: &tools, Attempts: &attempts,
+		AgentEnvironmentKeys:        &agentEnvironment,
+		VerificationEnvironmentKeys: &verificationEnvironment,
 	})
 	if err != nil {
 		f.t.Fatal(err)
@@ -409,6 +694,35 @@ func (f *publicationFixture) captureArtifact(value string) artifact.Reference {
 	return ref
 }
 
+func (f *publicationFixture) requestWithVerificationCommands(commands []verification.Command) publisher.Request {
+	f.t.Helper()
+	bundle, err := f.store.Load(context.Background(), f.request.Artifact)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	bundle.Verification = make([]verification.Result, len(commands))
+	for index, command := range commands {
+		bundle.Verification[index] = verification.Result{Command: command, Passed: true}
+	}
+	reference, err := f.store.Save(context.Background(), bundle)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	bound, err := f.store.Load(context.Background(), reference)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	evidence, err := publisher.DecodeExecutionEvidence(bound.ExecutionMetadata)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	request := publisher.CloneRequest(f.request)
+	request.Artifact = reference
+	request.ArtifactManifest = bound.Manifest
+	request.ExecutionEvidence = evidence
+	return request
+}
+
 func (f *publicationFixture) git(args ...string) string {
 	f.t.Helper()
 	if len(args) >= 5 && args[0] == "--git-dir" && args[2] == "show-ref" {
@@ -426,44 +740,76 @@ func (f *publicationFixture) git(args ...string) string {
 	return runGit(f.t, directory, args...)
 }
 
-type recordingVerifier struct {
-	mu           sync.Mutex
-	delegate     verification.Runner
-	calls        int
-	forceFailure bool
-	afterRun     func(workspace string)
-}
-
-func (v *recordingVerifier) Run(ctx context.Context, command verification.Command, environment map[string]string) verification.Result {
-	v.mu.Lock()
-	v.calls++
-	forceFailure := v.forceFailure
-	v.mu.Unlock()
-	if filepath.Base(command.Executable) == "go" && command.Environment["GOWORK"] != "off" {
-		return verification.Result{Command: command, ExitCode: 1, Passed: false, FailureClass: "internal", CauseCode: "missing_gowork_off"}
-	}
-	if forceFailure {
-		return verification.Result{Command: command, ExitCode: 1, Passed: false, FailureClass: "verification", CauseCode: "nonzero_exit"}
-	}
-	result := v.delegate.Run(ctx, command, environment)
-	if result.Passed && v.afterRun != nil {
-		v.afterRun(command.Directory)
-	}
-	return result
-}
-
-func (v *recordingVerifier) CallCount() int {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.calls
-}
-
 type recordingPullRequests struct {
 	mu      sync.Mutex
 	remote  string
 	last    PullRequestRequest
 	created *PullRequest
 	creates int
+}
+
+type faultExecutor struct {
+	*executormock.Executor
+	mu         sync.Mutex
+	result     executor.Result
+	executeErr error
+	destroyErr error
+	requests   []executor.Request
+	destroys   []executor.AttemptID
+}
+
+func (target *faultExecutor) Execute(ctx context.Context, request executor.Request) (executor.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return executor.Result{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return executor.Result{}, err
+	}
+	target.mu.Lock()
+	target.requests = append(target.requests, request.Clone())
+	result, executeErr := target.result.Clone(), target.executeErr
+	target.mu.Unlock()
+	return result, executeErr
+}
+
+func (target *faultExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := attempt.Validate(); err != nil {
+		return err
+	}
+	target.mu.Lock()
+	target.destroys = append(target.destroys, attempt)
+	err := target.destroyErr
+	target.mu.Unlock()
+	return err
+}
+
+type cleanupFailureManager struct {
+	workspace.Manager
+	err error
+}
+
+func (manager cleanupFailureManager) Prepare(
+	ctx context.Context,
+	repository string,
+	baseSHA string,
+) (workspace.Workspace, error) {
+	prepared, err := manager.Manager.Prepare(ctx, repository, baseSHA)
+	if err != nil {
+		return nil, err
+	}
+	return cleanupFailureWorkspace{Workspace: prepared, err: manager.err}, nil
+}
+
+type cleanupFailureWorkspace struct {
+	workspace.Workspace
+	err error
+}
+
+func (prepared cleanupFailureWorkspace) Cleanup(ctx context.Context) error {
+	return errors.Join(prepared.Workspace.Cleanup(ctx), prepared.err)
 }
 
 func (p *recordingPullRequests) Find(_ context.Context, request PullRequestRequest) (*PullRequest, error) {
@@ -501,11 +847,20 @@ func (p *recordingPullRequests) LastRequest() PullRequestRequest {
 }
 
 type recordingCredentials struct {
-	mu       sync.Mutex
-	cleanups int
+	mu            sync.Mutex
+	cleanups      int
+	preparations  int
+	beforePrepare func()
 }
 
 func (c *recordingCredentials) Prepare(context.Context) (map[string]string, func(context.Context) error, error) {
+	c.mu.Lock()
+	c.preparations++
+	beforePrepare := c.beforePrepare
+	c.mu.Unlock()
+	if beforePrepare != nil {
+		beforePrepare()
+	}
 	return map[string]string{}, func(context.Context) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -552,6 +907,12 @@ func (c *recordingCredentials) CleanupCount() int {
 	return c.cleanups
 }
 
+func (c *recordingCredentials) PrepareCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.preparations
+}
+
 func runGit(t *testing.T, directory string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -579,4 +940,14 @@ func writeFile(t *testing.T, path, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func verificationDigestFromCommitMessage(message string) string {
+	const prefix = "Paje-Publisher-Verification-Digest: "
+	for _, line := range strings.Split(message, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
 }

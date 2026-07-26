@@ -38,7 +38,7 @@ func (s *Service) Publish(ctx context.Context, runID string) (PhaseResult, error
 			"%w: publication approval binding is invalid", ErrRunBinding,
 		)
 	}
-	request, err := buildPublisherRequest(record, input)
+	request, err := buildPublisherRequestWithBundle(record, input, bundle)
 	if err != nil {
 		return s.recordPublishFailure(ctx, record, publishBindingFailure(), err)
 	}
@@ -95,7 +95,7 @@ func (s *Service) Publish(ctx context.Context, runID string) (PhaseResult, error
 		}
 		return s.finishFailure(ctx, runID, failure, err, ownership.attempt)
 	}
-	phase, persistErr := s.persistPublication(ctx, runID, ownership, request, result)
+	phase, persistErr := s.persistPublication(ctx, runID, ownership, request, bundle, result)
 	if persistErr != nil && ctx.Err() != nil {
 		return s.compensateOwnedCancellation(ctx, runID, ownership, persistErr)
 	}
@@ -149,7 +149,33 @@ func buildPublisherRequest(
 		),
 		Draft: input.Publication.Draft,
 	}
-	if err := request.Validate(); err != nil {
+	return request, nil
+}
+
+func buildPublisherRequestWithBundle(
+	record run.Record,
+	input templatecodechange.Input,
+	bundle artifact.Bundle,
+) (publisher.Request, error) {
+	request, err := buildPublisherRequest(record, input)
+	if err != nil {
+		return publisher.Request{}, err
+	}
+	if record.WorkerProfile == nil {
+		return publisher.Request{}, errors.New("worker profile is missing")
+	}
+	reference, err := artifact.ReferenceFor(bundle)
+	if err != nil || reference != *record.Artifact {
+		return publisher.Request{}, errors.New("artifact bundle reference is not exact")
+	}
+	executionEvidence, err := publisher.DecodeExecutionEvidence(bundle.ExecutionMetadata)
+	if err != nil {
+		return publisher.Request{}, err
+	}
+	request.ArtifactManifest = bundle.Manifest
+	request.WorkerProfile = record.WorkerProfile.Clone()
+	request.ExecutionEvidence = executionEvidence
+	if err := request.ValidatePortable(); err != nil {
 		return publisher.Request{}, err
 	}
 	return request, nil
@@ -160,6 +186,7 @@ func (s *Service) persistPublication(
 	runID string,
 	ownership stageOwnership,
 	request publisher.Request,
+	bundle artifact.Bundle,
 	result publisher.Result,
 ) (PhaseResult, error) {
 	record, err := s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
@@ -173,8 +200,8 @@ func (s *Service) persistPublication(
 		if err != nil {
 			return run.Record{}, false, err
 		}
-		currentRequest, err := buildPublisherRequest(current, input)
-		if err != nil || currentRequest != request {
+		currentRequest, err := buildPublisherRequestWithBundle(current, input, bundle)
+		if err != nil || !publisher.RequestsEqual(currentRequest, request) {
 			return run.Record{}, false, fmt.Errorf("%w: publication request changed", ErrRunBinding)
 		}
 		if current.Publication != nil {
@@ -299,7 +326,7 @@ func validatePublicationResult(
 	request publisher.Request,
 	expectedProvider string,
 ) error {
-	if err := result.Validate(request); err != nil {
+	if err := result.ValidateVerified(request); err != nil {
 		return err
 	}
 	if result.Provider != expectedProvider {
@@ -321,7 +348,8 @@ func publicationEvidence(
 		"target_branch": request.TargetRef, "publication_branch": request.Branch,
 		"artifact_digest": request.Artifact.Digest, "provider": result.Provider,
 		"commit_sha": result.CommitSHA, "pull_request_id": result.PullRequestID,
-		"pull_request_url": result.PullRequestURL,
+		"pull_request_url":              result.PullRequestURL,
+		"publisher_verification_digest": result.VerificationDigest,
 	}
 }
 
