@@ -331,9 +331,10 @@ This is the only implementation DAG for this plan. `ACP-00` through `ACP-04`
 are the integrated foundation present at baseline
 `984d8797fc3650e2654b1413a47b1ae30b357c4c`. Their detailed task sections are
 retained as the contract and verification record; they are not reimplemented.
-`ACP-14` through `ACP-21` reconcile the three empirical analyses into the
-foundation before the remaining gateway, client, plugin, packaging,
-certification, acceptance, documentation, and completion work.
+`ACP-14`, `ACP-14.1`, and `ACP-15` through `ACP-21` reconcile the three
+empirical analyses into the foundation before the remaining gateway, client,
+plugin, packaging, certification, acceptance, documentation, and completion
+work.
 
 `PW-07` means Task 7, “Split Images, Real Docker Conformance, and Worker Profile
 Fixture,” in the
@@ -357,7 +358,8 @@ flowchart LR
     A03 --> A04
 
     A04 --> A14["ACP-14 Authoritative journal and projections"]
-    A14 --> A15["ACP-15 Multi-run admission and isolation"]
+    A14 --> A141["ACP-14.1 Atomic semantic journal transaction"]
+    A141 --> A15["ACP-15 Multi-run admission and isolation"]
     A15 --> A16["ACP-16 Ownership and managed resources"]
     A15 --> A17["ACP-17 Runtime supervisor and closure"]
     PW07["PW-07 satisfied at parent 740b355"] --> A16
@@ -537,20 +539,60 @@ successor base and may mutate only its listed ownership.
 - `fallback`: `local_sequential` with sole ownership; never shared writer.
 - `promotion_trigger`: `none`.
 
+#### ACP-14.1 — Atomic semantic journal transaction and payload authority
+
+- Dependencies: `ACP-14` and the integrated portable execution checkpoint
+  through `PW-09`.
+- Ownership paths: exact exclusive edits to
+  `internal/controlplane/journal/{types.go,store.go,store_test.go}`,
+  `internal/controlplane/filesystem/{store.go,store_test.go}`, and
+  `internal/controlplane/mock/store.go`.
+- Frozen inputs: ACP-14 journal/feed/cursor authority, requirements
+  `ACP-J01..J06`, and the accepted ACP-15 finding that installation-wide quota
+  decisions require one global-cursor CAS with durable semantic payloads.
+- Test-first acceptance gates: canonical bounded request/outcome payloads,
+  atomic action/reservation/outcome/payload visibility, exact per-run plus
+  global cursor CAS, response-loss replay before numeric cursor rejection,
+  changed-input conflict, restart payload retrieval, whole-journal validation
+  before replay or payload return, construction-time commit/staging directory
+  identity, ordinary and symlink replacement denial, near-limit base64 staging
+  bounds, malformed staging grammar, timestamp canonicalization, crash
+  boundaries, memory/filesystem/mock parity, race, focused `-count=20`, vet,
+  exact one-commit path and clean-worktree audit.
+- Integration receipt: candidate
+  `27297122350a8b20bae1c88013e746ec6b1065ea` passed independent review with no
+  Critical or Important findings and was integrated as parent
+  `cf242c529a084152c4285513e6fb439fb0ed70b7`.
+- Integration order: slot 14.1 immediately after ACP-14 and before ACP-15.
+- `execution_placement`: `isolated_authoritative_journal_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: restart-critical cross-run CAS and filesystem
+  containment required an isolated durable correction stream.
+- `capability_requirements`: exact-base worktree, crash injection, filesystem
+  replacement and symlink fixtures, focused race/count-20 gates, independent
+  review.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential` with sole ownership; never emulate authority
+  with a side store or mutable projection.
+- `promotion_trigger`: `none`.
+
 #### ACP-15 — Central multi-run admission, scheduler, and isolation
 
-- Dependencies: `ACP-14`.
+- Dependencies: `ACP-14.1` integrated at
+  `cf242c529a084152c4285513e6fb439fb0ed70b7`.
 - Ownership paths: `internal/controlplane/admission/**`,
   `internal/controlplane/scheduler/**`, and
   `internal/controlplane/isolation/**`; status and runtime reconciler paths are
   forbidden.
-- Frozen inputs: ACP-14 journal/projection interfaces, canonical project
-  identity, requirements `ACP-M01..M08`, and versioned quota/fairness policy.
+- Frozen inputs: ACP-14 journal/projection interfaces, ACP-14.1
+  `AuthoritativeStore.Commit` plus immutable `Payload` retrieval, canonical
+  project identity, requirements `ACP-M01..M08`, and versioned quota/fairness
+  policy.
 - Test-first acceptance gates: concurrent unrelated runs, per-installation/
   principal/run/project/primitive quotas, bounded burst, fair ordering, aging,
   backpressure, no starvation, actual-shared-resource contention, identical
   unrelated paths, no global mutex, and bounded fair restart scan.
-- Integration order: slot 15 immediately after ACP-14.
+- Integration order: slot 15 immediately after ACP-14.1.
 - `execution_placement`: `isolated_multirun_scheduler_worktree`.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: centralized concurrency logic is independently
@@ -2292,6 +2334,68 @@ git add internal/controlplane
 git commit -m "feat: make control journal authoritative"
 ```
 
+### Task 14.1 (ACP-14.1): Add the atomic semantic journal transaction
+
+**Files:**
+- Modify exclusively: `internal/controlplane/journal/types.go`
+- Modify exclusively: `internal/controlplane/journal/store.go`
+- Modify exclusively: `internal/controlplane/journal/store_test.go`
+- Modify exclusively: `internal/controlplane/filesystem/store.go`
+- Modify exclusively: `internal/controlplane/filesystem/store_test.go`
+- Modify exclusively: `internal/controlplane/mock/store.go`
+
+**Interfaces:**
+- Produces `journal.CommitRequest`, `journal.CommitReceipt`, and
+  `journal.AuthoritativeStore` with `Commit` and `Payload`.
+- Commits one action, reservation, terminal outcome, canonical request payload,
+  and canonical outcome payload under exact run/global cursor CAS.
+- Preserves `journal.Store`, feed, cursor, migration, projection, memory,
+  filesystem, and mock compatibility.
+
+- [x] **Step 1: Capture the missing-authority RED**
+
+Prove the pre-existing store cannot atomically arbitrate a semantic decision
+across different runs, persist its canonical request/outcome bytes, or replay
+the receipt after response loss without splitting authority into a side store.
+
+- [x] **Step 2: Implement and test the frozen authoritative transaction**
+
+Freeze the following provider-neutral boundary:
+
+```go
+type AuthoritativeStore interface {
+    Store
+    Commit(context.Context, CommitRequest) (CommitReceipt, error)
+    Payload(context.Context, string) ([]byte, error)
+}
+```
+
+`Commit` validates two exact canonical JSON payloads of at most 1 MiB each and
+their SHA-256 bindings. A new commit atomically compares the expected run and
+global cursors and publishes the action, reservation, outcome, and payloads,
+advancing each cursor by exactly two. Exact replay precedes numeric cursor CAS;
+changed action, key, payload, or outcome conflicts.
+
+- [x] **Step 3: Make durable replay and containment fail closed**
+
+Before exact replay or `Payload`, validate the merged authoritative feed,
+per-run sequences, installation identity, action bindings, unique idempotency
+keys, and exact commit membership. Bind `journal/commits` and
+`journal/commit-staging` to their construction-time filesystem identities and
+revalidate before every read, stage, recovery, rename, and publication. Reject
+ordinary replacement, symlink replacement, malformed staging names,
+structurally valid duplicate identities, and corrupt or globally gapped state
+without mutating either source or replacement paths.
+
+- [x] **Step 4: Verify, independently review, integrate, and persist the receipt**
+
+The final candidate `27297122350a8b20bae1c88013e746ec6b1065ea`
+passed authoritative/crash `-count=20`, full control-plane race, vet, diff,
+one-commit/six-path/clean audits, and independent review with no Critical or
+Important findings. The parent repeated the gates, integrated it as
+`cf242c529a084152c4285513e6fb439fb0ed70b7`, archived the durable task, and
+removed its isolated worktree.
+
 ### Task 15 (ACP-15): Add fair centralized multi-run admission and isolation
 
 **Files:**
@@ -2304,7 +2408,8 @@ git commit -m "feat: make control journal authoritative"
 - Create: `internal/controlplane/isolation/scope_test.go`
 
 **Interfaces:**
-- Consumes only ACP-14 journal/projection interfaces and canonical project IDs.
+- Consumes ACP-14 journal/projection interfaces, ACP-14.1
+  `journal.AuthoritativeStore`, and canonical project IDs.
 - Produces durable `RunAdmission`, `ReadyWorkItem`, `QuotaPolicy`, `ResourceKey`,
   `LeaseRequest`, `RunScope`, `ProjectScope`, and opaque `CredentialScope`
   records used by ownership, supervision, gates, integration, publication,
@@ -2378,7 +2483,8 @@ Expected: FAIL because the packages do not exist.
 
 - [ ] **Step 4: Implement durable admission and resource-specific leases**
 
-Reserve every queue transition through ACP-14. `Admit` returns either one
+Reserve every queue transition through ACP-14.1 `AuthoritativeStore.Commit`.
+`Admit` returns either one
 receipt or a durable backpressure record containing the limiting quota and next
 eligibility. Never invoke external work from the scheduler package.
 

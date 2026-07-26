@@ -480,6 +480,22 @@ type ControlEvent struct {
     ProviderReceipt  string
     OccurredAt       time.Time
 }
+
+type CommitRequest struct {
+    Action         ControlAction
+    ExpectedRun    RunCursor
+    ExpectedGlobal GlobalCursor
+    RequestPayload []byte
+    Outcome        ControlEvent
+    OutcomePayload []byte
+}
+
+type CommitReceipt struct {
+    Action      ControlAction
+    Reservation ControlEvent
+    Outcome     ControlEvent
+    Created     bool
+}
 ```
 
 `JournalPosition` is the authoritative installation-wide append identity. The
@@ -501,6 +517,36 @@ last consumed `RunSequence`. Neither cursor is accepted by the other feed.
 Concurrent appends, coordinator restart, or a late event for an older run may
 change only the feed suffix: they cannot renumber, reorder, or rewrite an
 existing position.
+
+Semantic control-plane transitions that must arbitrate state across runs use
+one provider-neutral authoritative transaction. `Commit` validates exact
+canonical JSON request and outcome payloads, each bounded to 1 MiB and bound by
+its SHA-256 digest, then performs one compare-and-swap over both the expected
+per-run cursor and expected installation-global cursor. The action,
+reservation event, terminal outcome event, and immutable payload bytes become
+visible together or not at all. A successful new commit advances both cursors
+by exactly two events. Admission, backpressure, lease, ownership, gate, and
+integration payload schemas MUST exclude credentials, secrets, prompts, raw
+provider output, and other unsafe evidence bodies.
+
+Exact response-loss replay is checked before numeric cursor comparison and
+returns the original immutable receipt even when the supplied cursor numbers
+are now stale. The same action ID or idempotency key with any changed action,
+payload, or outcome conflicts. `Payload(digest)` returns bytes only when the
+digest belongs to an exact validated authoritative commit. Both replay and
+payload lookup first validate the complete merged journal: contiguous global
+and per-run order, installation binding, action/event bindings, unique
+idempotency identities, and exact action/reservation/outcome membership. An
+internally plausible record inside a globally corrupt feed is never readable.
+
+The filesystem implementation binds the construction-time identity of the
+authoritative commit and staging directories and revalidates their mode, type,
+and filesystem identity immediately before every read, prepared write,
+recovery, rename, and visibility boundary. Ordinary replacement, symlink
+replacement, malformed staging names, duplicate identities, oversized encoded
+records, or corruption fail closed without mutating either the original or
+replacement path. Crash recovery may publish only a fully validated prepared
+transaction and must preserve exact receipt and payload bytes across restart.
 
 `ControlActionKind` covers at least `dispatch`, `register_runtime`, `send`,
 `observe`, `wait`, `interrupt`, `cancel`, `allocate_resource`,
@@ -1015,6 +1061,13 @@ downgrades a mandatory invariant.
   `JournalPosition` atomically with its per-run sequence; the authoritative
   global feed MUST replay only by that position and MUST rebuild every global
   projection byte-stably after concurrency or restart.
+- `ACP-J06` Every semantic transition that depends on installation-wide
+  capacity or ordering MUST atomically commit its exact canonical request and
+  outcome payloads with one reservation and one terminal outcome under both
+  expected run and global cursors. Exact replay and payload retrieval MUST
+  validate whole-journal consistency and exact commit membership, and durable
+  commit/staging paths MUST remain bound to their construction-time filesystem
+  identities across every I/O and recovery boundary.
 - `ACP-M01` The centralized service MUST support multiple concurrently active
   control runs and MUST scope every durable identity and event application by
   exact control run.
