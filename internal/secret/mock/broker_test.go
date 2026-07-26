@@ -39,3 +39,11 @@ func TestBrokerRecordsAcquisitionAndRevocation(t *testing.T) {
 		t.Fatalf("Acquire() error = %v", err)
 	}
 }
+
+func TestSetAcquireResultRetainsCloneValidationError(t *testing.T) {
+	broker := NewBroker()
+	broker.SetAcquireResult("workload.invalid", secret.Lease{}, nil)
+	if got := broker.results["workload.invalid"].err; got == nil {
+		t.Fatal("invalid lease clone error was discarded")
+	}
+}

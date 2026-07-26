@@ -23,6 +23,7 @@ type Registry struct {
 
 	mu       sync.RWMutex
 	profiles map[workerprofile.ProfileID]workerprofile.Snapshot
+	digests  map[workerprofile.ProfileID]string
 }
 
 func New(directory string, limits workerprofile.Limits) (*Registry, error) {
@@ -43,12 +44,18 @@ func (registry *Registry) Reload(ctx context.Context) error {
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	nextDigests := make(map[workerprofile.ProfileID]string, len(registry.digests)+len(profiles))
+	for id, digest := range registry.digests {
+		nextDigests[id] = digest
+	}
 	for id, profile := range profiles {
-		if existing, ok := registry.profiles[id]; ok && existing.Digest != profile.Digest {
+		if digest, ok := nextDigests[id]; ok && digest != profile.Digest {
 			return errors.New("worker profile revision is immutable")
 		}
+		nextDigests[id] = profile.Digest
 	}
 	registry.profiles = profiles
+	registry.digests = nextDigests
 	return nil
 }
 

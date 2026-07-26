@@ -108,6 +108,19 @@ func TestFilesystemEnforcesByteAndEntryLimits(t *testing.T) {
 	if _, err := provider.Read(context.Background(), directory); err == nil {
 		t.Fatal("oversized directory tree accepted")
 	}
+
+	opened, err := os.Open(large)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &stat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBoundedFile(opened, &stat, 0); !errors.Is(err, secret.ErrSourceLimit) {
+		t.Fatalf("exhausted aggregate budget error = %v", err)
+	}
 }
 
 func TestBoundedDirectoryReadStopsAtOneEntryOverLimit(t *testing.T) {

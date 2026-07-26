@@ -144,6 +144,37 @@ func TestDetectorFormattingAndSerializationRemainOpaque(t *testing.T) {
 }
 
 func TestCallerOwnedSecretCopiesCanBeDestroyed(t *testing.T) {
+	t.Run("payload value", func(t *testing.T) {
+		payload := NewValuePayload([]byte("payload-secret"))
+		retainedValue := payload.value
+		payload.Destroy()
+		for _, value := range retainedValue {
+			if value != 0 {
+				t.Fatal("Payload.Destroy did not zero its value")
+			}
+		}
+		if payload.Kind() != "" || payload.Value() != nil || payload.Files() != nil {
+			t.Fatalf("destroyed value payload accessors are non-empty: %q %q %#v", payload.Kind(), payload.Value(), payload.Files())
+		}
+	})
+
+	t.Run("payload files", func(t *testing.T) {
+		payload, err := NewDirectoryPayload([]File{mustFile(t, "auth.json", 0o600, []byte("payload-file-secret"))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		retainedValue := payload.files[0].bytes
+		payload.Destroy()
+		for _, value := range retainedValue {
+			if value != 0 {
+				t.Fatal("Payload.Destroy did not zero a file value")
+			}
+		}
+		if payload.Kind() != "" || payload.Value() != nil || payload.Files() != nil {
+			t.Fatalf("destroyed directory payload accessors are non-empty: %q %q %#v", payload.Kind(), payload.Value(), payload.Files())
+		}
+	})
+
 	t.Run("materialization value", func(t *testing.T) {
 		materialization, err := NewValueMaterialization(
 			workerprofile.DeliveryEnvironment,
@@ -405,11 +436,44 @@ func TestBrokerRejectsMismatchedPayloadShapeAndUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestBrokerBoundsProviderReadByAttemptDeadline(t *testing.T) {
+	now := time.Now().UTC()
+	request := validAcquireRequest(now.Add(25 * time.Millisecond))
+	provider := &providerStub{
+		read: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	broker, err := NewBroker(&bindingRegistryStub{binding: validBinding(t)}, map[string]Provider{
+		"environment": provider,
+	}, BrokerConfig{
+		LeaseTTL: time.Minute,
+		Now:      func() time.Time { return now },
+		Random:   bytes.NewReader(make([]byte, 64)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	_, err = broker.Acquire(context.Background(), request)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("provider read exceeded bounded deadline: %v", elapsed)
+	}
+}
+
 func TestBrokerRejectsMaterializationWhenDeadlineExpiresDuringProviderRead(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	deadline := now.Add(time.Second)
 	provider := &providerStub{payload: NewValuePayload([]byte("secret"))}
-	provider.read = func() { now = deadline.Add(time.Nanosecond) }
+	provider.read = func(context.Context) error {
+		now = deadline.Add(time.Nanosecond)
+		return nil
+	}
 	broker, err := NewBroker(&bindingRegistryStub{binding: validBinding(t)}, map[string]Provider{"environment": provider}, BrokerConfig{
 		LeaseTTL: time.Minute, Now: func() time.Time { return now }, Random: bytes.NewReader(make([]byte, 64)),
 	})
@@ -590,13 +654,15 @@ type providerStub struct {
 	payload   Payload
 	err       error
 	reference string
-	read      func()
+	read      func(context.Context) error
 }
 
-func (provider *providerStub) Read(_ context.Context, reference string) (Payload, error) {
+func (provider *providerStub) Read(ctx context.Context, reference string) (Payload, error) {
 	provider.reference = reference
 	if provider.read != nil {
-		provider.read()
+		if err := provider.read(ctx); err != nil {
+			return Payload{}, err
+		}
 	}
 	return provider.payload.Clone(), provider.err
 }

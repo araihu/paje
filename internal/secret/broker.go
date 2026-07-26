@@ -88,9 +88,16 @@ func (broker *MemoryBroker) Acquire(ctx context.Context, request AcquireRequest)
 	if !ok {
 		return Lease{}, ErrSourceUnavailable
 	}
-	payload, err := provider.Read(ctx, reference)
+	readCtx, cancelRead := context.WithTimeout(ctx, request.Deadline.Sub(now))
+	payload, err := provider.Read(readCtx, reference)
+	readContextErr := readCtx.Err()
+	cancelRead()
 	if err != nil {
 		return Lease{}, fmt.Errorf("read secret source: %w", err)
+	}
+	if readContextErr != nil {
+		payload.Destroy()
+		return Lease{}, readContextErr
 	}
 	now = broker.now().UTC()
 	if err := ctx.Err(); err != nil {
@@ -243,11 +250,7 @@ func materialize(payload Payload, requirement workerprofile.SecretRequirement) (
 }
 
 func zeroPayload(payload *Payload) {
-	zeroBytes(payload.value)
-	zeroFiles(payload.files)
-	payload.kind = ""
-	payload.value = nil
-	payload.files = nil
+	payload.Destroy()
 }
 
 func AcquireAll(ctx context.Context, broker Broker, requests []AcquireRequest) ([]Lease, error) {

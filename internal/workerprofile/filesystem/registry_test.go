@@ -159,6 +159,10 @@ func TestReloadReplacesCompleteSetOnlyAfterValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	original, err := registry.Resolve(context.Background(), workerprofile.ProfileID{Name: "old", Revision: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(filepath.Join(dir, "old.yaml")); err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +175,27 @@ func TestReloadReplacesCompleteSetOnlyAfterValidation(t *testing.T) {
 	}
 	if _, err := registry.Resolve(context.Background(), workerprofile.ProfileID{Name: "new", Revision: 2}); err != nil {
 		t.Fatalf("new profile unavailable: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(dir, "new.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	changed := strings.Replace(validYAML("old", 1), "cpu_millis: 2000", "cpu_millis: 3000", 1)
+	writeProfile(t, dir, "old.yaml", changed)
+	if err := registry.Reload(context.Background()); err == nil {
+		t.Fatal("removed immutable revision was re-added with changed content")
+	}
+	if _, err := registry.Resolve(context.Background(), workerprofile.ProfileID{Name: "new", Revision: 2}); err != nil {
+		t.Fatalf("last-known-good set changed after immutable revision failure: %v", err)
+	}
+
+	writeProfile(t, dir, "old.yaml", validYAML("old", 1))
+	if err := registry.Reload(context.Background()); err != nil {
+		t.Fatalf("original immutable revision could not be re-added: %v", err)
+	}
+	readded, err := registry.Resolve(context.Background(), original.Metadata)
+	if err != nil || readded.Digest != original.Digest {
+		t.Fatalf("re-added immutable revision = %#v, %v", readded, err)
 	}
 }
 

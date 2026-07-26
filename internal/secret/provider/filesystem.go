@@ -268,10 +268,10 @@ func readBoundedDirectoryEntries(reader directoryEntryReader, maxEntries int) ([
 }
 
 func readBoundedFile(file *os.File, stat *unix.Stat_t, maxBytes int64) ([]byte, error) {
-	if maxBytes <= 0 || stat.Size <= 0 {
+	if stat.Size <= 0 {
 		return nil, secret.ErrSourceInvalid
 	}
-	if stat.Size > maxBytes {
+	if maxBytes <= 0 || stat.Size > maxBytes {
 		return nil, secret.ErrSourceLimit
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxBytes+1))

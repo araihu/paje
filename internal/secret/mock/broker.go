@@ -58,8 +58,16 @@ func (broker *Broker) Revoke(ctx context.Context, id string) error {
 func (broker *Broker) SetAcquireResult(capability string, lease secret.Lease, err error) {
 	broker.mu.Lock()
 	clone := lease
-	if err == nil && lease.ID() != "" {
-		clone, _ = secret.NewLease(lease.ID(), lease.ExpiresAt(), lease.Materialization())
+	if err == nil {
+		materialization := lease.Materialization()
+		cloned, cloneErr := secret.NewLease(lease.ID(), lease.ExpiresAt(), materialization)
+		materialization.Destroy()
+		if cloneErr != nil {
+			clone = secret.Lease{}
+			err = cloneErr
+		} else {
+			clone = cloned
+		}
 	}
 	broker.results[capability] = acquireResult{lease: clone, err: err}
 	broker.mu.Unlock()

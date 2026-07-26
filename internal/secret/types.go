@@ -129,6 +129,19 @@ func (payload Payload) Clone() Payload {
 	return Payload{kind: payload.kind, value: slices.Clone(payload.value), files: cloneFiles(payload.files)}
 }
 
+// Destroy zeroes caller-owned provider payload material. It is safe to call
+// repeatedly.
+func (payload *Payload) Destroy() {
+	if payload == nil {
+		return
+	}
+	zeroBytes(payload.value)
+	zeroFiles(payload.files)
+	payload.kind = ""
+	payload.value = nil
+	payload.files = nil
+}
+
 func (Payload) MarshalJSON() ([]byte, error) { return nil, ErrSecretSerialization }
 func (Payload) MarshalText() ([]byte, error) { return nil, ErrSecretSerialization }
 
