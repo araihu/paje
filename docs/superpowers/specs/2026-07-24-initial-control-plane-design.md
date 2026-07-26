@@ -26,6 +26,10 @@ create and steer multiple child agent sessions, coordinate work across multiple
 projects, choose the correct parallelism primitive for each task, integrate
 evidence, recover after restart, and close only after every placement has a
 verified disposition and capability-appropriate terminal evidence.
+The centralized service admits many such `ControlRun` values concurrently and
+must isolate their identities, projects, cursors, resources, credentials,
+evidence, cleanup, and status while applying bounded fair admission across the
+installation.
 
 ## Product-Scope Correction
 
@@ -50,7 +54,8 @@ records `execution_placement`, `parallelism_primitive`, placement rationale,
 capability requirements, lifecycle owner, and fallback. The exact durable
 fields are `execution_placement`, `parallelism_primitive`,
 `placement_rationale`, `capability_requirements`, `lifecycle_owner`, and
-`fallback`.
+`fallback`. A task that can outgrow its primitive also records
+`promotion_trigger`; a static task records the explicit value `none`.
 
 The provider-neutral choices are a persistent worktree-backed session, an
 ephemeral same-session subagent, a bounded harness-native parallel primitive,
@@ -73,6 +78,48 @@ subagent is checkpointed and promoted to a persistent session through an
 explicit handoff. Missing capabilities follow the recorded safe fallback, and
 two subagents or other primitives may never hold overlapping mutable ownership.
 These rules are acceptance gates, not scheduling hints.
+
+### Empirical orchestration contract
+
+The execution-lifecycle, review/integration, and meta-control-plane analyses
+completed on 2026-07-26 are consolidated normatively in the
+[empirical orchestration contract](./2026-07-25-agent-piloted-submission-and-harness-support-design.md#empirical-orchestration-contract).
+The corresponding dependency order, exact ownership boundaries, frozen inputs,
+test-first gates, and placement decisions live in the
+[canonical continuation DAG](../plans/2026-07-25-agent-piloted-submission-and-harness-support.md#canonical-continuation-dag).
+
+The durable source of truth is a typed append-only `ControlAction` and
+`ControlEvent` journal. `ControlRun`, task, attempt, session, candidate, review,
+integration, resource, status, and close views are deterministic projections of
+that journal. YAML and prose control records may be rendered for diagnosis or
+audit export, but they are never authoritative and may not be patched to drive
+state transitions.
+
+Every external effect is reserved before invocation, is bound to one canonical
+request digest and one exact result or ambiguity, and is reconciled by provider
+observation before a retry. This applies to dispatch, message delivery,
+interrupt/cancel, resource allocation and cleanup, verification, integration,
+publication, runtime close, persistent archive, and target-tree verification.
+Missing identity, capability, authority, evidence, or reconciliation remains a
+fail-closed state rather than a weaker fallback.
+
+Central scheduling is scoped by control run plus canonical project or actual
+shared-resource namespace. Identical relative paths in unrelated repositories
+do not conflict, and unrelated work does not share a global executor, gate, or
+integration lock. Per-run/project quotas, fair backpressure, bounded restart
+scans, and resource-specific locks ensure that a stalled, awaiting-authority,
+failed, or cleanup-incomplete run cannot prevent another ready run from
+advancing.
+
+Pajé may deterministically perform validation, replay, cursor supervision,
+exact ownership arbitration, immutable evidence binding, gate scheduling,
+conflict-free DAG integration, and receipt-backed closure. Choosing review
+scope, accepting semantic findings or residual risk, designing corrections,
+resolving authored conflicts, using administrative publication authority, and
+disposing of unique unmanaged evidence remain policy-assisted decisions that
+require an explicit durable authorization. The provider-neutral Agent Control
+Plane owns these decisions and receipts above the portable isolated execution
+plane; the executor never becomes the orchestration authority.
 
 ## Approaches Considered
 

@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a provider-neutral durable Agent Control Plane that lets one
-Codex control agent orchestrate a long specification through parallel child
-sessions across multiple projects, while retaining a scoped deterministic
-leaf-submission path over Hatchet, making Codex the first fully integrated
-harness, and aligning every product surface with evidence-backed support truth.
+**Goal:** Add one provider-neutral durable centralized Agent Control Plane that
+coordinates many simultaneous, possibly unrelated `ControlRun` values. Each
+Codex control agent can orchestrate its long specification through parallel
+child sessions across multiple projects without blocking or observing other
+runs, while Pajé retains a scoped deterministic leaf-submission path over
+Hatchet, makes Codex the first fully integrated harness, and aligns every
+product surface with evidence-backed support truth.
 
 **Architecture:** A new provider-neutral `controlplane.Service` owns durable
 `ControlRun`, `TaskGraph`, `Task`, `ProjectRef`, ownership,
@@ -26,7 +28,9 @@ version pinned when the task is executed, Go `net/http`, filesystem atomic
 writes, Docker, Kubernetes, Helm 3, Node.js site regression tests, Codex plugin
 skills and command hooks.
 
-**Design:** [Pajé Agent-Piloted Submission and Harness Support Design](../specs/2026-07-25-agent-piloted-submission-and-harness-support-design.md)
+**Design:** [Pajé Agent-Piloted Submission and Harness Support Design](../specs/2026-07-25-agent-piloted-submission-and-harness-support-design.md),
+with the boundary summarized in the
+[initial control-plane design](../specs/2026-07-24-initial-control-plane-design.md#empirical-orchestration-contract).
 
 ## Global Constraints
 
@@ -105,6 +109,35 @@ skills and command hooks.
   produces a committed selection decision.
 - Public copy changes a capability from planned to current only in the commit
   that carries its acceptance evidence.
+- Typed append-only `ControlAction` and `ControlEvent` records are authoritative;
+  snapshots, YAML, prose, status, and audit files are derived projections only.
+- Every external action is reserved before invocation and binds one exact result
+  or ambiguity. Ambiguous dispatch, messaging, interrupt/cancel, resource
+  mutation, verification, integration, publication, close, archive, and remote
+  verification are reconciled before any retry.
+- The centralized service supports many concurrently active `ControlRun`
+  values. All IDs, cursors, leases, idempotency keys, ownership, resources,
+  credentials, evidence, cleanup, and status subscriptions are scoped so one
+  run cannot collide with or observe another.
+- Admission applies bounded installation, principal, run, project, primitive,
+  verifier, integration, publication, and shared-resource quotas with
+  deterministic fairness, backpressure, bounded bursts, and starvation
+  prevention.
+- Ownership uses canonical repository/project identity plus normalized path or
+  an explicit shared-resource namespace. Identical paths in unrelated projects
+  do not conflict; actual shared resources do.
+- Resource locks name the real scarce resource and mode. Global executor, test,
+  integration, or publication mutexes are forbidden.
+- A slow, blocked, awaiting-authority, failed, stalled, or cleanup-incomplete
+  run cannot block unrelated eligible runs. Restart scans all active runs and
+  due leases through a bounded fair durable cursor.
+- Immutable candidates, independent verifier provenance, mandatory review
+  barriers, finding/correction/supersession history, exact DAG integration,
+  generated-only conflict handling, explicit publication authority, target-tree
+  verification, and resource-specific closure receipts are mandatory.
+- Every implementation node uses its canonical `ACP-NN` ID. The portable-worker
+  image gate is `PW-07`; it is not ACP Task 7 and does not grant mutation of the
+  portable-worker documents in this plan.
 
 ---
 
@@ -185,6 +218,35 @@ Pajé never invents one.
 - `internal/controlplane/filesystem/*.go`: atomic single-installation store,
   restart reconciliation, and cursor index.
 - `internal/controlplane/mock/*.go`: deterministic store and failure fixtures.
+- `internal/controlplane/journal/**`: authoritative typed action/event
+  reservations, atomic per-run/global append positions, installation feed,
+  replay, checkpoints, and active-run index.
+- `internal/controlplane/projection/**`: deterministic journal-derived control
+  projections and one-time legacy snapshot migration.
+- `internal/controlplane/admission/**`, `scheduler/**`, and `isolation/**`:
+  scoped multi-run quotas, fair backpressure, real-resource leases, and
+  run/project/credential/evidence namespace isolation.
+- `internal/controlplane/ownership/**` and `resources/**`: exact claim CAS,
+  origin/cleanup authority, managed-resource ledger, and terminal receipts.
+- `internal/workspace/gitworktree/**`: immutable-base managed Git-worktree
+  allocation, observation, recovery, and cleanup.
+- `internal/controlplane/reconcile/**`, `supervisor/**`, and `adoption/**`:
+  all-action ambiguity reconciliation, callback-plus-cursor monitor leases,
+  exact runtime registration, adopted-resource policy, and primitive closure.
+- `internal/controlplane/candidate/**`, `evidence/**`, `review/**`, and
+  `correction/**`: immutable candidates, independent provenance, mandatory
+  review barriers, findings, correction cycles, and supersession.
+- `internal/controlplane/gates/**` and `internal/verification/scheduler/**`:
+  distinct candidate and integration-snapshot gate receipts, real-resource
+  locks, bounded execution, and restart recovery.
+- `internal/controlplane/integration/**` and `publication/**`: exact DAG-order
+  integration, generated-only conflict handling, explicit publication
+  authority, and remote target-tree verification.
+- `internal/controlplane/status/**` and exact status-only
+  `internal/controlplane/httpapi/status*.go`: delta-only per-run status and the
+  separately authorized redacted central view; ACP-21 also owns the exact
+  `control:list` action addition in
+  `internal/submission/auth/{policy.go,policy_test.go}`.
 - `internal/agentharness/harness.go`: provider-neutral capabilities plus
   dispatch/observe/send/wait/interrupt/close contract.
 - `internal/agentharness/registry.go`: exact harness registration and
@@ -263,7 +325,601 @@ Pajé never invents one.
 - `README.md`, `site/README.md`, `site/app/page.tsx`, and
   `site/tests/rendered-html.test.mjs`: aligned product truth and regressions.
 
-### Task 0: Establish the durable Agent Control Plane and capability-aware work lifecycle
+## Canonical Continuation DAG
+
+This is the only implementation DAG for this plan. `ACP-00` through `ACP-04`
+are the integrated foundation present at baseline
+`984d8797fc3650e2654b1413a47b1ae30b357c4c`. Their detailed task sections are
+retained as the contract and verification record; they are not reimplemented.
+`ACP-14` through `ACP-21` reconcile the three empirical analyses into the
+foundation before the remaining gateway, client, plugin, packaging,
+certification, acceptance, documentation, and completion work.
+
+`PW-07` means Task 7, “Split Images, Real Docker Conformance, and Worker Profile
+Fixture,” in the
+[portable-worker implementation plan](./2026-07-25-portable-worker-profiles-and-isolated-execution.md#task-7-split-images-real-docker-conformance-and-worker-profile-fixture).
+It is an external prerequisite, not an ACP task. That prerequisite is satisfied:
+candidate `0ceabae5aade12c02034ea94858e3914ac960e25` passed independent review and
+was integrated and reverified by the parent as
+`740b355660ae8f29210911ae1a5c3514797a2449`. The parent dispatches `ACP-16`,
+`ACP-17`, `ACP-19`, `ACP-08`, or `ACP-09` only after integrating this
+specification commit on top of that parent head and freezing the accepted image,
+profile, and live-Docker evidence digests as successor inputs. This plan does
+not grant any writer ownership of the portable-worker documents or `PW-07`
+implementation paths.
+
+```mermaid
+flowchart LR
+    A00["ACP-00 Control foundation: integrated"] --> A01["ACP-01 Submission domain: integrated"]
+    A01 --> A02["ACP-02 Submission persistence: integrated"]
+    A02 --> A03["ACP-03 Hatchet trigger: integrated"]
+    A00 --> A04["ACP-04 Scoped HTTP API: integrated"]
+    A03 --> A04
+
+    A04 --> A14["ACP-14 Authoritative journal and projections"]
+    A14 --> A15["ACP-15 Multi-run admission and isolation"]
+    A15 --> A16["ACP-16 Ownership and managed resources"]
+    A15 --> A17["ACP-17 Runtime supervisor and closure"]
+    PW07["PW-07 satisfied at parent 740b355"] --> A16
+    PW07 --> A17
+
+    A16 --> A18["ACP-18 Candidate review and correction"]
+    A17 --> A18
+    A18 --> A19["ACP-19 Gate scheduler and provenance"]
+    PW07 --> A19
+    A18 --> A20["ACP-20 Exact integration and publication"]
+    A19 --> A20
+    A15 --> A21["ACP-21 Delta status and central view"]
+    A17 --> A21
+    A20 --> A21
+
+    A03 --> A05["ACP-05 Hardened gateway"]
+    A17 --> A05
+    A21 --> A05
+    A05 --> A06["ACP-06 Deterministic client"]
+    A21 --> A06
+    A06 --> A07["ACP-07 Codex plugin"]
+    A17 --> A07
+    A05 --> A08["ACP-08 Gateway packaging"]
+    A07 --> A08
+    PW07 --> A08
+    A19 --> A09["ACP-09 Harness certification"]
+    A05 --> A09
+    PW07 --> A09
+    A07 --> A10["ACP-10 Live acceptance"]
+    A08 --> A10
+    A09 --> A10
+    A20 --> A10
+    A21 --> A10
+    A10 --> A11["ACP-11 Public documentation"]
+    A11 --> A12["ACP-12 Second-harness evidence gate"]
+    A12 --> A13["ACP-13 Final completion gates"]
+    A14 --> A13
+    A15 --> A13
+    A16 --> A13
+    A17 --> A13
+    A18 --> A13
+    A19 --> A13
+    A20 --> A13
+    A21 --> A13
+```
+
+### Canonical task registry
+
+The registry supplies the scheduling fields for every ACP node. The detailed
+sections below supply the executable TDD steps. A dependency means the exact
+integrated predecessor SHA and its green gates are frozen inputs, not merely
+that a child reported completion. Each remaining writer starts from that exact
+successor base and may mutate only its listed ownership.
+
+#### ACP-00 — Durable control and harness foundation (integrated)
+
+- Dependencies: none.
+- Ownership paths: `internal/controlplane/**`, `internal/agentharness/**` as
+  listed in the ACP-00 detailed section.
+- Frozen inputs: design commit `722fd15971e18c94778d8fef09df65bb98744a67`.
+- Test-first acceptance gates: control-plane and harness contract, recovery,
+  race, ownership, multi-project, and close tests in ACP-00.
+- Integration order: historical slot 00; integrated as `3faab30` and retained
+  in baseline `984d8797fc3650e2654b1413a47b1ae30b357c4c`.
+- `execution_placement`: `isolated_controlplane_foundation_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: restart-critical provider-neutral schema and lifecycle
+  implementation with exclusive package ownership.
+- `capability_requirements`: exact worktree/base, durable steering, Go race
+  tests, independent review.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential` at the exact base; otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-01 — Scoped submission domain (integrated)
+
+- Dependencies: `ACP-00`.
+- Ownership paths: `internal/submission/{types.go,errors.go,trigger.go,store.go,service.go,service_test.go,mock/**}`.
+- Frozen inputs: ACP-00 provider-neutral boundary and `code-change@v1` template
+  schema at its dispatch SHA.
+- Test-first acceptance gates: strict binding, scope, idempotency, recursion,
+  cancellation, race, and provider-import denial in ACP-01.
+- Integration order: historical slot 01; integrated as `e2f0b0d`.
+- `execution_placement`: `isolated_submission_domain_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: bounded independent domain after the control contract
+  froze.
+- `capability_requirements`: isolated mutation, focused race tests, exact
+  template fixtures.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-02 — Submission persistence and lineage (integrated)
+
+- Dependencies: `ACP-01`.
+- Ownership paths: `internal/submission/filesystem/**` plus the exact store,
+  service-test, and mock files named in ACP-02.
+- Frozen inputs: ACP-01 store contract and canonical reservation fixtures.
+- Test-first acceptance gates: 32-way reservation, restart windows, binding
+  tombstone, corruption, symlink, race, and lineage tests in ACP-02.
+- Integration order: historical slot 02; integrated as `48a2393`.
+- `execution_placement`: `isolated_submission_store_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: durability and crash-window work requires an isolated
+  restartable stream.
+- `capability_requirements`: filesystem fault fixtures, race tests, exact
+  canonical JSON.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-03 — Hatchet leaf trigger (integrated)
+
+- Dependencies: `ACP-02`.
+- Ownership paths: `internal/submission/hatchet/**` and the exact
+  `internal/workflow/codechangehatchet/{workflow.go,workflow_test.go}` files.
+- Frozen inputs: ACP-02 reservation contract and exact workflow name
+  `paje-code-change-v1`.
+- Test-first acceptance gates: provider collision, status/final binding,
+  cancellation, race, and provider-type isolation in ACP-03.
+- Integration order: historical slot 03; integrated as `11892c7`.
+- `execution_placement`: `isolated_hatchet_adapter_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: provider adapter is independently testable against a
+  frozen port.
+- `capability_requirements`: Hatchet-shaped fake, exact workflow fixtures,
+  focused race tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-04 — Scoped control and submission HTTP API (integrated)
+
+- Dependencies: `ACP-00`, `ACP-03`.
+- Ownership paths: `internal/submission/{auth/**,httpapi/**}` and
+  `internal/controlplane/httpapi/**`.
+- Frozen inputs: ACP-00 service interface, ACP-03 leaf service, v1 route and
+  error schemas.
+- Test-first acceptance gates: auth, strict HTTP, action binding, cursor, close,
+  fuzz-seed, and race tests in ACP-04.
+- Integration order: historical slot 04; integrated as
+  `984d8797fc3650e2654b1413a47b1ae30b357c4c` after compile fix `2361fb1`.
+- `execution_placement`: `isolated_http_api_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: cross-surface API work required durable isolation and
+  independent contract review.
+- `capability_requirements`: frozen service ports, HTTP conformance fixtures,
+  race tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-14 — Authoritative action/event journal and projections
+
+- Dependencies: `ACP-04` and this committed specification revision.
+- Ownership paths: `internal/controlplane/journal/**`,
+  `internal/controlplane/projection/**`, and exclusive migration edits to
+  `internal/controlplane/{types.go,store.go,service.go}` plus their focused
+  tests; no other writer may touch those shared files.
+- Frozen inputs: baseline `984d8797fc3650e2654b1413a47b1ae30b357c4c`,
+  requirements `ACP-J01..J05`, and the current snapshot/action compatibility
+  fixtures.
+- Test-first acceptance gates: exact replay equality, changed-input conflict,
+  corrupt/nonmonotonic journal denial, contiguous installation-wide position,
+  byte-stable interleaved feed rebuild, old-snapshot migration, and crash
+  injection before/after reserve, append, invoke-result bind, checkpoint, and
+  per-run/global cursor advancement.
+- Integration order: slot 14, first new implementation commit.
+- `execution_placement`: `isolated_journal_core_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: foundational restart-critical shared-schema mutation
+  must complete before dependent writers.
+- `capability_requirements`: isolated worktree, durable steering, fault
+  injection, focused `-race` and `-count=20` tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential` with sole ownership; never shared writer.
+- `promotion_trigger`: `none`.
+
+#### ACP-15 — Central multi-run admission, scheduler, and isolation
+
+- Dependencies: `ACP-14`.
+- Ownership paths: `internal/controlplane/admission/**`,
+  `internal/controlplane/scheduler/**`, and
+  `internal/controlplane/isolation/**`; status and runtime reconciler paths are
+  forbidden.
+- Frozen inputs: ACP-14 journal/projection interfaces, canonical project
+  identity, requirements `ACP-M01..M08`, and versioned quota/fairness policy.
+- Test-first acceptance gates: concurrent unrelated runs, per-installation/
+  principal/run/project/primitive quotas, bounded burst, fair ordering, aging,
+  backpressure, no starvation, actual-shared-resource contention, identical
+  unrelated paths, no global mutex, and bounded fair restart scan.
+- Integration order: slot 15 immediately after ACP-14.
+- `execution_placement`: `isolated_multirun_scheduler_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: centralized concurrency logic is independently
+  testable but restart-sensitive and security-critical.
+- `capability_requirements`: deterministic clock, controllable queues/leases,
+  race tests, multi-run fault fixtures.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: implement in `local_sequential` with one exclusive writer; the
+  product remains blocked until full multi-run scoping, fairness, and
+  concurrency gates pass.
+- `promotion_trigger`: `none`.
+
+#### ACP-16 — Exact ownership, adopted origins, and managed resources
+
+- Dependencies: `ACP-15` and satisfied `PW-07` receipt at parent integration
+  `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Ownership paths: `internal/controlplane/ownership/**`,
+  `internal/controlplane/resources/**`, and
+  `internal/workspace/gitworktree/**`; no journal, supervisor, candidate, or
+  integration paths.
+- Frozen inputs: ACP-15 admission/resource-key contract, accepted PW-07 image
+  and profile digests, canonical project/base fixtures, and requirements
+  `ACP-G01..G03` and `ACP-R01..R02`.
+- Test-first acceptance gates: one winner for overlapping same-project grants,
+  unrelated-project path concurrency, expansion/transfer/release CAS,
+  acknowledgement, no idle release, created/adopted cleanup authority,
+  partial allocation restart, dirty/unique retention, and resource-specific
+  cleanup receipts.
+- Integration order: slot 16; may run in parallel with ACP-17 only after their
+  frozen interfaces and disjoint paths are committed.
+- `execution_placement`: `isolated_ownership_resources_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: security-sensitive concurrent resource lifecycle needs
+  isolated mutation and restart supervision.
+- `capability_requirements`: managed-workspace provider, exact repository
+  probes, Docker/profile fixtures, CAS/fault injection.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: block if the frozen PW-07 evidence digests or safe
+  managed-resource observation are unavailable.
+- `promotion_trigger`: `none`.
+
+#### ACP-17 — Runtime registration, supervisor, adoption, and closure
+
+- Dependencies: `ACP-15` and satisfied `PW-07` receipt at parent integration
+  `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Ownership paths: `internal/controlplane/reconcile/**`,
+  `internal/controlplane/supervisor/**`,
+  `internal/controlplane/adoption/**`, and narrowly bounded additions to
+  `internal/agentharness/{harness.go,contracttest/**,mock/**}`.
+- Frozen inputs: ACP-14 action semantics, ACP-15 fair due-lease scheduler,
+  PW-07 runtime fixtures, and current primitive-specific harness contract.
+- Test-first acceptance gates: wrong-ID acknowledgement, callback-first,
+  poll-first, callback loss, cursor regression/future cursor, persisted
+  backoff/lease takeover, adopted detach-only/none authority, every ambiguous
+  lifecycle action, per-primitive receipts, and one failing run not blocking an
+  unrelated due lease.
+- Integration order: slot 17; parallel with ACP-16 only on disjoint paths, then
+  integrated after ACP-16 to freeze the combined lifecycle surface.
+- `execution_placement`: `isolated_runtime_supervisor_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: long provider-facing restart/recovery work requires a
+  durable independently steerable session.
+- `capability_requirements`: controllable harness, cursor/callback faults,
+  archive/close/detach fixtures, deterministic clock.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential` only with the same controllable fixtures;
+  otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-18 — Candidate, independent review, correction, and supersession
+
+- Dependencies: `ACP-16`, `ACP-17`.
+- Ownership paths: `internal/controlplane/candidate/**`,
+  `internal/controlplane/evidence/**`, `internal/controlplane/review/**`, and
+  `internal/controlplane/correction/**`.
+- Frozen inputs: immutable project/ownership/resource evidence from ACP-16,
+  terminal/callback observation from ACP-17, and requirements
+  `ACP-C01..C03`, `ACP-V01..V02`, and `ACP-W01..W03`.
+- Test-first acceptance gates: malformed/mismatched callbacks, immutable
+  candidate identity, stale-evidence invalidation, independent provenance,
+  arrival-order-independent review barrier, structured findings, exact-only
+  deduplication, single correction writer, RED/GREEN exception authority,
+  rejection, amendment, and immutable supersession.
+- Integration order: slot 18 after both lifecycle predecessors.
+- `execution_placement`: `isolated_candidate_review_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: security-sensitive evidence and repeated correction
+  state machines form one coherent independently reviewable unit.
+- `capability_requirements`: repository attestation port, read-only review
+  harness, durable Send, exact SHA fixtures.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential` with read-only bounded reviewers; otherwise
+  block review acceptance.
+- `promotion_trigger`: `none`.
+
+#### ACP-19 — Resource-locked gate scheduler and verification provenance
+
+- Dependencies: `ACP-18` and satisfied `PW-07` receipt at parent integration
+  `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Ownership paths: `internal/controlplane/gates/**` and
+  `internal/verification/scheduler/**`; publisher and integration paths are
+  forbidden.
+- Frozen inputs: candidate identity/provenance contract from ACP-18, accepted
+  PW-07 worker image/profile digest, distinct candidate/combined gate-subject
+  schema, versioned gate definitions, and actual shared-resource key schema.
+- Test-first acceptance gates: subject-kind/ID/tree/toolchain/environment
+  invalidation, candidate receipt denial for combined gates, required-skip
+  non-pass, bounded logs, process-group cancellation, typed environmental
+  retry, lock fairness, same-resource serialization, unrelated gate
+  concurrency, no head-of-line blocking, and restart at queue/lock/run/result
+  boundaries.
+- Integration order: slot 19 after ACP-18 and PW-07.
+- `execution_placement`: `isolated_gate_scheduler_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: environment-heavy restartable scheduling and
+  provenance need durable isolation.
+- `capability_requirements`: isolated executor, PW-07 workload image,
+  cancellation, deterministic locks/clock, fault injection.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: local deterministic mock evidence only; release acceptance blocks
+  if the frozen PW-07 live proof cannot be reproduced.
+- `promotion_trigger`: `none`.
+
+#### ACP-20 — Exact DAG integration and authority-bound publication
+
+- Dependencies: `ACP-18`, `ACP-19`.
+- Ownership paths: `internal/controlplane/integration/**`,
+  `internal/controlplane/publication/**`, and narrowly reviewed extensions to
+  `internal/publisher/**`; token-bearing adapters remain publisher-owned.
+- Frozen inputs: integration-eligible candidate/review evidence, candidate
+  pre-gate receipts, typed gate-subject contract,
+  persisted integration order, generated-output manifest, secure publisher
+  contract, and requirements `ACP-I01..I04` and `ACP-P01..P02`.
+- Test-first acceptance gates: exact parent/candidate/tree integration,
+  response-loss ancestry reconciliation, immutable integration snapshot,
+  candidate/combined gate subject separation, exact-result-tree combined
+  gates, generated-only regeneration, authored/ambiguous conflict stop,
+  same-target locking without global mutex, explicit authority, target drift,
+  idempotent PR/merge, credential isolation, and final remote target-tree
+  equality.
+- Integration order: slot 20 after ACP-19.
+- `execution_placement`: `isolated_integration_publication_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: high-risk repository mutation and asynchronous
+  publication require resumable isolation and independent security review.
+- `capability_requirements`: disposable repositories, generator classifier,
+  secure publisher fixture, provider observation, fault injection.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential` before credential creation; authored conflict,
+  authority gap, or target drift blocks.
+- `promotion_trigger`: `none`.
+
+#### ACP-21 — Per-run delta status and redacted central view
+
+- Dependencies: `ACP-15`, `ACP-17`, `ACP-20`.
+- Ownership paths: `internal/controlplane/status/**` and exact status-only files
+  `internal/controlplane/httpapi/status.go` and `status_test.go`, plus the
+  narrowly bounded `control:list` action addition in
+  `internal/submission/auth/{policy.go,policy_test.go}`.
+- Frozen inputs: ACP-14 per-run cursor plus authoritative installation feed and
+  `JournalPosition`, ACP-15 global fair-scheduler projection, ACP-17 supervisor
+  state, ACP-20 integration/publication states, and v1 HTTP redaction limits.
+- Test-first acceptance gates: byte-stable rebuild, per-run `after_cursor`,
+  delta-only output, unchanged silence, global/per-run cursor separation,
+  concurrent/interleaved/late event ordering, restart at append boundaries,
+  bounded redaction, subscriber replay, no cross-run mutation, and proof that
+  status calls cannot acknowledge or mutate state.
+- Integration order: slot 21 after ACP-20; last empirical core node.
+- `execution_placement`: `isolated_status_projection_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: bounded API work consumes several frozen services but
+  has disjoint status-only ownership.
+- `capability_requirements`: frozen journal/status schemas, HTTP conformance
+  fixtures, multi-run event generator.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; no unredacted or snapshot-authoritative
+  status fallback.
+- `promotion_trigger`: `none`.
+
+#### ACP-05 — Hardened gateway composition
+
+- Dependencies: `ACP-03`, `ACP-17`, `ACP-21`.
+- Ownership paths: `internal/gatewayconfig/**`, `cmd/paje-gateway/**`, exact
+  process-guard files, `go.mod`, and `go.sum` listed in ACP-05.
+- Frozen inputs: final control/submission services, status API, harness registry,
+  and pairwise credential policy.
+- Test-first acceptance gates: configuration, credential denial, startup/
+  shutdown, readiness, race, native/Linux builds in ACP-05.
+- Integration order: slot 22, first remaining product-surface node.
+- `execution_placement`: `isolated_gateway_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: composition and dependency changes need isolated
+  durable ownership after core interfaces freeze.
+- `capability_requirements`: Go builds, injected constructors, process guard,
+  exact final ports.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; otherwise block.
+- `promotion_trigger`: `none`.
+
+#### ACP-06 — Deterministic `paje-agent` client
+
+- Dependencies: `ACP-05`, `ACP-21`.
+- Ownership paths: `internal/agentclient/**`, `cmd/paje-agent/**`.
+- Frozen inputs: final v1 control/status/leaf HTTP schemas and stable exit
+  classifications.
+- Test-first acceptance gates: client HTTP, token-file, two-phase action,
+  cursor, ambiguity, close, hook context, race, and cross-build tests in ACP-06.
+- Integration order: slot 23 after ACP-05.
+- `execution_placement`: `isolated_agent_client_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: installable cross-platform client is substantial and
+  independently testable against frozen HTTP fixtures.
+- `capability_requirements`: HTTP fixtures, Linux/Windows builds, exact token
+  permission tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; no partial client publication.
+- `promotion_trigger`: `none`.
+
+#### ACP-07 — Codex plugin and hooks
+
+- Dependencies: `ACP-06`, `ACP-17`.
+- Ownership paths: `integrations/codex/paje/**` plus exact ACP-07 client command
+  files.
+- Frozen inputs: final client CLI, primitive lifecycle, current official Codex
+  packaging/hook documentation, and trusted hook fixtures.
+- Test-first acceptance gates: manifest, skill, hook, token scan, install/
+  discovery/trust, race, and diff checks in ACP-07.
+- Integration order: slot 24 after ACP-06.
+- `execution_placement`: `isolated_codex_plugin_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: installable artifact and trust lifecycle require a
+  durable isolated implementation stream.
+- `capability_requirements`: current official Codex docs, isolated Codex home,
+  plugin discovery/trust fixtures.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; do not publish a partial plugin.
+- `promotion_trigger`: `none`.
+
+#### ACP-08 — Optional gateway/image packaging
+
+- Dependencies: `ACP-05`, `ACP-07`, and the satisfied `PW-07` receipt at parent
+  integration `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Ownership paths: `charts/paje/**`, `Dockerfile`, and exact ACP-08 image
+  acceptance files; portable `Dockerfile.worker-codex` remains PW-07-owned.
+- Frozen inputs: accepted PW-07 coordinator/worker split, final gateway/client
+  binaries, chart credential model.
+- Test-first acceptance gates: Helm render/lint, Secret separation, image
+  content, exact revision, and static acceptance in ACP-08.
+- Integration order: slot 25 after ACP-07 and PW-07; resolve shared Dockerfile
+  ownership centrally, never with concurrent writers.
+- `execution_placement`: `isolated_packaging_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: shared release surfaces and image acceptance require a
+  single durable owner.
+- `capability_requirements`: accepted PW-07 artifacts, Helm, Docker/static image
+  fixtures.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: block if the frozen PW-07 artifacts are unavailable;
+  `local_sequential` only for central conflict resolution.
+- `promotion_trigger`: `none`.
+
+#### ACP-09 — Formal harness certification
+
+- Dependencies: `ACP-05`, `ACP-19`, and the satisfied `PW-07` receipt at
+  parent integration `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Ownership paths: `internal/runner/contracttest/**`, exact Codex/local runner,
+  executil/environment/processguard tests, and `docs/harness-certification.md`.
+- Frozen inputs: PW-07 workload image and tool versions, ACP-19 provenance and
+  gate semantics, ACP-05 process-guard baseline, and exact harness protocol.
+- Test-first acceptance gates: reusable contract, transcript, cancellation,
+  sandbox, credential, version, race, and certification-schema tests in ACP-09.
+- Integration order: slot 26; may run after ACP-19 but must integrate before
+  ACP-10.
+- `execution_placement`: `isolated_harness_certification_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: security-heavy independent certification benefits from
+  isolated mutation and long-running tests.
+- `capability_requirements`: PW-07 image, process/sandbox probes, exact Codex
+  binary, race tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: deterministic local suite only with explicit non-release concern;
+  full integration blocks.
+- `promotion_trigger`: `none`.
+
+#### ACP-10 — Live leaf, control-plane, and multi-run acceptance
+
+- Dependencies: `ACP-07`, `ACP-08`, `ACP-09`, `ACP-20`, `ACP-21`.
+- Ownership paths: `internal/acceptance/codex*_test.go`, bounded acceptance
+  helpers/testdata, plugin acceptance fixtures, and post-pass
+  `docs/evidence/codex-*.yaml`.
+- Frozen inputs: exact committed implementation SHA, disposable project base
+  SHAs, plugin and image versions/digests, scoped non-production credentials.
+- Test-first acceptance gates: existing leaf/control scenarios plus simultaneous
+  unrelated runs, interleaved callbacks, shared-resource contention, unrelated
+  gate concurrency, stalled/awaiting-authority run, cleanup-incomplete run,
+  restart, fairness, unaffected progress, and zero cross-run contamination.
+- Integration order: slot 27 after every production/certification dependency.
+- `execution_placement`: `isolated_live_acceptance_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: long environment-heavy restartable certification must
+  bind exact committed code and durable evidence.
+- `capability_requirements`: live or controllable provider, Docker, two or more
+  disposable projects, fault injection, scoped credentials.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: deterministic mock certification plus explicit
+  `DONE_WITH_CONCERNS`; public graduation remains blocked.
+- `promotion_trigger`: `none`.
+
+#### ACP-11 — Public docs and positioning
+
+- Dependencies: `ACP-10` exact acceptance evidence.
+- Ownership paths: the README, chart metadata/notes, site, public docs, and
+  positioning/link tests listed in ACP-11.
+- Frozen inputs: exact ACP-10 evidence files and this canonical design/plan.
+- Test-first acceptance gates: positioning, Markdown links, site lint/render,
+  current-versus-planned claims in ACP-11.
+- Integration order: slot 28 after ACP-10.
+- `execution_placement`: `isolated_docs_surface_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: broad but coherent public-surface change requires one
+  owner after evidence freezes.
+- `capability_requirements`: exact evidence, site toolchain, link tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: `local_sequential`; retain planned wording if evidence is absent.
+- `promotion_trigger`: `none`.
+
+#### ACP-12 — Second-harness evidence gate
+
+- Dependencies: `ACP-11`.
+- Ownership paths: the five documentation/site files listed in ACP-12 only.
+- Frozen inputs: final Codex certification/support matrix and primary evidence
+  available at execution time.
+- Test-first acceptance gates: fixed decision schema and positioning/site
+  regressions in ACP-12.
+- Integration order: slot 29 after ACP-11.
+- `execution_placement`: `local_evidence_gate`.
+- `parallelism_primitive`: `local_sequential`.
+- `placement_rationale`: policy-assisted selection and shared canonical docs are
+  parent-owned.
+- `capability_requirements`: primary-source research, safe local probes,
+  positioning tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: record no selection.
+- `promotion_trigger`: evidence collection becomes a candidate-specific
+  implementation stream only after a selected decision and new approved plan.
+
+#### ACP-13 — Whole-system completion gates
+
+- Dependencies: `ACP-10`, `ACP-11`, `ACP-12`, and every `ACP-14..ACP-21` node.
+- Ownership paths: only files already introduced by their owning ACP nodes,
+  this plan's checkboxes, and narrowly reviewed final-fix files; no scope
+  expansion without a graph revision.
+- Frozen inputs: exact integrated head, all candidate/review/integration/close
+  receipts, live evidence, and support claims.
+- Test-first acceptance gates: full security, race, Go, Helm, image, site,
+  docs, live, global-journal replay, typed gate-subject separation, adversarial
+  review, exact changed-path, and clean-history checks in ACP-13.
+- Integration order: slot 30 and final ACP integration.
+- `execution_placement`: `local_final_integration`.
+- `parallelism_primitive`: `local_sequential`.
+- `placement_rationale`: final shared-tree integration and release authority
+  remain centrally owned.
+- `capability_requirements`: whole-repository ownership, all toolchains, exact
+  evidence, independent review.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: block; no partial completion claim.
+- `promotion_trigger`: `none`.
+
+### Task 0 (ACP-00): Establish the durable Agent Control Plane and capability-aware work lifecycle
 
 This task is a hard predecessor for Tasks 4, 6, 7, 10, 11, and 13.
 Tasks 1-5 retain the leaf submit/status/wait/cancel path, while Tasks 4-5 also
@@ -524,7 +1180,7 @@ git add internal/controlplane internal/agentharness
 git commit -m "feat: define durable agent control plane"
 ```
 
-### Task 1: Define the provider-neutral submission contract and canonical binding
+### Task 1 (ACP-01): Define the provider-neutral submission contract and canonical binding
 
 **Files:**
 - Create: `internal/submission/types.go`
@@ -912,7 +1568,7 @@ git add internal/submission
 git commit -m "feat: define scoped submission domain"
 ```
 
-### Task 2: Persist deterministic reservations, lineage, and trigger bindings
+### Task 2 (ACP-02): Persist deterministic reservations, lineage, and trigger bindings
 
 **Files:**
 - Create: `internal/submission/filesystem/store.go`
@@ -1094,7 +1750,7 @@ git add internal/submission
 git commit -m "feat: persist submission identity and lineage"
 ```
 
-### Task 3: Add the Hatchet trigger adapter without leaking provider types
+### Task 3 (ACP-03): Add the Hatchet trigger adapter without leaking provider types
 
 **Files:**
 - Create: `internal/submission/hatchet/trigger.go`
@@ -1241,7 +1897,7 @@ git add internal/submission internal/workflow/codechangehatchet
 git commit -m "feat: adapt scoped submissions to Hatchet"
 ```
 
-### Task 4: Authenticate scoped Pajé credentials and expose the bounded v1 API
+### Task 4 (ACP-04): Authenticate scoped Pajé credentials and expose the bounded v1 API
 
 **Files:**
 - Create: `internal/submission/auth/token.go`
@@ -1445,7 +2101,1077 @@ git add internal/submission/auth internal/submission/httpapi \
 git commit -m "feat: expose scoped agent API"
 ```
 
-### Task 5: Compose a hardened, separately credentialed gateway
+### Task 14 (ACP-14): Make the typed action/event journal authoritative
+
+**Files:**
+- Create: `internal/controlplane/journal/types.go`
+- Create: `internal/controlplane/journal/store.go`
+- Create: `internal/controlplane/journal/store_test.go`
+- Create: `internal/controlplane/projection/project.go`
+- Create: `internal/controlplane/projection/project_test.go`
+- Modify exclusively: `internal/controlplane/types.go`
+- Modify exclusively: `internal/controlplane/store.go`
+- Modify exclusively: `internal/controlplane/service.go`
+- Modify exclusively: `internal/controlplane/service_test.go`
+- Modify exclusively: `internal/controlplane/recovery_test.go`
+- Modify exclusively: `internal/controlplane/filesystem/store.go`
+- Modify exclusively: `internal/controlplane/filesystem/store_test.go`
+- Modify exclusively: `internal/controlplane/mock/store.go`
+
+**Interfaces:**
+- Produces `journal.Action`, `journal.Event`, `journal.Store`, and
+  `projection.RebuildRun` plus `projection.RebuildInstallation` as the
+  authoritative write/replay boundary.
+- Preserves strict decode and public `controlplane.Snapshot` compatibility as a
+  checkpoint/projection format.
+- Consumes no harness, repository, executor, HTTP, Hatchet, or publisher types.
+
+- [ ] **Step 1: Write failing authoritative journal and replay tests**
+
+Define the exact records:
+
+```go
+type Action struct {
+    ID                     string `json:"id"`
+    ControlRunID           string `json:"control_run_id"`
+    TaskID                 string `json:"task_id,omitempty"`
+    AttemptID              string `json:"attempt_id,omitempty"`
+    Kind                   Kind   `json:"kind"`
+    GraphRevision          uint64 `json:"graph_revision"`
+    ExpectedProjection     uint64 `json:"expected_projection"`
+    CanonicalRequestDigest string `json:"canonical_request_digest"`
+    IdempotencyKey         string `json:"idempotency_key"`
+    AuthorityReceiptID     string `json:"authority_receipt_id,omitempty"`
+}
+
+type JournalPosition uint64
+
+type RunCursor struct {
+    InstallationID string `json:"installation_id"`
+    ControlRunID   string `json:"control_run_id"`
+    SchemaVersion  uint32 `json:"schema_version"`
+    RunSequence    uint64 `json:"run_sequence"`
+}
+
+type GlobalCursor struct {
+    InstallationID  string          `json:"installation_id"`
+    SchemaVersion   uint32          `json:"schema_version"`
+    JournalPosition JournalPosition `json:"journal_position"`
+}
+
+type Event struct {
+    ID              string          `json:"id"`
+    ControlRunID    string          `json:"control_run_id"`
+    RunSequence     uint64          `json:"run_sequence"`
+    JournalPosition JournalPosition `json:"journal_position"`
+    ActionID        string          `json:"action_id,omitempty"`
+    Kind            EventKind       `json:"kind"`
+    PayloadDigest   string          `json:"payload_digest"`
+    ProviderReceipt string          `json:"provider_receipt,omitempty"`
+    OccurredAt      time.Time       `json:"occurred_at"`
+}
+```
+
+Tests MUST prove:
+
+- 32 concurrent exact reservations return one action and no duplicate event;
+- the same idempotency key with changed request, graph, projection, task, or run
+  conflicts;
+- one reservation binds exactly one result, `not_performed`, supersession, or
+  ambiguity outcome;
+- events are contiguous per run, `JournalPosition` is contiguous across the
+  installation, and cross-run action/event IDs cannot bind;
+- run/global cursors with the wrong installation, schema, run, future position,
+  or regressive position fail before projection mutation;
+- 1,000 concurrent appends interleaved across 20 runs rebuild the same global
+  bytes in ascending `JournalPosition`; restart at every append boundary and a
+  late event for an older run only extend the feed suffix, with no gap,
+  duplicate, renumbering, timestamp ordering, or cross-run mutation;
+- `projection.RebuildRun(events)` and
+  `projection.RebuildInstallation(feed)` produce byte-equivalent projections
+  independent of checkpoint boundaries;
+- deleting or corrupting a checkpoint rebuilds from the journal, while corrupt,
+  duplicate, reordered, gapped, or foreign events fail closed; and
+- an edited YAML/JSON diagnostic export never changes replayed state.
+
+- [ ] **Step 2: Run the journal tests and confirm the new packages are missing**
+
+Run:
+
+```bash
+go test ./internal/controlplane/journal ./internal/controlplane/projection \
+  ./internal/controlplane -run 'TestJournal|TestProjection|TestReplay' -count=1
+```
+
+Expected: FAIL because the journal and projection packages do not exist.
+
+- [ ] **Step 3: Implement reserve, append, and rebuild without dual authority**
+
+`journal.Store` exposes only:
+
+```go
+type Store interface {
+    Reserve(context.Context, Action) (Action, bool, error)
+    Append(context.Context, string, uint64, Event) (Event, error)
+    RunEvents(context.Context, RunCursor, int) ([]Event, RunCursor, error)
+    Feed(context.Context, GlobalCursor, int) ([]Event, GlobalCursor, error)
+    Checkpoint(context.Context, RunCursor, GlobalCursor, []byte) error
+    LoadCheckpoint(context.Context, string) ([]byte, RunCursor, GlobalCursor, error)
+    ActiveRuns(context.Context, string, int) ([]string, string, error)
+}
+```
+
+The filesystem layout separates run scopes:
+
+```text
+<root>/journal/manifest.json
+<root>/runs/<sha256-control-run-id>/actions/<action-id>.json
+<root>/journal/events/<20-digit-journal-position>.json
+<root>/runs/<sha256-control-run-id>/event-index/<20-digit-run-sequence>.json
+<root>/runs/<sha256-control-run-id>/checkpoint.json
+<root>/active/<sha256-control-run-id>.json
+```
+
+Each create/append uses mode `0600`, file and directory sync, no symlink, exact
+canonical JSON, and process-local CAS for the v1 single replica. Under one
+append lock, create or validate the immutable installation ID/schema manifest,
+validate the expected per-run sequence, choose
+`JournalPosition = committed_position + 1`, write the one canonical event, and
+make it visible with both positions. The per-run event index, head cache, and
+checkpoints are derived and rebuildable; none is an ordering authority. Restart
+validates the contiguous canonical files and repairs derived indexes before
+append. `service.go` reserves first and advances state only by appending the
+typed result event. Remove every path that can mutate a projection without a
+corresponding event. `OccurredAt` is never used for ordering.
+
+In the same exclusive schema migration, add `PromotionTrigger string` to
+`ExecutionPlacement`. Rebuild every existing attempt with the explicit value
+`none`; new attempts must persist a non-empty trigger when capability, duration,
+scope, ownership, or isolation changes can require promotion. The six base
+placement fields remain mandatory on every task and attempt.
+
+- [ ] **Step 4: Migrate current snapshots and lifecycle actions once**
+
+On first open of ACP-00 snapshots without a journal, hold the installation
+migration/append lock, validate every snapshot completely, sort snapshots by
+canonical control-run ID and each run's facts by the frozen migration order,
+then emit `migration_started`, translated graph/attempt/session/action/evidence/
+message/callback/disposition/close facts, and `migration_completed` into the
+same contiguous installation feed. Each migrated event receives its global
+position and per-run sequence together. Rebuild per-run and global projections
+and compare them to the originals and migration manifest. Mismatch leaves the
+old files untouched and returns `ErrInvalidRecord`. A completed migration
+marker binds the terminal `JournalPosition` and makes every restart a read-only
+replay, never a second import.
+
+- [ ] **Step 5: Inject crashes at every action boundary**
+
+Add a failpoint matrix for before/after reservation, global-position selection,
+canonical event visibility, per-run index repair, invocation handoff, result
+append, per-run/global projection rebuild, checkpoint write, active-index
+update, and response.
+For every action kind, restart and prove one of: exact result, proven
+`not_performed`, or durable unresolved ambiguity. No test may accept a duplicate
+provider call or a projection-only fact.
+
+Run:
+
+```bash
+go test -race ./internal/controlplane/... -count=1
+go test ./internal/controlplane/... \
+  -run 'TestJournal|TestProjection|TestMigration|TestCrash' -count=20
+git diff --check
+```
+
+Expected: PASS with byte-stable replay and no duplicate effect.
+
+- [ ] **Step 6: Commit ACP-14 alone**
+
+```bash
+git add internal/controlplane
+git commit -m "feat: make control journal authoritative"
+```
+
+### Task 15 (ACP-15): Add fair centralized multi-run admission and isolation
+
+**Files:**
+- Create: `internal/controlplane/admission/types.go`
+- Create: `internal/controlplane/admission/service.go`
+- Create: `internal/controlplane/admission/service_test.go`
+- Create: `internal/controlplane/scheduler/queue.go`
+- Create: `internal/controlplane/scheduler/queue_test.go`
+- Create: `internal/controlplane/isolation/scope.go`
+- Create: `internal/controlplane/isolation/scope_test.go`
+
+**Interfaces:**
+- Consumes only ACP-14 journal/projection interfaces and canonical project IDs.
+- Produces durable `RunAdmission`, `ReadyWorkItem`, `QuotaPolicy`, `ResourceKey`,
+  `LeaseRequest`, `RunScope`, `ProjectScope`, and opaque `CredentialScope`
+  records used by ownership, supervision, gates, integration, publication,
+  evidence, cleanup, status, and recovery.
+- Does not invoke a harness, executor, repository, or publisher.
+
+- [ ] **Step 1: Write failing run-scope and callback-binding tests**
+
+Use two runs with intentionally equal task IDs, attempt IDs, relative paths,
+client keys, and provider-local cursor strings. Prove that each derived ID and
+lookup includes `ControlRunID`, and that a callback/event/result containing the
+other run's runtime binding is rejected before projection mutation.
+
+`RunScope` binds installation and control run. `ProjectScope` adds principal
+and canonical project identity. `CredentialScope` adds one declared purpose
+and opaque credential handle; it never contains secret material. Tests create
+equal provider-local credential, evidence, cleanup, and subscription IDs under
+different scopes and prove no lookup, status projection, handoff, or authority
+receipt can cross those scopes. An explicit cross-project handoff exposes only
+its declared evidence digest and acknowledgement.
+
+Define canonical scope keys:
+
+```go
+type OwnershipKey struct {
+    ProjectIdentity string `json:"project_identity"`
+    Namespace       string `json:"namespace"`
+    Unit            string `json:"unit"`
+}
+
+type ResourceKey struct {
+    Kind      string `json:"kind"`
+    Namespace string `json:"namespace"`
+    Identity  string `json:"identity"`
+}
+```
+
+Tests prove `service-a:internal/api` and `service-b:internal/api` do not
+conflict, while two repositories declaring the same Kubernetes namespace,
+local Docker registry, target branch, or verifier device do.
+
+- [ ] **Step 2: Write failing deterministic fairness and backpressure tests**
+
+`QuotaPolicy` contains installation, principal, run, project, primitive,
+verifier, integration, publication, and per-`ResourceKey` limits plus weights
+from 1 through 16. The exact scheduling rule is:
+
+1. discard ineligible items without losing their durable ready record;
+2. order eligible items by lowest virtual finish, then enqueue sequence, run ID,
+   and item ID;
+3. after admission add `ceil(1024 / weight)` to that run's virtual finish;
+4. allow at most two consecutive admissions from one run while another run is
+   eligible; and
+5. every 60 seconds waiting reduces effective virtual finish by 1, capped at
+   300, without crossing zero.
+
+Tests cover 100 runs, unequal weights, bounded per-run burst, quota exhaustion,
+deterministic restart, continuous arrivals, and proof that every continuously
+eligible run is admitted within a bounded number of releases. A blocked,
+awaiting-authority, failed, or cleanup-only run must not consume an execution
+slot.
+
+- [ ] **Step 3: Run focused tests and confirm the packages are missing**
+
+```bash
+go test ./internal/controlplane/admission \
+  ./internal/controlplane/scheduler ./internal/controlplane/isolation -count=1
+```
+
+Expected: FAIL because the packages do not exist.
+
+- [ ] **Step 4: Implement durable admission and resource-specific leases**
+
+Reserve every queue transition through ACP-14. `Admit` returns either one
+receipt or a durable backpressure record containing the limiting quota and next
+eligibility. Never invoke external work from the scheduler package.
+
+Lock compatibility is explicit: `read` shares with `read`; `write` is exclusive
+for the exact `ResourceKey`; unrelated keys never contend. Queue and lease IDs
+bind control run, action, key, mode, generation, and enqueue sequence. There is
+no key representing all executors, all tests, all integrations, or all
+publications.
+
+- [ ] **Step 5: Implement bounded fair all-run restart scanning**
+
+Each recovery tick reads at most 100 active-run index entries or runs for at
+most 250 milliseconds, whichever comes first. It persists the global scan
+cursor, selects due leases through the same fair queue, processes at most one
+action per run per pass while another run is due, and applies per-action typed
+backoff. One reconcile error is recorded for that action and the scan continues.
+
+- [ ] **Step 6: Run concurrency, race, and starvation gates**
+
+```bash
+go test -race ./internal/controlplane/admission \
+  ./internal/controlplane/scheduler ./internal/controlplane/isolation -count=1
+go test ./internal/controlplane/admission ./internal/controlplane/scheduler \
+  -run 'TestFair|TestQuota|TestBackpressure|TestRestart|TestCrossRun' -count=20
+git diff --check
+```
+
+Expected: PASS with unrelated progress, bounded starvation, and no cross-run
+binding.
+
+- [ ] **Step 7: Commit ACP-15 alone**
+
+```bash
+git add internal/controlplane/admission internal/controlplane/scheduler \
+  internal/controlplane/isolation
+git commit -m "feat: schedule concurrent control runs fairly"
+```
+
+### Task 16 (ACP-16): Implement exact ownership and managed resource lifecycles
+
+`PW-07` is satisfied by independently reviewed candidate
+`0ceabae5aade12c02034ea94858e3914ac960e25`, parent-integrated as
+`740b355660ae8f29210911ae1a5c3514797a2449`. Dispatch this task only from the
+successor head produced by integrating this specification commit on top of that
+parent head, with the accepted worker image, profile, and live-Docker evidence
+digests frozen in the task inputs.
+
+**Files:**
+- Create: `internal/controlplane/ownership/types.go`
+- Create: `internal/controlplane/ownership/service.go`
+- Create: `internal/controlplane/ownership/service_test.go`
+- Create: `internal/controlplane/resources/types.go`
+- Create: `internal/controlplane/resources/service.go`
+- Create: `internal/controlplane/resources/service_test.go`
+- Create: `internal/workspace/gitworktree/manager.go`
+- Create: `internal/workspace/gitworktree/manager_test.go`
+
+**Interfaces:**
+- Consumes ACP-15 `OwnershipKey`, `ResourceKey`, admission, and lease records.
+- Produces `OwnershipClaim`, `ManagedResource`, `Origin`, `CleanupAuthority`,
+  allocation/disposition receipts, and a managed Git-worktree provider.
+- Does not own runtime supervision, candidate review, gate execution,
+  integration, or publication.
+
+- [ ] **Step 1: Write failing ownership transition and namespace tests**
+
+Define exact enums:
+
+```go
+type ClaimState string
+const (
+    ClaimProposed ClaimState = "proposed"
+    ClaimGranted ClaimState = "granted"
+    ClaimActive ClaimState = "active"
+    ClaimTransferPending ClaimState = "transfer_pending"
+    ClaimReleased ClaimState = "released"
+    ClaimRevoked ClaimState = "revoked"
+)
+
+type Origin string
+const (
+    OriginCreated Origin = "created"
+    OriginAdopted Origin = "adopted"
+)
+
+type CleanupAuthority string
+const (
+    CleanupManageAndDispose CleanupAuthority = "manage_and_dispose"
+    CleanupDetachOnly CleanupAuthority = "detach_only"
+    CleanupNone CleanupAuthority = "none"
+)
+```
+
+Tests reject skipped/backward transitions, stale graph CAS, wrong owner ack,
+partial expansion, transfer without disposition/close/handoff ack, release from
+idle or callback alone, and revocation without explicit authority. Concurrent
+same-project overlaps yield one grant. Identical paths in unrelated canonical
+projects both become active. Explicit shared-resource namespaces conflict
+across repositories.
+
+- [ ] **Step 2: Write failing managed-resource and workspace tests**
+
+`ManagedResource` binds resource ID/key, control run, task/attempt, project,
+base SHA, origin, cleanup authority and its authority receipt, creating or
+adoption action, state, provider identity, observation digest, disposition, and
+cleanup receipt.
+
+Table tests cover worktree, branch, process, container, network, workflow,
+runtime session, verifier environment, and publisher checkout. Inject restart
+before/after provider create, identity bind, use, disposition, cleanup, and
+receipt. Unknown outcome is retained and reconciled. Created resources with
+authority can be cleaned once. An adopted resource with an exact
+`manage_and_dispose` authority receipt can be cleaned once; `detach_only`
+produces only a detach receipt. `none`, dirty, unique, unmanaged, or
+unintegrated resources remain pending and cannot be deleted.
+
+Git-worktree tests resolve an exact base SHA before allocation, keep the source
+checkout unchanged, reject dirty/stale/symlink/escape roots, recover partial
+creation, and remove only the exact managed clean worktree after disposition.
+
+- [ ] **Step 3: Run tests and verify the packages are missing**
+
+```bash
+go test ./internal/controlplane/ownership \
+  ./internal/controlplane/resources ./internal/workspace/gitworktree -count=1
+```
+
+Expected: FAIL because the packages do not exist.
+
+- [ ] **Step 4: Implement journal-backed claims and resource operations**
+
+Every grant, expand, transfer, release, allocate, observe, dispose, detach, and
+cleanup call reserves an ACP-14 action. Canonicalize project-relative paths
+without filesystem access, then validate them against the immutable project
+root during workspace allocation. Exact replay returns the original claim or
+resource receipt. Changed units/authority conflict.
+
+Resource cleanup requests must pass all of:
+
+```go
+func CleanupEligible(resource ManagedResource) bool {
+    return resource.CleanupAuthority == CleanupManageAndDispose &&
+        resource.CleanupAuthorityReceiptID != "" &&
+        resource.Disposition.ID != "" &&
+        resource.UniqueEvidenceCount == 0 &&
+        resource.Observation.Clean &&
+        resource.CleanupReceipt == ""
+}
+```
+
+For an adopted resource, the cleanup receipt must bind the exact adoption
+identity and cleanup-authority receipt. Adopted detach uses a separate predicate
+and action; it never calls provider delete/archive.
+
+- [ ] **Step 5: Run race, restart, and live managed-workspace gates**
+
+```bash
+go test -race ./internal/controlplane/ownership \
+  ./internal/controlplane/resources ./internal/workspace/gitworktree -count=1
+go test ./internal/controlplane/ownership ./internal/controlplane/resources \
+  -run 'TestConcurrent|TestTransfer|TestAdopted|TestRestart|TestCleanup' -count=20
+PAJE_DOCKER_ACCEPTANCE=1 go test ./internal/controlplane/resources \
+  -run TestManagedContainerLifecycle -count=1 -v
+git diff --check
+```
+
+Expected: PASS against the exact accepted PW-07 image/profile evidence.
+
+- [ ] **Step 6: Commit ACP-16 alone**
+
+```bash
+git add internal/controlplane/ownership internal/controlplane/resources \
+  internal/workspace/gitworktree
+git commit -m "feat: manage control ownership and resources"
+```
+
+### Task 17 (ACP-17): Build the cursor supervisor and primitive closure reconciler
+
+`PW-07` is satisfied at parent integration
+`740b355660ae8f29210911ae1a5c3514797a2449`. Dispatch from the successor head
+that contains that integration plus this specification commit and its frozen
+evidence digests. ACP-17 may be implemented in parallel with ACP-16 only after
+ACP-15 freezes their disjoint interfaces; the parent integrates ACP-16 first
+and ACP-17 second.
+
+**Files:**
+- Create: `internal/controlplane/reconcile/action.go`
+- Create: `internal/controlplane/reconcile/action_test.go`
+- Create: `internal/controlplane/supervisor/lease.go`
+- Create: `internal/controlplane/supervisor/service.go`
+- Create: `internal/controlplane/supervisor/service_test.go`
+- Create: `internal/controlplane/adoption/service.go`
+- Create: `internal/controlplane/adoption/service_test.go`
+- Modify narrowly: `internal/agentharness/harness.go`
+- Modify narrowly: `internal/agentharness/contracttest/suite.go`
+- Modify narrowly: `internal/agentharness/mock/harness.go`
+- Modify narrowly: `internal/agentharness/mock/harness_test.go`
+
+**Interfaces:**
+- Consumes ACP-14 actions and ACP-15 fair due-lease admission.
+- Produces `MonitorLease`, `RuntimeBinding`, `RegistrationReceipt`,
+  `AdoptionReceipt`, and primitive-specific `CloseReceipt` services.
+- Extends reconciliation to every external lifecycle action without weakening
+  the existing exact runtime-ID and capability contract.
+
+- [ ] **Step 1: Write failing runtime-binding and supervisor tests**
+
+Use a controllable harness to cover:
+
+- dispatch response lost before/after runtime creation;
+- exact runtime-ID registration and wrong/foreign/cross-run acknowledgement;
+- callback before poll, poll before callback, lost callback, duplicate callback,
+  changed duplicate, terminal without callback, and callback without terminal
+  observation;
+- persisted cursor/request binding, duplicate events, regression, future
+  cursor, provider revision mismatch, and identity mismatch;
+- deterministic backoff reset only on material change; and
+- coordinator crash and expired-lease takeover without two active monitors.
+
+The persisted lease is:
+
+```go
+type MonitorLease struct {
+    ControlRunID       string    `json:"control_run_id"`
+    AttemptID          string    `json:"attempt_id"`
+    Owner              string    `json:"owner"`
+    Generation         uint64    `json:"generation"`
+    LastCursor         string    `json:"last_cursor,omitempty"`
+    CursorSequence     uint64    `json:"cursor_sequence"`
+    CallbackState      string    `json:"callback_state"`
+    LastMaterialChange time.Time `json:"last_material_change"`
+    NextWakeAt         time.Time `json:"next_wake_at"`
+    RetryClass         string    `json:"retry_class,omitempty"`
+    BackoffStep        uint8     `json:"backoff_step"`
+    ExpiresAt          time.Time `json:"expires_at"`
+}
+```
+
+- [ ] **Step 2: Write failing ambiguity, adoption, and closure tests**
+
+Exercise dispatch, send, interrupt/cancel, observe/wait result binding,
+runtime-close, native aggregate/cancel, persistent archive, and detach. For each
+action, response loss must reconcile exact provider evidence or remain blocked;
+it must never repeat blindly.
+
+Adopted sessions reject duplicate/foreign bindings, record `OriginAdopted`, and
+enforce `manage_and_dispose`, `detach_only`, or `none`. `detach_only` emits an
+immutable detach receipt without provider archive. `none` cannot be closed by
+Pajé and remains explicitly externally owned.
+
+Close tests prove persistent archive, ephemeral runtime close, native aggregate
+or cancel, and local inactive evidence are not interchangeable. A failing close
+in run A leaves A cleanup-incomplete while due run B continues through the fair
+scheduler.
+
+- [ ] **Step 3: Run tests and verify the packages are missing**
+
+```bash
+go test ./internal/controlplane/reconcile \
+  ./internal/controlplane/supervisor ./internal/controlplane/adoption -count=1
+```
+
+Expected: FAIL because the packages do not exist.
+
+- [ ] **Step 4: Implement callback-plus-poll supervision and all-action reconciliation**
+
+Use ACP-15 admission for each due monitor action. The deterministic backoff
+sequence is 30 seconds, 60 seconds, 2 minutes, then 5 minutes capped, with a
+stable action-ID-derived jitter of at most 10 percent persisted in
+`NextWakeAt`. Typed transient/contention results advance the step. Material
+events reset it. Semantic, identity, cursor, evidence, capability, or authority
+failures block.
+
+Every reconciler returns exactly `result_bound`, `not_performed`, or
+`unresolved`; only `not_performed` permits a separately authorized new action
+generation. Registration acknowledgement remains a completed bound Send/
+Acknowledge action, not a boolean-only patch.
+
+- [ ] **Step 5: Run race, restart, fairness, and conformance gates**
+
+```bash
+go test -race ./internal/controlplane/reconcile \
+  ./internal/controlplane/supervisor ./internal/controlplane/adoption \
+  ./internal/agentharness/... -count=1
+go test ./internal/controlplane/supervisor \
+  -run 'TestCallback|TestCursor|TestLease|TestRestart|TestUnrelatedRunProgress' \
+  -count=20
+git diff --check
+```
+
+Expected: PASS with no duplicate lifecycle effect or cross-run event.
+
+- [ ] **Step 6: Commit ACP-17 alone**
+
+```bash
+git add internal/controlplane/reconcile internal/controlplane/supervisor \
+  internal/controlplane/adoption internal/agentharness
+git commit -m "feat: supervise and close agent runtimes"
+```
+
+### Task 18 (ACP-18): Enforce immutable candidates, review barriers, and correction history
+
+**Files:**
+- Create: `internal/controlplane/candidate/types.go`
+- Create: `internal/controlplane/candidate/service.go`
+- Create: `internal/controlplane/candidate/service_test.go`
+- Create: `internal/controlplane/evidence/verifier.go`
+- Create: `internal/controlplane/evidence/verifier_test.go`
+- Create: `internal/controlplane/review/service.go`
+- Create: `internal/controlplane/review/service_test.go`
+- Create: `internal/controlplane/correction/service.go`
+- Create: `internal/controlplane/correction/service_test.go`
+
+**Interfaces:**
+- Consumes ACP-16 project/ownership/resource facts and ACP-17 terminal provider
+  observation plus callbacks.
+- Produces immutable `CandidateSnapshot`, `VerificationRun`, `ReviewGate`,
+  `Finding`, `CorrectionCycle`, and supersession records.
+- Does not integrate, publish, execute a mutating reviewer, or accept a semantic
+  finding without policy authority.
+
+- [ ] **Step 1: Write failing candidate and provenance tests**
+
+Define candidate identity from exact fields:
+
+```go
+type Snapshot struct {
+    ID                 string `json:"id"`
+    ControlRunID       string `json:"control_run_id"`
+    TaskID             string `json:"task_id"`
+    AttemptID          string `json:"attempt_id"`
+    RepositoryIdentity string `json:"repository_identity"`
+    BaseSHA            string `json:"base_sha"`
+    HeadSHA            string `json:"head_sha"`
+    TreeSHA            string `json:"tree_sha"`
+    TargetRef          string `json:"target_ref"`
+    CleanTreeDigest    string `json:"clean_tree_digest"`
+    OwnedPathsDigest   string `json:"owned_paths_digest"`
+    GraphRevision      uint64 `json:"graph_revision"`
+    FrozenInputsDigest string `json:"frozen_inputs_digest"`
+    GatePolicyDigest   string `json:"gate_policy_digest"`
+    SupersedesID       string `json:"supersedes_candidate_id,omitempty"`
+    CorrectionCycleID  string `json:"correction_cycle_id,omitempty"`
+}
+```
+
+Tests reject dirty/moved/mismatched base, head, tree, target, owned paths, graph,
+frozen input, task/attempt/run, provider evidence, and symlink escape. Replaying
+the same snapshot is stable. Any field change creates a new ID and makes all
+prior PASS evidence stale.
+
+`VerificationRun` tests bind verifier principal/version, candidate, profile,
+commands, toolchain, environment, start/finish, bounded result digests, and
+retry class. Worker-reported tests remain `reported`; only an independent
+verifier or trusted attestation may become `verified`.
+
+- [ ] **Step 2: Write failing review, finding, correction, and supersession tests**
+
+Table-test the exact monotonic states from the design. Two required reviewers
+finishing in either order produce the same aggregate. Missing, active, stale,
+failed, blocked, skipped, or inconclusive review keeps the gate closed. External
+review evidence alone cannot pass.
+
+Findings have stable exact fingerprints and immutable evidence. Exact duplicate
+fingerprints may collapse; similar prose, severity, or apparent root cause may
+not. One policy-authorized disposition is required for `accepted_residual`.
+
+Correction tests allow one writer per overlapping set, bind the rejected
+candidate and sorted finding digest, require RED then GREEN unless a persisted
+exception authority exists, and require fresh re-review. Amendment creates a
+new candidate pointing to the prior candidate. Rejected/superseded candidates
+remain readable and never become integration-eligible.
+
+- [ ] **Step 3: Run focused tests and confirm the packages are missing**
+
+```bash
+go test ./internal/controlplane/candidate ./internal/controlplane/evidence \
+  ./internal/controlplane/review ./internal/controlplane/correction -count=1
+```
+
+Expected: FAIL because the packages do not exist.
+
+- [ ] **Step 4: Implement the journal-backed state machines**
+
+Every transition validates its exact predecessor set, action/result binding,
+candidate identity, and graph revision, then appends one typed event. Review
+aggregation sorts scope IDs and findings before hashing so arrival order cannot
+change the outcome. `integration_eligible` requires provider confirmation,
+structural verification, independent verification PASS, and every mandatory
+review PASS for the same candidate.
+
+Correction dispatch consumes ACP-16 ownership transfer and ACP-17 supervisor
+contracts; it cannot grant scope itself. Policy-assisted decisions persist an
+authority receipt and evidence digest but never execute code in this package.
+
+- [ ] **Step 5: Run race, order, restart, and adversarial gates**
+
+```bash
+go test -race ./internal/controlplane/candidate \
+  ./internal/controlplane/evidence ./internal/controlplane/review \
+  ./internal/controlplane/correction -count=1
+go test ./internal/controlplane/review ./internal/controlplane/correction \
+  -run 'TestArrivalOrder|TestStale|TestFinding|TestCorrection|TestSupersession' \
+  -count=20
+git diff --check
+```
+
+Expected: PASS with no mutable evidence or barrier bypass.
+
+- [ ] **Step 6: Commit ACP-18 alone**
+
+```bash
+git add internal/controlplane/candidate internal/controlplane/evidence \
+  internal/controlplane/review internal/controlplane/correction
+git commit -m "feat: enforce candidate review barriers"
+```
+
+### Task 19 (ACP-19): Schedule provenance-bound gates with real resource locks
+
+`PW-07` is satisfied at parent integration
+`740b355660ae8f29210911ae1a5c3514797a2449`. Dispatch only after this
+specification commit is integrated on top of that parent head, the accepted
+image/profile evidence digests are frozen, and ACP-18 is frozen.
+
+**Files:**
+- Create: `internal/controlplane/gates/types.go`
+- Create: `internal/controlplane/gates/service.go`
+- Create: `internal/controlplane/gates/service_test.go`
+- Create: `internal/verification/scheduler/scheduler.go`
+- Create: `internal/verification/scheduler/scheduler_test.go`
+- Create: `internal/verification/scheduler/process_test.go`
+
+**Interfaces:**
+- Consumes ACP-15 `ResourceKey`/fair leases, ACP-18 immutable candidates and
+  verification provenance, and the accepted PW-07 executor/profile.
+- Produces immutable `CandidateGateRun`, `CombinedGateRun`, and lock/result
+  receipts. The combined subject is supplied only from ACP-20's frozen
+  integration snapshot.
+- Executes only declared shell-free `executor.Command` values.
+
+- [ ] **Step 1: Write failing gate identity and invalidation tests**
+
+```go
+type GateIdentity struct {
+    GateDigest        string         `json:"gate_digest"`
+    ToolchainDigest   string         `json:"toolchain_digest"`
+    EnvironmentDigest string         `json:"environment_digest"`
+    VerifierVersion   string         `json:"verifier_version"`
+    ResourceLocks     []ResourceLock `json:"resource_locks"`
+    Required          bool           `json:"required"`
+}
+
+type CandidateGateRun struct {
+    ID               string       `json:"id"`
+    ControlRunID     string       `json:"control_run_id"`
+    CandidateID      string       `json:"candidate_id"`
+    CandidateTreeSHA string       `json:"candidate_tree_sha"`
+    Gate             GateIdentity `json:"gate"`
+}
+
+type CombinedGateRun struct {
+    ID                        string       `json:"id"`
+    ControlRunID              string       `json:"control_run_id"`
+    IntegrationSnapshotID     string       `json:"integration_snapshot_id"`
+    IntegrationApplyReceiptID string       `json:"integration_apply_receipt_id"`
+    ResultTreeSHA             string       `json:"result_tree_sha"`
+    Gate                      GateIdentity `json:"gate"`
+}
+```
+
+Changing subject kind, subject ID/tree, integration-apply receipt, gate,
+toolchain, environment, verifier, or lock set creates a new result. A candidate
+receipt is never accepted for a combined gate and vice versa. Required skip,
+unavailable environment, cancellation, critical truncation, missing receipt,
+or ambiguity is non-passing. Exact completed replay returns the original
+immutable result.
+
+- [ ] **Step 2: Write failing lock fairness and execution tests**
+
+Use two unrelated runs with distinct resource keys and two contenders for one
+shared registry/device/port key. Prove unrelated gates run concurrently,
+contenders serialize fairly, readers share only when declared, canceled holders
+release with receipts, expired leases reconcile, and no global
+`executor`, `test`, or `integration` key exists. A long gate in run A and a
+cleanup failure in run C must not delay run B's unrelated gate.
+
+Process tests prove exact argv/no shell, separate bounded stdout/stderr,
+process-group cancellation, timeout, no credential inheritance, and typed
+classification of contention/unavailable infrastructure versus semantic test
+failure.
+
+- [ ] **Step 3: Run focused tests and verify the packages are missing**
+
+```bash
+go test ./internal/controlplane/gates ./internal/verification/scheduler -count=1
+```
+
+Expected: FAIL because the packages do not exist.
+
+- [ ] **Step 4: Implement fair acquire-run-bind-release**
+
+Reserve the gate, enqueue all sorted lock keys atomically, acquire through
+ACP-15, record lock receipts, invoke the executor once, bind bounded output and
+result, then release each exact lease. Partial acquisition releases already
+held leases before retry. Only typed contention/transient infrastructure errors
+may create a new generation. Semantic failure waits for a new candidate or
+policy action.
+
+Candidate pre-gates may pass early and ACP-20 may require them before apply.
+`CombinedGateRun` is admitted only after ACP-20 supplies a frozen snapshot ID,
+integration-apply receipt, and result tree. Before and after execution the
+managed workspace tree must equal that exact result tree. Neither gate kind can
+reuse the other's receipt.
+
+- [ ] **Step 5: Run race, restart, PW-07, and contention gates**
+
+```bash
+go test -race ./internal/controlplane/gates \
+  ./internal/verification/scheduler -count=1
+go test ./internal/controlplane/gates ./internal/verification/scheduler \
+  -run 'TestSubject|TestInvalidate|TestRequired|TestResourceLock|TestRestart|TestNoHOL' \
+  -count=20
+PAJE_DOCKER_ACCEPTANCE=1 go test ./internal/verification/scheduler \
+  -run TestAcceptedWorkerProfileGate -count=1 -v
+git diff --check
+```
+
+Expected: PASS with no leaked lock or false code regression.
+
+- [ ] **Step 6: Commit ACP-19 alone**
+
+```bash
+git add internal/controlplane/gates internal/verification/scheduler
+git commit -m "feat: schedule provenance-bound verification"
+```
+
+### Task 20 (ACP-20): Integrate exact candidates and publish with explicit authority
+
+**Files:**
+- Create: `internal/controlplane/integration/types.go`
+- Create: `internal/controlplane/integration/service.go`
+- Create: `internal/controlplane/integration/service_test.go`
+- Create: `internal/controlplane/integration/repository.go`
+- Create: `internal/controlplane/integration/repository_test.go`
+- Create: `internal/controlplane/publication/service.go`
+- Create: `internal/controlplane/publication/service_test.go`
+- Modify narrowly as tests require: `internal/publisher/publisher.go`
+- Modify narrowly as tests require: `internal/publisher/gitpr/**`
+
+**Interfaces:**
+- Consumes only ACP-18 integration-eligible candidates/review evidence, ACP-19
+  candidate pre-gate receipts plus typed gate scheduler, the persisted graph
+  integration order, and explicit publication authority.
+- Produces immutable `IntegrationAttempt`, `IntegrationSnapshot`, final
+  `IntegrationReceipt`, `PublicationIntent`, and target-tree verification
+  receipts.
+- Reuses the secure publisher-owned repository/config boundary; it never runs
+  token-bearing Git in a verification or integration workspace.
+
+- [ ] **Step 1: Write failing exact integration and replay tests**
+
+```go
+type Attempt struct {
+    ID                      string `json:"id"`
+    ControlRunID            string `json:"control_run_id"`
+    GraphRevision           uint64 `json:"graph_revision"`
+    IntegrationIndex        uint64 `json:"integration_index"`
+    ExpectedParentSHA       string `json:"expected_parent_sha"`
+    ExpectedParentTreeSHA   string `json:"expected_parent_tree_sha"`
+    CandidateID             string `json:"candidate_id"`
+    CandidateSHA            string `json:"candidate_sha"`
+    CandidateTreeSHA        string `json:"candidate_tree_sha"`
+    CandidateEvidenceDigest string `json:"candidate_evidence_digest"`
+    OwnershipDigest         string `json:"ownership_digest"`
+    GeneratorManifestDigest string `json:"generator_manifest_digest"`
+    CandidateGateProfileDigest string `json:"candidate_gate_profile_digest"`
+    CombinedGateProfileDigest  string `json:"combined_gate_profile_digest"`
+    Strategy                string `json:"strategy"`
+}
+
+type IntegrationSnapshot struct {
+    ID                        string `json:"id"`
+    ControlRunID              string `json:"control_run_id"`
+    IntegrationAttemptID      string `json:"integration_attempt_id"`
+    IntegrationApplyReceiptID string `json:"integration_apply_receipt_id"`
+    GraphRevision             uint64 `json:"graph_revision"`
+    IntegrationIndex          uint64 `json:"integration_index"`
+    BaseSHA                   string `json:"base_sha"`
+    BaseTreeSHA               string `json:"base_tree_sha"`
+    CandidateID               string `json:"candidate_id"`
+    CandidateSHA              string `json:"candidate_sha"`
+    CandidateTreeSHA          string `json:"candidate_tree_sha"`
+    ResultSHA                 string `json:"result_sha"`
+    ResultTreeSHA             string `json:"result_tree_sha"`
+    OwnershipDigest           string `json:"ownership_digest"`
+    GeneratorManifestDigest   string `json:"generator_manifest_digest"`
+    CandidateGateProfileDigest string `json:"candidate_gate_profile_digest"`
+    CombinedGateProfileDigest  string `json:"combined_gate_profile_digest"`
+}
+```
+
+Tests require every predecessor receipt, exact next index, clean managed
+workspace, expected parent/candidate ancestry and trees, owned-path confinement,
+and current candidate pre-gate evidence. Response loss reconciles by ancestry
+plus tree and subtree equality, binds one immutable integration-apply receipt,
+and freezes one snapshot whose ID covers every field. Replaying the same attempt
+is harmless; changed parent, candidate, result, strategy, order, ownership,
+apply receipt, or either gate profile conflicts. No final integration receipt,
+publication eligibility, or integrated disposition exists before every required
+combined-gate receipt binds this exact snapshot and result tree.
+
+- [ ] **Step 2: Write failing generated-only and authored-conflict tests**
+
+A versioned generator manifest lists exact input digests, executable/argv,
+working directory, and output paths. Tests prove a conflict entirely within
+declared outputs is resolved only by deleting those outputs, running the exact
+credential-free generator, and verifying the resulting diff stays within the
+manifest. Authored, mixed, unknown, dirty-tree, path-escape, or generator-drift
+conflicts return `needs_input` without rebase, force, or guessed edits.
+
+Two integration attempts for different repositories or target/resource keys
+run concurrently. Attempts for the same target key serialize through ACP-15.
+There is no global integration mutex.
+
+- [ ] **Step 3: Write failing publication authority and target-tree tests**
+
+Authority binds repository, target ref and expected SHA, integration snapshot,
+exact result head/tree, candidate lineage, strategy, provider action, policy
+version, principal, and expiry. Missing, expired, changed, widened, or
+admin-bypass authority fails before credentials exist. Target drift conflicts;
+it never triggers automatic rebase or force.
+
+Test idempotent PR creation/reuse, head-bound checks, ordinary merge authority,
+post-response-loss observation, exact remote head, and target-tree equality.
+Provider success with a different tree is a failure. Verify credential helpers,
+URL rewrites, proxies, hooks, redirects, and repository-controlled config cannot
+reach the publisher token.
+
+- [ ] **Step 4: Run tests and verify the packages are missing**
+
+```bash
+go test ./internal/controlplane/integration \
+  ./internal/controlplane/publication ./internal/publisher/... -count=1
+```
+
+Expected: FAIL because the control-plane packages do not exist.
+
+- [ ] **Step 5: Implement reserve-integrate-gate-publish-verify**
+
+Reserve integration, require the exact candidate pre-gates, acquire only its
+exact target/workspace resource keys, apply the candidate once, and bind the
+integration-apply receipt plus ancestry/tree evidence. Freeze the
+`IntegrationSnapshot` before any combined gate. Submit each declared combined
+gate through ACP-19 with that snapshot ID, apply receipt, and result tree;
+verify the managed tree still matches before and after every gate. Only after
+all required combined receipts pass may Pajé persist the final
+`IntegrationReceipt`, mark the attempt integration-eligible for disposition,
+or begin publication. Publication is a later separately authorized action in a
+fresh publisher-owned validated bare repository/config. After success or
+ambiguity, observe provider state and bind the exact remote head and target
+tree before disposition.
+
+No child-selected command can widen the generator or combined-gate profile.
+No repository-controlled code executes after publisher credentials exist.
+
+- [ ] **Step 6: Run race, fault, security, and exact-tree gates**
+
+```bash
+go test -race ./internal/controlplane/integration \
+  ./internal/controlplane/publication ./internal/publisher/... -count=1
+go test ./internal/controlplane/integration \
+  ./internal/controlplane/publication \
+  -run 'TestExact|TestReplay|TestSnapshot|TestCombinedGate|TestGenerated|TestAuthored|TestTarget|TestNoHOL' \
+  -count=20
+git diff --check
+```
+
+Expected: PASS with no duplicated integration/publication or credential
+crossing.
+
+- [ ] **Step 7: Commit ACP-20 alone**
+
+```bash
+git add internal/controlplane/integration internal/controlplane/publication \
+  internal/publisher
+git commit -m "feat: integrate and publish verified candidates"
+```
+
+### Task 21 (ACP-21): Expose delta-only per-run status and a safe central view
+
+**Files:**
+- Create: `internal/controlplane/status/types.go`
+- Create: `internal/controlplane/status/projector.go`
+- Create: `internal/controlplane/status/projector_test.go`
+- Create: `internal/controlplane/httpapi/status.go`
+- Create: `internal/controlplane/httpapi/status_test.go`
+- Modify narrowly: `internal/submission/auth/policy.go`
+- Modify narrowly: `internal/submission/auth/policy_test.go`
+
+**Interfaces:**
+- Consumes ACP-14 per-run cursors and canonical installation `Feed` ordered by
+  `JournalPosition`, ACP-15 admission/backpressure projection, ACP-17 supervisor
+  state, and ACP-20 integration/publication state.
+- Produces per-run delta status and a distinct redacted installation-wide view.
+- Performs no acknowledgement, action completion, lease renewal, or workflow
+  mutation.
+
+- [ ] **Step 1: Write failing per-run delta and redaction tests**
+
+Per-run status includes only changed active nodes, blockers, ownership,
+callback/observation, candidate/review, gates, integration, publication,
+resources/cleanup, and next deterministic action after the supplied run cursor.
+Tests prove unchanged polls return an empty delta, duplicate delivery is
+harmless, restart rebuild is byte-stable, foreign/global/future/regressive
+cursors fail, and one run's cursor cannot read another run. Per-run projection
+uses only `(ControlRunID, RunSequence)` from ACP-14 `RunEvents`; it never scans
+or merges other runs.
+
+Seed forbidden sentinels in credentials, prompts, provider payloads, host paths,
+raw logs, transcripts, evidence bodies, and diagnostics. Assert none appears and
+all arrays/strings obey explicit limits.
+
+- [ ] **Step 2: Write failing central-view and interleaving tests**
+
+The central view contains only safe run ID, principal-safe subject reference,
+coarse state, quota/backpressure reason, pending counts, and next eligibility.
+It consumes only ACP-14 `Feed` in ascending `JournalPosition`, returns a cursor
+binding installation/schema/last position, and cannot acknowledge per-run
+events. Interleave 1,000 concurrent events across 20 runs, restart before and
+after canonical append visibility and derived-index repair, then append a late
+event for the oldest run. Exact global bytes and cursor progression must be
+identical after rebuild; the late event extends only the suffix. Tests reject a
+gap, duplicate position, timestamp sort, mutable side counter, per-run-head
+merge, foreign installation cursor, and any event that mutates the wrong run.
+
+One stalled run and one cleanup-incomplete run remain visible while unrelated
+runs advance and disappear from the active view after close. Status reads must
+not acquire execution/resource locks or cause head-of-line blocking.
+
+- [ ] **Step 3: Run tests and verify the packages are missing**
+
+```bash
+go test ./internal/controlplane/status ./internal/controlplane/httpapi \
+  -run 'TestStatus|TestCentral|TestRedaction|TestCursor' -count=1
+```
+
+Expected: FAIL because the status projector and routes do not exist.
+
+- [ ] **Step 4: Implement projections and read-only routes**
+
+Expose:
+
+```text
+GET /v1/control-runs/{control_run_id}/status?after_cursor=...
+GET /v1/control-runs/status?after_global_cursor=...
+```
+
+The per-run route authorizes the exact principal/run. The central route requires
+a separately scoped `control:list` action and applies subject/project redaction.
+Both read immutable journal/projection indexes with bounded pagination. Neither
+accepts an idempotency key or calls a mutating service. The central projector
+may checkpoint its derived bytes at one `JournalPosition`, but recovery
+validates that position against the canonical feed and replays forward; the
+checkpoint and HTTP cursor are never ordering authorities.
+
+- [ ] **Step 5: Run race, replay, HTTP, and no-mutation gates**
+
+```bash
+go test -race ./internal/controlplane/status \
+  ./internal/controlplane/httpapi -count=1
+go test ./internal/controlplane/status ./internal/controlplane/httpapi \
+  -run 'TestDelta|TestCentral|TestInterleaved|TestRedaction|TestReadOnly' \
+  -count=20
+git diff --check
+```
+
+Expected: PASS with bounded delta-only output and no state change.
+
+- [ ] **Step 6: Commit ACP-21 alone**
+
+```bash
+git add internal/controlplane/status internal/controlplane/httpapi/status.go \
+  internal/controlplane/httpapi/status_test.go internal/submission/auth/policy.go \
+  internal/submission/auth/policy_test.go
+git commit -m "feat: project isolated control status"
+```
+
+### Task 5 (ACP-05): Compose a hardened, separately credentialed gateway
+
+Execute only after `ACP-03`, `ACP-17`, and `ACP-21` are integrated. The gateway
+must compose the authoritative journal, fair multi-run admission/scheduler,
+runtime supervisor, and read-only status projections; it must not preserve the
+legacy snapshot-authoritative or single-active-run composition.
 
 **Files:**
 - Create: `internal/gatewayconfig/config.go`
@@ -1461,8 +3187,10 @@ git commit -m "feat: expose scoped agent API"
 - Produces:
   `gatewayconfig.Load(func(string) string) (Config, error)`.
 - `cmd/paje-gateway` composes control and submission filesystem stores, token
-  authenticator, agent-harness registry, Hatchet trigger, control and
-  submission services, and bounded `http.Server`.
+  authenticator, journal/projections, admission/scheduler, agent-harness
+  registry, supervisor, ownership/resources, candidate/review/gates,
+  integration/publication, status, Hatchet trigger, control and submission
+  services, and bounded `http.Server`.
 - The gateway and worker use separate Hatchet client instances and environment
   keys.
 - The gateway executes no repository-controlled command.
@@ -1579,18 +3307,24 @@ binary default.
 1. install the process-inspection guard;
 2. load and validate gateway config;
 3. load hashed token policy;
-4. construct the control-plane and submission filesystem stores;
-5. construct the capability-aware agent-harness registry and Codex action
+4. construct the authoritative control journal/projection store and the
+   submission filesystem store;
+5. construct the fair multi-run admission, scheduler, lease, ownership,
+   resource, supervisor, candidate/review/gate, integration/publication, and
+   redacted status services using the frozen interfaces from ACP-14 through
+   ACP-21;
+6. construct the capability-aware agent-harness registry and Codex action
    validator without a
    Codex service credential or command executor;
-6. construct `controlplane.Service`;
-7. construct a Hatchet client with only
+7. construct `controlplane.Service` without any process-global executor,
+   integration, test, or publication mutex;
+8. construct a Hatchet client with only
    `PAJE_GATEWAY_HATCHET_TOKEN`;
-8. construct the trigger adapter and template registry;
-9. construct `submission.Service`;
-10. construct the combined HTTP handler and server;
-11. serve until signal cancellation;
-12. shut down HTTP, close Hatchet, and close stores with bounded
+9. construct the trigger adapter and template registry;
+10. construct `submission.Service`;
+11. construct the combined HTTP handler and server;
+12. serve until signal cancellation;
+13. shut down HTTP, close Hatchet, and close stores with bounded
     non-canceled contexts.
 
 Do not reuse `config.Config`, `runtimeDependencies`, or the worker composition
@@ -1632,7 +3366,7 @@ git add internal/gatewayconfig internal/processguard cmd/paje-gateway go.mod go.
 git commit -m "feat: compose hardened agent gateway"
 ```
 
-### Task 6: Build the deterministic `paje-agent` client
+### Task 6 (ACP-06): Build the deterministic `paje-agent` client
 
 **Files:**
 - Create: `internal/agentclient/client.go`
@@ -1658,6 +3392,8 @@ git commit -m "feat: compose hardened agent gateway"
   `agentclient.New(Config) (*Client, error)`,
   `(*Client).Capabilities`,
   `(*Client).CreateControlRun`,
+  `(*Client).ListControlRuns`,
+  `(*Client).ControlStatus`,
   `(*Client).AddTask`,
   `(*Client).DispatchWork`,
   `(*Client).ObserveWork`,
@@ -1677,7 +3413,7 @@ git commit -m "feat: compose hardened agent gateway"
   `(*Client).Status`,
   `(*Client).Wait`, and
   `(*Client).Cancel`.
-- Produces exact commands: `capabilities`; `control create/status/close`; `task
+- Produces exact commands: `capabilities`; `control create/list/status/close`; `task
   create`; `work dispatch/observe/send/wait/interrupt/close`; persistent-only
   `session create/read/send/wait/interrupt/archive` shortcuts; `evidence add`;
   `submit/status/wait/cancel`; and `hook`.
@@ -1758,6 +3494,8 @@ func TestSubmitSendsTokenOnlyInAuthorizationHeader(t *testing.T) {
 Also test:
 
 - canonical control/task/work requests and stable lifecycle action IDs;
+- per-run delta cursors and the separately authorized/redacted global control
+  view, including rejection of cross-run/global cursor substitution;
 - persistent runtime-returned child-ID registration/acknowledgement, callback
   plus cursor polling, and archive receipt;
 - ephemeral attempts with optional runtime ID and capability-gated ack/send/
@@ -1793,20 +3531,28 @@ Token-file tests require:
 Hook context uses:
 
 ```go
+type ControlRunContext struct {
+    ControlRunID string `json:"control_run_id"`
+    LastCursor   string `json:"last_cursor,omitempty"`
+}
+
 type HookContext struct {
-    SchemaVersion int    `json:"schema_version"`
-    SessionID     string `json:"session_id"`
-    TurnID        string `json:"turn_id"`
-    CWD           string `json:"cwd"`
-    ActiveControlRunID string `json:"active_control_run_id,omitempty"`
-    ActiveRunID   string `json:"active_run_id,omitempty"`
-    LastCursor    string `json:"last_cursor,omitempty"`
-    UpdatedAt     string `json:"updated_at"`
+    SchemaVersion        int                 `json:"schema_version"`
+    SessionID            string              `json:"session_id"`
+    TurnID               string              `json:"turn_id"`
+    CWD                  string              `json:"cwd"`
+    SelectedControlRunID string              `json:"selected_control_run_id,omitempty"`
+    ControlRuns          []ControlRunContext `json:"control_runs,omitempty"`
+    ActiveLeafRunID      string              `json:"active_leaf_run_id,omitempty"`
+    UpdatedAt            string              `json:"updated_at"`
 }
 ```
 
 It is stored at `$PLUGIN_DATA/context.json` with directory `0700`, file `0600`,
-atomic replace, and no prompt, transcript, request body, or token fields.
+atomic replace, and no prompt, transcript, request body, or token fields. The
+control-run slice is sorted, duplicate-free, bounded to 16 entries, and keeps a
+cursor inside its exact run scope. Selection is an explicit UI convenience,
+never proof that only one control run is active.
 
 - [ ] **Step 3: Write failing command tests for JSON output and exit codes**
 
@@ -1849,11 +3595,13 @@ Every lifecycle mutation derives an action ID from:
 
 ```text
 sha256(
-  "paje-control-action-v1\0" +
+  "paje-control-action-v2\0" +
   control_run_id + "\0" +
-  task_or_attempt_id + "\0" +
-  verb + "\0" +
+  task_id + "\0" +
+  attempt_id + "\0" +
+  action_kind + "\0" +
   graph_revision + "\0" +
+  expected_projection_revision + "\0" +
   canonical_request_digest
 )
 ```
@@ -1873,6 +3621,12 @@ until a terminal receipt is recorded. `control close` verifies the server's
 exact close evidence and returns `cleanup_incomplete` when any persistent
 archive receipt, ephemeral runtime-close proof, native aggregate/cancel receipt,
 inactive-local marker, or typed pending-work condition is unresolved.
+
+`control status --run <id> --after-cursor <cursor>` consumes only that run's
+delta cursor. `control list --after-global-cursor <cursor>` consumes the
+separate `control:list` view and never returns a per-run cursor, credential,
+prompt, raw evidence, or provider payload. Neither command mutates, renews, or
+acknowledges work.
 
 Then implement the stable Codex leaf idempotency helper:
 
@@ -1921,9 +3675,9 @@ outcomes. Never resubmit from `wait`.
 `hook user-prompt-submit` reads hook JSON from stdin, validates
 `hook_event_name == "UserPromptSubmit"`, and writes safe context.
 
-`hook session-start` and `hook stop` may perform one status request for
-`ActiveControlRunID` or `ActiveRunID`; they output valid hook JSON containing
-only a concise
+`hook session-start` and `hook stop` may perform one bounded status request for
+the explicitly selected control run, the redacted central view, or the active
+leaf run; they output valid hook JSON containing only a concise
 `systemMessage`. They never call submit or cancel and never return
 `continue:false`. They also never dispatch, send, interrupt/cancel, close work,
 archive a persistent session, or close a control run.
@@ -1950,7 +3704,7 @@ git add internal/agentclient cmd/paje-agent
 git commit -m "feat: add deterministic agent control client"
 ```
 
-### Task 7: Package the Codex skill and lifecycle hooks
+### Task 7 (ACP-07): Package the Codex skill and lifecycle hooks
 
 **Files:**
 - Create: `integrations/codex/paje/.codex-plugin/plugin.json`
@@ -2010,6 +3764,10 @@ commit before implementation.
 - orchestration skill names all four provider-neutral primitives, all required
   placement fields, the concrete Codex mapping and decision factors, promotion,
   safe fallback, concurrency limits, and overlapping-writer denial;
+- orchestration skill treats multiple simultaneously active `ControlRun`
+  values and unrelated `ProjectRef` values as normal, uses per-run cursors and
+  typed cross-project handoffs, and never infers one active spec from hook
+  selection;
 - orchestration skill distinguishes persistent runtime-ID/callback/archive,
   ephemeral capability-gated identity/ack/send/callback plus runtime close,
   deterministic native aggregation/cancel without synthetic identity, and local
@@ -2085,7 +3843,9 @@ content, and use timeouts of 5 seconds:
 
 The `orchestrating-with-paje/SKILL.md` must instruct Codex to:
 
-1. require explicit intent and create or resume one durable `ControlRun`;
+1. require explicit intent and create or resume the requested durable
+   `ControlRun` values without assuming it is the installation's only active
+   run;
 2. discover semantic primitive-specific dispatch/observe/send/wait/interrupt-
    or-cancel/callback/aggregation/runtime-close/archive capabilities and apply
    the recorded safe fallback or stop when a requirement is unavailable;
@@ -2095,8 +3855,9 @@ The `orchestrating-with-paje/SKILL.md` must instruct Codex to:
 4. record every task's placement, primitive, rationale, capability
    requirements, lifecycle owner, and fallback using the concrete Codex
    mapping; re-evaluate scope growth and promote subagent work safely;
-5. dispatch only ready independent tasks and isolate unrelated projects'
-   workspaces, credentials, ownership, messages, and evidence;
+5. submit ready work through central fair admission, dispatch only independent
+   admitted tasks, and isolate every run/project's cursors, workspaces,
+   credentials, ownership, messages, resources, cleanup, and evidence;
 6. reserve one durable `PlacementAttempt`, invoke the selected primitive once,
    and record only runtime identities actually returned;
 7. for persistent sessions, register/acknowledge the exact child ID, require
@@ -2105,12 +3866,15 @@ The `orchestrating-with-paje/SKILL.md` must instruct Codex to:
    terminal plus runtime-close evidence; for native fan-out, require bounded
    deterministic aggregation/cancel without invented identities; for local work,
    create no child;
-8. send scoped parent steering and dependency handoffs and record
-   acknowledgement;
+8. send scoped parent steering and dependency handoffs, record acknowledgement,
+   and represent cross-project handoffs as explicit typed graph edges rather
+   than shared ownership;
 9. verify exact branch/SHA/owned diff/tests/evidence and assign one disposition;
 10. integrate in graph order and rerun combined gates;
 11. resume after restart from durable attempts, actual registered IDs, and
-    applicable stored cursors without duplicate lifecycle actions; and
+    exact per-run stored cursors without duplicate lifecycle actions, while
+    unrelated eligible runs continue past stalled, failed, authority-blocked,
+    or cleanup-incomplete runs; and
 12. refuse close until every persistent session is archived, every ephemeral
     runtime is closed, every native fan-out is terminally aggregated or
     canceled, no local work is active, and every typed pending-work counter is
@@ -2171,7 +3935,13 @@ git add integrations/codex/paje cmd/paje-agent
 git commit -m "feat: package Codex Pajé integration"
 ```
 
-### Task 8: Deploy the optional gateway with pairwise credential isolation
+### Task 8 (ACP-08): Deploy the optional gateway with pairwise credential isolation
+
+Use the `PW-07` artifacts from parent integration
+`740b355660ae8f29210911ae1a5c3514797a2449` as frozen inputs after this
+specification commit is integrated on top. `Dockerfile` is then assigned to the
+single ACP-08 writer; `Dockerfile.worker-codex` and portable-worker documents
+remain immutable inputs.
 
 **Files:**
 - Modify: `charts/paje/Chart.yaml`
@@ -2328,7 +4098,14 @@ git add charts/paje Dockerfile internal/acceptance/image_test.go
 git commit -m "feat: package isolated submission gateway"
 ```
 
-### Task 9: Formalize execution certification and ratify Codex
+### Task 9 (ACP-09): Formalize execution certification and ratify Codex
+
+Use the accepted `PW-07` worker image/profile and live-Docker evidence from
+parent integration `740b355660ae8f29210911ae1a5c3514797a2449` after this
+specification commit is integrated on top. Any digest drift creates a new
+certification candidate and invalidates the frozen receipt. ACP-05 must also be
+integrated first because ACP-05 and ACP-09 sequentially own the same
+`internal/processguard/guard_linux_test.go` path.
 
 **Files:**
 - Create: `internal/runner/contracttest/suite.go`
@@ -2496,9 +4273,15 @@ through AP-6 from the design, then define the evidence fields and validation:
 | `tests.race` | exact race-test command |
 | `tests.live` | exact opt-in live command |
 | `recorded_at` | UTC RFC3339 timestamp |
+| `control_run_id` | exact source control run when applicable |
+| `journal_cursor` | terminal authoritative journal cursor |
+| `evidence_receipt_id` | immutable journal-derived evidence receipt |
+| `candidate_id` | exact accepted candidate or explicit `not_applicable` |
 
 Generated evidence files contain concrete values and are created only by
-acceptance runs.
+acceptance runs. YAML is a redacted diagnostic export bound to the listed
+journal cursor and receipt; editing or committing it cannot authorize a support
+claim or replace the authoritative journal evidence.
 
 - [ ] **Step 7: Run certification and existing security tests**
 
@@ -2526,17 +4309,19 @@ git add internal/runner internal/executil internal/environment \
 git commit -m "test: formalize Codex harness certification"
 ```
 
-### Task 10: Prove live Codex execution, leaf submission, and Agent Control Plane acceptance
+### Task 10 (ACP-10): Prove live Codex execution, leaf submission, and Agent Control Plane acceptance
 
 **Files:**
 - Modify: `internal/acceptance/codex_test.go`
 - Create: `internal/acceptance/codex_agent_pilot_test.go`
 - Create: `internal/acceptance/codex_control_plane_test.go`
+- Create: `internal/acceptance/codex_central_multirun_test.go`
 - Modify: `internal/acceptance/helpers_test.go`
 - Modify: `internal/acceptance/prerequisites_test.go`
 - Create: `internal/acceptance/testdata/agent-pilot-task.json`
 - Create: `internal/acceptance/testdata/control-plane-spec.md`
 - Create: `internal/acceptance/testdata/control-plane-steering.json`
+- Create: `internal/acceptance/testdata/central-multirun-scenario.json`
 - Modify: `integrations/codex/paje/plugin_test.go`
 - Create after live pass: `docs/evidence/codex-execution.yaml`
 - Create after live pass: `docs/evidence/codex-agent-pilot.yaml`
@@ -2547,7 +4332,7 @@ git commit -m "test: formalize Codex harness certification"
 - Adds `PAJE_CODEX_AGENT_PILOT_ACCEPTANCE=1` for the full originating-session
   leaf round trip.
 - Adds `PAJE_CODEX_CONTROL_PLANE_ACCEPTANCE=1` for the long-spec multi-agent
-  control run.
+  control run and centralized concurrent-run isolation scenario.
 - Produces concrete certification evidence only after a successful opt-in run.
 
 - [ ] **Step 1: Extend the existing live Codex test with formal assertions**
@@ -2654,7 +4439,9 @@ The control-plane test:
     active, then proves durable attempts, returned child IDs, applicable
     cursors, graph state, and evidence resume without duplicate work;
 12. verifies exact branches, SHAs, owned-path diffs, tests, and reports, then
-   integrates evidence in graph order and runs combined gates;
+   integrates evidence in graph order, freezes each exact integration snapshot,
+   and runs every combined gate against that snapshot's apply receipt and
+   result tree before publication or disposition;
 13. assigns one disposition to every placement attempt, archives every
     persistent session, records ephemeral runtime closure, native terminal
     aggregation/cancel, and no active local work, then proves every typed
@@ -2662,6 +4449,33 @@ The control-plane test:
 14. scans control/child transcripts, hook state, gateway/coordinator logs,
     durable evidence, and artifacts for Hatchet, worker, runtime-provider,
     executor, publisher, and scoped-token sentinels.
+
+The same opt-in suite MUST also run
+`TestCodexCentralMultiRunAcceptance`. It starts at least four independently
+scoped `ControlRun` values: two unrelated ready projects with intentionally
+equal task IDs, attempt IDs, relative owned paths, and provider-local cursor
+strings; one run held awaiting publication authority; and one run whose managed
+cleanup is forced to fail. The scenario MUST:
+
+1. apply bounded installation, project, run, primitive, and shared-resource
+   quotas and prove deterministic fair backpressure with no starvation;
+2. interleave callbacks and events, attempt one foreign callback/result/cursor
+   application, and prove rejection before any target-run mutation;
+3. serialize only two contenders for one real shared-resource key while
+   unrelated executor, verifier, integration, and publication work proceeds
+   concurrently without a global mutex or head-of-line blocking;
+4. restart the gateway while work and due leases span all four runs, then prove
+   the bounded persisted scan cursor and fair due-lease selection resume each
+   action without duplication, while the installation feed retains one
+   contiguous `JournalPosition` order and rebuilds the same central-view bytes;
+5. prove the authority-blocked and cleanup-incomplete runs remain visible but
+   consume no unrelated execution slot;
+6. query each run with its own delta cursor and query the separately authorized
+   redacted global view, proving cursor separation and credential/evidence
+   isolation; and
+7. close the unaffected runs with exact primitive receipts while the two
+   intentionally blocked runs remain accurately open, with no cross-run state,
+   credential, resource, ownership, evidence, or cleanup contamination.
 
 - [ ] **Step 3: Add an adversarial recursion acceptance case**
 
@@ -2747,7 +4561,7 @@ PAJE_CODEX_CONTROL_PROJECT_B="$PAJE_CODEX_CONTROL_PROJECT_B" \
 PAJE_CODEX_CONTROL_PROJECT_B_BASE_SHA="$PAJE_CODEX_CONTROL_PROJECT_B_BASE_SHA" \
 PAJE_CODEX_CONTROL_APP_ID="$PAJE_CODEX_CONTROL_APP_ID" \
   go test ./internal/acceptance \
-  -run TestCodexAgentControlPlaneAcceptance -v -count=1
+  -run 'TestCodex(AgentControlPlane|CentralMultiRun)Acceptance' -v -count=1
 ```
 
 Expected: PASS with at least three acknowledged persistent children over at
@@ -2757,7 +4571,12 @@ no overlapping mutable ownership; scoped message exchange; one steering event;
 persistent callback plus cursor-aware recovery; ephemeral terminal/runtime
 close; deterministic fan-out aggregation/cancel; evidence integration;
 successful restart recovery; an archive receipt for every persistent session;
-no active local work; and every typed pending-work counter zero at close.
+no active local work; and every typed pending-work counter zero at close. The
+central multi-run scenario also proves fair bounded admission, interleaved
+callback isolation, real shared-resource contention without head-of-line
+blocking, continued unaffected progress around one authority-blocked and one
+cleanup-incomplete run, per-run/global cursor separation, and no cross-run
+contamination.
 
 - [ ] **Step 8: Commit redacted exact evidence**
 
@@ -2765,7 +4584,9 @@ Copy only the schema-valid, redacted evidence for the exact Step 5 commit into
 `docs/evidence/codex-execution.yaml` and
 `docs/evidence/codex-agent-pilot.yaml`, and
 `docs/evidence/codex-control-plane.yaml`. Never commit credentials or
-unredacted live logs:
+unredacted live logs. Each YAML file is a diagnostic projection bound to the
+authoritative journal cursor and immutable evidence receipt; no YAML edit may
+advance acceptance or publication:
 
 ```bash
 git add docs/evidence/codex-execution.yaml \
@@ -2774,7 +4595,7 @@ git add docs/evidence/codex-execution.yaml \
 git commit -m "test: record Codex control-plane evidence"
 ```
 
-### Task 11: Align README, Helm metadata, site, docs, and positioning regressions
+### Task 11 (ACP-11): Align README, Helm metadata, site, docs, and positioning regressions
 
 **Files:**
 - Modify: `README.md`
@@ -2878,6 +4699,13 @@ Expected: FAIL on the new support matrix until the page is aligned.
 - exact capability, control-run, task, placement-attempt work, persistent
   session specialization, mailbox, evidence, and close endpoints and two-phase
   lifecycle action schemas;
+- typed authoritative action/event journal, derived projections, external
+  reservation/result/ambiguity reconciliation, graph CAS, and diagnostic-only
+  YAML;
+- centralized multi-run admission, quotas, fairness/backpressure, bounded fair
+  restart scanning, real shared-resource locks, per-run delta cursors, safe
+  global status, cross-run rejection, and proof that blocked or cleanup-failing
+  runs do not delay unrelated work;
 - durable model, graph revisions, projects, ownership, message scope, runtime
   identity by primitive, persistent acknowledgement/callbacks/cursors/archive,
   ephemeral optional identity and runtime close, native aggregation/cancel,
@@ -2889,6 +4717,10 @@ Expected: FAIL on the new support matrix until the page is aligned.
   overlapping-writer denial; and
 - operator reconciliation for ambiguous dispatch/interrupt/close and
   `cleanup_incomplete`.
+- immutable candidate/review/correction/supersession history, independent
+  verifier provenance, gate receipts, exact integration/generated-only
+  conflicts, explicit publication authority, target-tree verification, and the
+  deterministic-versus-policy-assisted fail-closed boundary.
 
 `docs/codex-integration.md` includes:
 
@@ -2984,7 +4816,7 @@ git add README.md charts/paje/Chart.yaml charts/paje/templates/NOTES.txt \
 git commit -m "docs: align Pajé product support claims"
 ```
 
-### Task 12: Run the evidence gate for a second dedicated harness
+### Task 12 (ACP-12): Run the evidence gate for a second dedicated harness
 
 **Files:**
 - Create: `docs/second-harness-selection.md`
@@ -3099,10 +4931,11 @@ git add docs/second-harness-selection.md docs/harness-certification.md \
 git commit -m "docs: record second harness evidence gate"
 ```
 
-### Task 13: Run full security, compatibility, and completion gates
+### Task 13 (ACP-13): Run full security, compatibility, and completion gates
 
 **Files:**
-- Modify as findings require: files introduced or changed in Tasks 0-12 only
+- Modify as findings require: files introduced or changed by their owning
+  `ACP-00..ACP-21` task only
 - Modify: this plan, checking completed task boxes
 
 **Interfaces:**
@@ -3142,7 +4975,8 @@ go test -race \
 
 Expected: PASS with no race, credential sentinel, leaked or duplicate child,
 placement-record omission, unsafe fallback, overlapping mutable subagent,
-cursor regression, false closure, duplicate reservation owner, or
+cursor regression, cross-run binding, journal/projection divergence, unfair
+starvation, global work mutex, false closure, duplicate reservation owner, or
 untrusted-hook bypass.
 
 - [ ] **Step 3: Run the full Go quality gate**
@@ -3230,7 +5064,7 @@ PAJE_CODEX_CONTROL_PROJECT_B="$PAJE_CODEX_CONTROL_PROJECT_B" \
 PAJE_CODEX_CONTROL_PROJECT_B_BASE_SHA="$PAJE_CODEX_CONTROL_PROJECT_B_BASE_SHA" \
 PAJE_CODEX_CONTROL_APP_ID="$PAJE_CODEX_CONTROL_APP_ID" \
   go test ./internal/acceptance \
-  -run TestCodexAgentControlPlaneAcceptance -v -count=1
+  -run 'TestCodex(AgentControlPlane|CentralMultiRun)Acceptance' -v -count=1
 ```
 
 Run GitHub publication and Kubernetes server-side dry-run acceptance only with
@@ -3244,7 +5078,11 @@ promotion, missing-capability fallback, concurrency enforcement, no overlapping
 mutation, three persistent children, two projects, steering, restart recovery,
 persistent archival, ephemeral runtime close, deterministic native aggregation,
 no active local work, and a zero typed pending-work gate. Any opted-in missing
-prerequisite is fatal.
+prerequisite is fatal. The same evidence proves simultaneous unrelated runs,
+fair bounded admission, interleaved callback/result/cursor isolation,
+resource-specific contention, unaffected progress around one
+authority-blocked and one cleanup-incomplete run, bounded fair restart
+reconciliation, and per-run/global status separation.
 
 - [ ] **Step 7: Perform an independent adversarial review**
 
@@ -3254,6 +5092,14 @@ Review the complete implementation range for:
 - token or service-credential exposure;
 - scope widening;
 - idempotency split-brain and crash windows;
+- any projection-only mutation, cross-run ID/cursor/result binding, unscoped
+  credential/evidence/resource lookup, or replay that changes with checkpoint
+  boundaries;
+- noncontiguous/reused `JournalPosition`, timestamp or mutable-side-counter
+  global ordering, per-run-head merge, or restart/late append that changes an
+  existing installation-feed prefix;
+- admission starvation, unbounded restart scans, head-of-line blocking, or a
+  global executor/test/integration/publication lock;
 - lineage forgery or depth bypass;
 - cancellation lies and automatic retry;
 - malformed transcript false success;
@@ -3267,6 +5113,14 @@ Review the complete implementation range for:
   aggregation/cancel, local child creation, cursor regression, unscoped
   steering/handoff, missing disposition, false close evidence, or a nonzero
   typed pending-work gate;
+- mutable candidate/evidence history, self-reported verification accepted as
+  independent, review-barrier bypass, stale gate reuse, guessed authored
+  conflict resolution, publication without exact authority, or missing target
+  tree verification;
+- a candidate pre-gate receipt accepted as a combined gate, a combined receipt
+  not bound to the exact integration snapshot/apply receipt/result tree, tree
+  drift during combined gates, or publication/disposition before every required
+  post-integration gate passes;
 - unsafe filesystem roots/symlinks/modes;
 - gateway/worker Secret aliasing;
 - support-matrix claims ahead of acceptance evidence.
@@ -3285,7 +5139,8 @@ git log --oneline --decorate -15
 ```
 
 Expected: no unchecked implementation task, no uncommitted implementation
-file, and a reviewable commit sequence matching Tasks 0-12.
+file, and a reviewable dependency-ordered commit sequence matching every
+`ACP-00..ACP-21` node.
 
 - [ ] **Step 9: Commit final review fixes and evidence**
 

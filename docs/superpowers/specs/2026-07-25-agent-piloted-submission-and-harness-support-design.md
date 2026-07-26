@@ -84,6 +84,9 @@ an explicit definition of what "supported harness" means.
 
 - Let one external control agent deliberately create and resume a durable
   `ControlRun` from a long specification.
+- Let the centralized service admit and fairly supervise many simultaneous,
+  unrelated `ControlRun` values without cross-run identity, cursor, ownership,
+  resource, credential, evidence, cleanup, or status leakage.
 - Persist the task graph, exact projects, dependencies, ownership, child
   sessions, placement attempts, scoped messages, evidence, dispositions,
   integration order, and close state independently of one coordinator process.
@@ -403,6 +406,698 @@ leaf command runs safely; it does not prove child-session orchestration.
 
 ## Provider-Neutral Durable Agent Control Plane
 
+### Empirical Orchestration Contract
+
+This section is the canonical reconciliation of the 2026-07-26
+execution/runtime, review/integration, and meta-control-plane analyses. It does
+not add another orchestration layer beside the model below. It makes that model
+executable by defining authority, action, ownership, candidate, verification,
+integration, publication, supervision, and closure state machines. The
+[initial control-plane design](./2026-07-24-initial-control-plane-design.md#empirical-orchestration-contract)
+summarizes the boundary, and the
+[canonical continuation DAG](../plans/2026-07-25-agent-piloted-submission-and-harness-support.md#canonical-continuation-dag)
+is the only implementation ordering for these requirements.
+
+The provider-neutral Agent Control Plane remains above the portable isolated
+execution plane. Worker profiles, secret materialization, executors, sandbox
+initialization, and runner adapters execute one bounded leaf command. They do
+not own graph revisions, runtime supervision, review acceptance, integration,
+publication authority, or closure.
+
+#### Authoritative journal and derived projections
+
+The authoritative state is a typed append-only journal. A `ControlAction` is an
+immutable reservation for one intended effect. A `ControlEvent` is an immutable
+fact about that reservation or another internal transition. `ControlRun`,
+`TaskGraph`, `PlacementAttempt`, `AgentSession`, mailbox, resource, candidate,
+review, gate, integration, publication, status, and close records are derived
+projections that can be rebuilt from journal position zero.
+
+The existing durable `Snapshot`, `LifecycleAction`, and ordered `Event` records
+are the migration base. Until journal migration is complete they remain shipped
+behavior, but new orchestration semantics MUST NOT expand snapshot mutation as
+an alternative source of truth. After migration, a snapshot is a versioned
+checkpoint plus a verified journal cursor. It may accelerate reads but cannot
+authorize a transition that the journal cannot replay.
+
+```go
+type ControlAction struct {
+    ID                     string
+    ControlRunID           string
+    TaskID                 string
+    AttemptID              string
+    Kind                   ControlActionKind
+    GraphRevision          uint64
+    ExpectedProjection     uint64
+    CanonicalRequestDigest string
+    IdempotencyKey         string
+    AuthorityReceiptID     string
+}
+
+type JournalPosition uint64
+
+type RunCursor struct {
+    InstallationID string
+    ControlRunID   string
+    SchemaVersion  uint32
+    RunSequence    uint64
+}
+
+type GlobalCursor struct {
+    InstallationID  string
+    SchemaVersion   uint32
+    JournalPosition JournalPosition
+}
+
+type ControlEvent struct {
+    ID               string
+    ControlRunID     string
+    RunSequence      uint64
+    JournalPosition  JournalPosition
+    ActionID         string
+    Kind             ControlEventKind
+    PayloadDigest    string
+    ProviderReceipt  string
+    OccurredAt       time.Time
+}
+```
+
+`JournalPosition` is the authoritative installation-wide append identity. The
+single-replica v1 store first creates or validates an immutable journal-root
+manifest containing installation identity and schema, then assigns the next
+position while holding the same append
+CAS that validates and assigns the event's next per-run `RunSequence`; the
+persisted event becomes visible with both values or not at all. Positions start
+at one, are contiguous, never reused, and order all runs without timestamps.
+`OccurredAt` is diagnostic metadata and MUST NOT order replay.
+
+The canonical installation feed pages immutable events by
+`JournalPosition`. Per-run feeds are derived indexes over that same event set
+and page by `(ControlRunID, RunSequence)`; an event is stored authoritatively
+once, and indexes/checkpoints are rebuildable. A global cursor binds
+installation identity, journal schema, and last consumed `JournalPosition`. A
+per-run cursor binds installation identity, exact `ControlRunID`, schema, and
+last consumed `RunSequence`. Neither cursor is accepted by the other feed.
+Concurrent appends, coordinator restart, or a late event for an older run may
+change only the feed suffix: they cannot renumber, reorder, or rewrite an
+existing position.
+
+`ControlActionKind` covers at least `dispatch`, `register_runtime`, `send`,
+`observe`, `wait`, `interrupt`, `cancel`, `allocate_resource`,
+`dispose_resource`, `verify_candidate`, `run_gate`, `integrate`, `publish`,
+`verify_target_tree`, `close_runtime`, `archive_session`, and `close_run`.
+Provider-neutral adapters may add typed kinds only by schema version; they may
+not persist provider payloads as an untyped escape hatch.
+
+The stable action key is derived from control run, task and attempt when
+applicable, action kind, graph revision, expected projection revision, and the
+canonical request digest. Exact replay returns the original reservation and
+bound result. Reusing a key with changed input is a conflict. A later retry of a
+typed transient failure uses a new generation linked to the prior action; it
+does not overwrite history.
+
+Every durable key is scoped by the centralized installation and exact
+`ControlRunID` before task, attempt, action, candidate, cursor, lease,
+idempotency, evidence, subscription, or resource-local identity. Provider IDs
+are never sufficient keys on their own. A callback or provider event is applied
+only after the runtime binding proves the same control run, task, attempt,
+primitive, provider identity, and action generation. An event from one run can
+therefore never advance another run even when provider-local IDs, relative
+paths, task names, or client idempotency strings are equal.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Reserved
+    Reserved --> ResultBound: exact result persisted
+    Reserved --> NotPerformed: pre-invocation proof of no effect
+    Reserved --> Ambiguous: invocation outcome unknown
+    Ambiguous --> ResultBound: provider observation proves result
+    Ambiguous --> NotPerformed: provider observation proves no effect
+    Ambiguous --> Blocked: provider cannot reconcile safely
+    NotPerformed --> Superseded: authorized new generation
+    ResultBound --> [*]
+    Blocked --> [*]
+    Superseded --> [*]
+```
+
+The invocation may start only after `Reserved` is durable. Response loss or a
+coordinator crash leaves `Ambiguous`, never an implicit failure. Pajé observes
+the provider by action ID, runtime ID, provider receipt, repository ancestry,
+remote ref, resource identity, or target-tree equality, as appropriate. It MUST
+NOT blindly repeat an ambiguous dispatch, message, interrupt/cancel, resource
+mutation, integration, publication, runtime close, archive, or target-tree
+verification. If the required observation capability is absent or contradictory,
+the action and its dependents remain fail-closed `blocked`.
+
+YAML and prose control records are diagnostic exports only. A renderer binds
+its schema version and terminal journal cursor. Editing or repairing an export
+does not mutate the control run, advance a cursor, release ownership, accept
+evidence, or close work.
+
+#### Central multi-run admission, isolation, and fairness
+
+Pajé is one centralized control plane for many concurrently active
+`ControlRun` values. A run is an isolation and accounting boundary, not a
+singleton service mode. Unrelated graphs and projects advance concurrently;
+one run that is slow, blocked, awaiting authority, failed, or
+`cleanup_incomplete` cannot hold a global progress lock or prevent another
+ready run from admission, supervision, verification, integration, publication,
+or closure.
+
+Central admission records a durable `RunAdmission` and `ReadyWorkItem` for each
+eligible task/action. It enforces bounded installation, principal, run,
+canonical-project, primitive, verifier, integration, publication, and named
+resource quotas. Admission uses a versioned deterministic weighted-fair policy:
+FIFO within equal run/priority class, round-robin or virtual-finish ordering
+across runnable runs, bounded per-run burst, and age-based promotion that
+prevents starvation. A rejected or deferred item records its limiting quota,
+queue position class, and next eligibility condition. Backpressure leaves the
+item durably ready; it does not create a runtime or spin a poll loop.
+
+Quota and fairness policy is independent of semantic task priority. A control
+agent may submit a policy-assisted priority recommendation, but only an
+authorized versioned admission policy turns it into deterministic weight.
+Awaiting-input and cleanup-only work consumes only its actual monitor or cleanup
+budget, not an execution slot. Per-run and per-project ceilings prevent one
+large graph from exhausting centralized capacity.
+
+Ownership conflict keys combine canonical repository/project identity with the
+normalized mutable path or named shared-resource namespace. Identical relative
+paths in unrelated repositories do not conflict. Projects that intentionally
+share a deployment target, cluster namespace, database, cache, device, local
+registry, publisher target, or other scarce resource declare the same canonical
+shared-resource key and therefore contend even when their repositories differ.
+Cross-project handoff is an explicit typed graph edge with bounded evidence and
+acknowledgement; it never creates implicit shared ownership or credential
+visibility.
+
+Credential handles are keyed by installation, control run, principal,
+canonical project, and declared purpose. The journal stores only the opaque
+handle identity, policy/authority digest, and use receipt, never clear secret
+material. Evidence, cleanup, and subscription namespaces use the same run and
+project scope. Equal provider-local credential or evidence IDs in two scopes
+remain distinct, and a typed cross-project handoff grants only its declared
+evidence—not credential lookup, publication authority, ownership, or cleanup
+authority. Publication credentials are resolved later inside the isolated
+publisher boundary from the exact authorized project/target scope.
+
+Resource locks are keyed to the real scarce resource and requested mode, not to
+the executor, verifier, integration subsystem, or whole installation. Compatible
+read/shared modes and unrelated keys proceed concurrently. A lock request binds
+run, action, resource key, mode, lease generation, queue order, and expiry.
+Locks use the same fair admission discipline, impose bounded hold times, and
+release only through result or recovery evidence. Pajé MUST NOT implement a
+global executor, test, integration, or publication mutex that causes
+head-of-line blocking across unrelated work.
+
+Restart recovery enumerates all nonterminal runs and due leases through a
+stable paginated index. Each recovery tick has a bounded item/time budget,
+advances a durable scan cursor, and selects due work through the same fair
+policy. A repeatedly failing reconciliation is classified and backed off for
+that run/action; the scan continues to other runs. Recovery never scans one run
+to exhaustion before allowing another due run to progress.
+
+Each run has its own monotonic run sequence and status cursor. The central
+status view is a separate redacted projection rebuilt only from the canonical
+installation feed in ascending `JournalPosition` and keyed by its global cursor. It
+contains only safe run IDs, coarse states, quota/backpressure reasons, counts,
+and next eligibility; it cannot expose project secrets, prompts, provider
+payloads, evidence bodies, or per-run cursor tokens. Per-run subscribers can
+never use a global cursor, and global subscribers cannot acknowledge or mutate
+a run. A timestamp sort, mutable global counter outside the journal, scan of
+per-run heads, or arrival-time merge is not an authoritative global ordering.
+
+Central acceptance MUST exercise at least two simultaneous unrelated runs over
+different canonical projects, interleaved callbacks, one genuinely shared
+resource contention key, unrelated noncontending gates, one stalled or
+awaiting-authority run, one cleanup-incomplete run, and a coordinator restart.
+Evidence must show fair bounded admission, continued progress and closure of
+unaffected runs, no cross-run callback/event/cursor/idempotency collision, no
+credential or evidence leakage, and deterministic recovery of every due lease.
+
+#### CAS graph revisions, exact ownership, and managed resources
+
+Every graph update is an immutable `TaskGraphRevision` written with
+compare-and-swap against the expected revision. It binds task definitions,
+project/base SHAs, dependency order, frozen-input digests, ownership claims,
+placement policy inputs, integration order, combined gates, and the prior
+revision. A stale revision is rejected. A changed frozen input creates a new
+revision and suspends affected ready or active dependents; it never rewrites
+their historical boundary.
+
+Ownership is a journaled lease over canonical project-relative paths or named
+resources. The only states are `proposed`, `granted`, `active`,
+`transfer_pending`, `released`, and `revoked`. `revoked` is an exceptional
+policy-authorized terminal state and does not imply that resources are safe to
+delete.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Proposed
+    Proposed --> Granted: CAS grant at graph revision
+    Granted --> Active: exact owner acknowledges digest
+    Active --> TransferPending: disposition and handoff reserved
+    TransferPending --> Released: recipient acknowledges and prior work closes
+    Active --> Released: terminal disposition and close receipt
+    Active --> Revoked: explicit exceptional authority
+    Revoked --> [*]
+    Released --> [*]
+```
+
+Grant, expansion, transfer, and release each bind control run, graph revision,
+canonical project/repository or shared-resource namespace, normalized ownership
+units, owner, action ID, and acknowledgement
+digest. Expansion is a new claim and MUST fail while any added unit overlaps an
+active or undispositioned owner. Transfer requires immutable handoff evidence,
+recipient acknowledgement, prior-owner disposition, and primitive-specific
+closure. Silence, idle runtime state, callback receipt, terminal worker prose,
+or coordinator restart never releases ownership.
+
+Every isolated workspace and external resource belongs in a managed resource
+ledger. A `ManagedResource` binds resource kind, stable provider identity,
+creating action, attempt, project, immutable base, origin, cleanup authority,
+current state, observation evidence, and disposition receipt. Resource kinds
+include worktrees/checkouts, branches, processes, containers, networks,
+workflow runs, runtime sessions, verification environments, publisher-owned
+repositories, and other provider resources created by an attempt.
+
+Session and resource origin is exactly `created` or `adopted`. Cleanup authority
+is exactly `manage_and_dispose`, `detach_only`, or `none`. Adoption grants no
+mutation, interruption, archive, deletion, or cleanup authority beyond the
+separately recorded ownership and cleanup grants. An adopted session with
+`detach_only` closes through an immutable detach receipt; one with `none`
+remains externally owned and is excluded from automated cleanup without being
+misreported as archived.
+
+Managed workspace creation resolves an immutable base SHA before allocation,
+uses a dedicated attempt root, records partial creation before continuing, and
+fails closed on a stale base, dirty source, path escape, symlink ambiguity, or
+unmanaged pre-existing resource. Cleanup is idempotent and may automatically
+remove only a managed resource whose authority, terminal disposition,
+cleanliness, and content-addressed integration or proven-safe discard are all
+verified. Unique, dirty, unmanaged, or ambiguously owned evidence requires a
+policy decision.
+
+#### Runtime registration, callback recovery, leases, and status
+
+Persistent dispatch keeps the existing exact runtime-ID registration contract:
+reserve dispatch, bind the runtime-returned child ID, send the parent/child
+registration message once, and require acknowledgement of that exact digest
+before accepting completion evidence. An ID inferred from a parent, source
+thread, worktree, prompt, or delegation envelope is invalid. Ephemeral and
+native primitives record only identities actually returned by their advertised
+capabilities.
+
+A completion callback is a wake-up claim. It never substitutes for provider
+observation, immutable candidate creation, or independent verification. Every
+persistent attempt combines callback delivery with cursor-aware observe/wait.
+Missing callbacks are recovered by polling; callbacks received before polling
+are confirmed by polling. Cursors are request-bound and monotonic. Duplicate
+events are harmless only when identity and digest match; regression, future
+cursor, identity mismatch, or changed duplicate payload blocks the attempt.
+
+The restart supervisor persists a `MonitorLease` containing attempt, owner,
+generation, last confirmed cursor, callback state, last material change,
+`next_wake_at`, retry class, backoff step, and expiry. Lease acquisition and
+renewal use CAS. A restart or replacement supervisor may take an expired lease
+and resume the same due action; it may not create a second monitor. Backoff is
+deterministic from the action identity and persisted step, is reset only by a
+material state change, and is bounded by policy. Only typed transient or
+contention failures are retryable; semantic, authority, identity, and evidence
+failures require a new candidate, graph revision, or authorization.
+
+Status is a redacted derived projection. `after_cursor` returns only material
+deltas in active nodes, blockers, ownership, callback/observation state,
+candidate/review status, gate status, integration eligibility, resource
+cleanup, and the next deterministic action. Unchanged polls emit no user-facing
+event. Payloads are bounded and exclude secrets, raw provider payloads, host
+paths, full prompts, raw transcripts, and unbounded logs. A subscriber cursor
+does not become an authority cursor and cannot advance workflow state.
+
+#### Immutable candidates, independent verification, and review barriers
+
+Every reported implementation result creates an immutable `CandidateSnapshot`
+bound to repository identity, expected base SHA, head/tree SHA, target ref,
+clean-tree proof, owned-path manifest and digest, graph revision, frozen-input
+digest, gate-policy digest, producing attempt, and callback/provider evidence.
+Any changed field creates a different candidate and invalidates all prior PASS
+evidence for integration purposes.
+
+Candidate state is monotonic:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Reported
+    Reported --> ProviderConfirmed
+    ProviderConfirmed --> StructurallyVerified
+    StructurallyVerified --> IndependentlyVerified
+    IndependentlyVerified --> ReviewPending
+    ReviewPending --> ReviewPassed
+    ReviewPending --> Rejected
+    ReviewPassed --> IntegrationEligible
+    IntegrationEligible --> Integrated
+    Integrated --> Dispositioned
+    Dispositioned --> Closed
+    Rejected --> Superseded
+    Superseded --> [*]
+    Closed --> [*]
+```
+
+Worker-reported commands and callback text remain claims. `VerificationRun`
+binds candidate ID, verifier implementation/version, verification profile and
+command digests, toolchain and environment digests, exact start/finish state,
+bounded result digests, retry classification, and verifier principal. Parent
+acceptance requires an independently executed verifier or a separately trusted
+cryptographic attestation. Verification and publisher credentials remain
+separated from repository-controlled code.
+
+Every required `ReviewGate` contains immutable reviewer scope identities and a
+versioned policy. Reviewer attempts are read-only, use the exact candidate, and
+aggregate independently of arrival order. The gate cannot pass while any
+required review is missing, active, stale, failed, blocked, skipped, or
+inconclusive. Mechanical tests do not replace a mandatory review, and an
+external review tool cannot be the sole authoritative verdict.
+
+A `Finding` has exactly one of `open`, `red_proven`, `correction_pending`,
+`green_proven`, `resolved`, `accepted_residual`, or `superseded`. Only exact
+duplicate finding identities may be collapsed mechanically. Semantic
+equivalence, severity, shared-root-cause grouping, and residual acceptance are
+policy-assisted and recorded with authority and evidence.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Open
+    Open --> RedProven: independent failing evidence
+    RedProven --> CorrectionPending: correction cycle reserved
+    CorrectionPending --> GreenProven: same finding passes on amended candidate
+    GreenProven --> Resolved: mandatory rereview accepts replacement
+    Open --> AcceptedResidual: explicit residual-risk authority
+    RedProven --> AcceptedResidual: explicit residual-risk authority
+    Open --> Superseded: exact replacement finding bound
+    RedProven --> Superseded: exact replacement finding bound
+    CorrectionPending --> Superseded: correction abandoned for replacement
+    GreenProven --> Superseded: later evidence invalidates replacement
+    Resolved --> [*]
+    AcceptedResidual --> [*]
+    Superseded --> [*]
+```
+
+A `CorrectionCycle` binds one rejected candidate, one immutable finding-set
+digest, one exclusive mutation owner, and one generation. Its states are
+`reserved`, `red_proven`, `correcting`, `green_proven`, `rereview_pending`,
+`accepted`, `rejected`, and `abandoned`. At most one correction cycle may own an
+overlapping path set. Except for a separately authorized documented exception,
+each resolved finding requires failing pre-fix evidence and passing post-fix
+evidence.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Reserved
+    Reserved --> RedProven: exact pre-fix failure bound
+    RedProven --> Correcting: exclusive correction owner acknowledges
+    Correcting --> GreenProven: amended candidate passes focused proof
+    GreenProven --> RereviewPending: immutable replacement candidate frozen
+    RereviewPending --> Accepted: all mandatory review gates pass
+    RereviewPending --> Rejected: any mandatory review rejects
+    Reserved --> Abandoned: explicit disposition authority
+    RedProven --> Abandoned: explicit disposition authority
+    Correcting --> Abandoned: exact work disposition and handoff
+    GreenProven --> Abandoned: evidence invalidated before rereview
+    Accepted --> [*]
+    Rejected --> [*]
+    Abandoned --> [*]
+```
+
+Transitions are forward-only and journal-bound. A new attempt after `rejected`
+or `abandoned` is a new correction generation; no state is reopened or
+overwritten.
+
+An amended head creates a new candidate whose `supersedes_candidate_id` points
+to the rejected candidate and whose `correction_cycle_id` binds the exact
+finding set. Supersession never deletes or mutates the earlier candidate,
+review, findings, or evidence. A rejected or superseded candidate can never
+become integration-eligible.
+
+#### Gate scheduling, exact integration, and secure publication
+
+Gate receipts have two non-interchangeable subjects. A `CandidateGateRun` is a
+pre-integration gate bound to an immutable candidate. A `CombinedGateRun` is a
+post-integration gate bound to an immutable `IntegrationSnapshot`:
+
+```go
+type CandidateGateRun struct {
+    ID                string
+    ControlRunID      string
+    CandidateID       string
+    CandidateTreeSHA  string
+    GateDigest        string
+    ToolchainDigest   string
+    EnvironmentDigest string
+    VerifierVersion   string
+    ResourceLocks     []ResourceLock
+    Required          bool
+}
+
+type IntegrationSnapshot struct {
+    ID                        string
+    ControlRunID              string
+    IntegrationAttemptID      string
+    IntegrationApplyReceiptID string
+    GraphRevision             uint64
+    IntegrationIndex          uint64
+    BaseSHA                   string
+    BaseTreeSHA               string
+    CandidateID               string
+    CandidateSHA              string
+    CandidateTreeSHA          string
+    ResultSHA                 string
+    ResultTreeSHA             string
+    OwnershipDigest           string
+    GeneratorManifestDigest   string
+    CandidateGateProfileDigest string
+    CombinedGateProfileDigest  string
+}
+
+type CombinedGateRun struct {
+    ID                        string
+    ControlRunID              string
+    IntegrationSnapshotID     string
+    IntegrationApplyReceiptID string
+    ResultTreeSHA             string
+    GateDigest                string
+    ToolchainDigest           string
+    EnvironmentDigest         string
+    VerifierVersion           string
+    ResourceLocks             []ResourceLock
+    Required                  bool
+}
+```
+
+The store freezes `IntegrationSnapshot` immediately after the reserved apply
+action binds its immutable integration-apply receipt and exact result SHA/tree.
+The snapshot ID covers every listed field. Candidate pre-gates may authorize
+starting the apply, but they can never satisfy a required combined gate.
+Likewise, a combined-gate receipt for one integration snapshot cannot verify a
+candidate or another integration result.
+
+Each gate result key covers its exact typed subject and subject tree, gate
+definition, toolchain, environment, verifier version, and required
+resource-lock set. Results are reusable only for that identical key. A change
+to subject kind/ID/tree, candidate, integration receipt, policy, toolchain,
+environment, verifier, or locks creates a new run and invalidates reuse. A
+required skip, canceled run, critical truncation, missing environment, or
+ambiguous outcome is non-passing.
+
+The scheduler acquires deterministic resource locks before execution, records
+queue and lock evidence, executes shell-free bounded commands, cancels process
+groups, and releases locks with receipts. Contention and unavailable
+infrastructure are typed environmental outcomes, not code regressions.
+Semantic failures require a new candidate or explicit policy action. Focused
+candidate gates may run early. Every required combined gate executes against a
+managed workspace whose SHA/tree equals its `IntegrationSnapshot` before and
+after the gate; drift is non-passing. The exact integrated result tree requires
+all declared `CombinedGateRun` receipts before publication or disposition.
+
+Integration follows the persisted graph's exact `IntegrationOrder`. An
+`IntegrationAttempt` binds control run, graph revision, integration index,
+expected parent SHA/tree, candidate SHA/tree, candidate evidence digest,
+ownership manifest, strategy, candidate pre-gate profile, combined-gate
+profile, and clean managed integration workspace. It reserves before mutation
+and records resulting head/tree plus ancestry and subtree equality evidence in
+the integration-apply receipt. Replay proves the result from ancestry and trees
+and never applies the same candidate twice. The resulting immutable
+`IntegrationSnapshot` is then the sole subject for post-integration combined
+gates. A final `IntegrationReceipt` binds that snapshot and the complete sorted
+set of required passing combined-gate receipt IDs.
+
+Only a conflict confined to outputs declared by a versioned generator manifest
+may be resolved automatically, by discarding the conflicted generated output,
+running the exact trusted generator in a credential-free environment, and
+verifying the regenerated diff is confined to declared outputs. Any authored
+conflict, ambiguous generated/authored classification, dirty integration tree,
+unexpected path, or predecessor mismatch transitions to `needs_input`; Pajé
+does not guess, rebase, force, or widen ownership.
+
+Publication is a separate action after the final `IntegrationReceipt`. It
+requires an explicit
+authority receipt binding repository, target ref, expected target SHA, exact
+head/tree, publication strategy, policy version, and allowed provider action.
+Administrative branch-protection bypass is never an automatic fallback.
+Credential-bearing Git runs only in a fresh publisher-owned validated
+repository/config that did not execute repository-controlled verification.
+After success or ambiguity, Pajé observes the provider and verifies the exact
+remote head and target tree. A pull-request merge is not complete until the
+target tree equals the authorized integrated tree.
+
+#### Primitive-specific disposition and close-check
+
+Terminal reporting, terminal provider observation, candidate verification,
+review, integration eligibility, integration, disposition, and runtime closure
+are separate states. Exactly one disposition binds each attempt to
+`integrated`, `handed_off`, or `discarded`; discard requires immutable proof
+that no unique work remains.
+
+Close evidence remains primitive-specific:
+
+- `persistent_session` requires provider-confirmed archive receipt, or an
+  adopted-session detach receipt when cleanup authority is exactly
+  `detach_only`;
+- `ephemeral_subagent` requires terminal runtime evidence and runtime-close
+  receipt, never a fabricated archive;
+- `harness_native_parallel` requires exact deterministic aggregate completion
+  or a cancel receipt covering every declared ordinal; and
+- `local_sequential` requires an inactive marker plus terminal evidence.
+
+A managed resource also requires its own disposition/cleanup receipt; a child
+archive is not a worktree, process, container, branch, or publisher-workspace
+cleanup receipt. `close-check` derives a typed pending gate from the journal and
+fails while any task, action, candidate, review, finding, correction,
+candidate gate, integration snapshot, combined gate, integration, publication,
+handoff, ownership claim, monitor lease, placement, or managed resource lacks
+its required terminal fact. The existing five
+primitive counters remain public compatibility fields; the detailed close-check
+projection supplies the reasons behind `TotalPendingWork`.
+
+#### Deterministic and policy-assisted boundary
+
+Pajé deterministically validates canonical input, reserves and replays actions,
+rebuilds projections, supervises cursors and callbacks, arbitrates exact
+ownership, schedules declared gates, verifies immutable identity/evidence,
+integrates conflict-free candidates in declared order, performs generated-only
+regeneration under a frozen manifest, invokes explicitly authorized
+publication, reconciles provider results, and closes managed resources with
+receipts.
+
+Pajé may produce evidence-bound recommendations but MUST NOT autonomously
+choose complementary review scopes, decide semantic finding equivalence or
+severity, design a correction, accept residual risk or `DONE_WITH_CONCERNS`,
+resolve authored conflicts, delete unique unmanaged evidence, change an
+integration strategy after target drift, request or use administrative bypass,
+or broaden publication authority. Unless a versioned deterministic policy plus
+explicit authority fully resolves the choice, the state is `needs_input` or
+`blocked`. Missing capability, evidence, authority, or reconciliation never
+downgrades a mandatory invariant.
+
+#### Normative requirement index
+
+- `ACP-J01` The typed append-only journal MUST be authoritative; every
+  per-run projection/export MUST bind its terminal run sequence and every
+  installation-wide projection/export MUST bind its terminal
+  `JournalPosition`.
+- `ACP-J02` Every external action MUST be durably reserved with a stable key and
+  canonical request digest before invocation.
+- `ACP-J03` Every reservation MUST bind exactly one result, proven
+  not-performed fact, supersession, or unresolved ambiguity; history is never
+  overwritten.
+- `ACP-J04` An ambiguous external effect MUST be reconciled through a certified
+  observation path before retry; unsupported ambiguity MUST remain blocked.
+- `ACP-J05` Every event MUST receive one contiguous immutable installation-wide
+  `JournalPosition` atomically with its per-run sequence; the authoritative
+  global feed MUST replay only by that position and MUST rebuild every global
+  projection byte-stably after concurrency or restart.
+- `ACP-M01` The centralized service MUST support multiple concurrently active
+  control runs and MUST scope every durable identity and event application by
+  exact control run.
+- `ACP-M02` Admission MUST enforce bounded installation, principal, run,
+  project, primitive, and shared-resource quotas with deterministic fairness,
+  backpressure, and starvation prevention.
+- `ACP-M03` Ownership conflicts MUST be evaluated by canonical project or
+  shared-resource namespace; identical paths in unrelated projects MUST NOT
+  conflict.
+- `ACP-M04` Resource locks MUST name the actual scarce resource and mode and
+  MUST NOT become a global executor, gate, integration, or publication mutex.
+- `ACP-M05` A blocked, awaiting-authority, failed, stalled, or
+  cleanup-incomplete run MUST NOT prevent unrelated eligible runs from
+  advancing.
+- `ACP-M06` Restart recovery MUST scan all active runs and due leases with a
+  stable cursor, bounded work, deterministic fairness, and per-action backoff.
+- `ACP-M07` Per-run status cursors and the redacted central status cursor over
+  `JournalPosition` MUST be distinct, bounded, replayable, and incapable of
+  cross-run acknowledgement or mutation.
+- `ACP-M08` Project credentials, evidence namespaces, publication authority,
+  and handoffs MUST remain isolated; cross-project flow requires an explicit
+  typed edge.
+- `ACP-G01` Graph revisions, frozen inputs, ownership, and handoffs MUST be
+  immutable and CAS-versioned.
+- `ACP-G02` Grant, expansion, transfer, release, and revocation MUST bind exact
+  normalized units, graph revision, owner, acknowledgement, and evidence.
+- `ACP-G03` Idle, silence, callback, terminal prose, and restart MUST NOT imply
+  ownership release.
+- `ACP-R01` Every created or adopted external resource MUST record origin,
+  lifecycle owner, cleanup authority, provider identity, and terminal receipt.
+- `ACP-R02` Automated cleanup MUST be limited to managed, authorized,
+  dispositioned resources with no unique unintegrated evidence.
+- `ACP-S01` Persistent runtime IDs MUST use returned-ID registration and exact
+  acknowledgement before child evidence is accepted.
+- `ACP-S02` Persistent supervision MUST combine callbacks with cursor-aware
+  observation and MUST reject cursor or identity inconsistency.
+- `ACP-S03` Monitor leases, wake times, retry classifications, and backoff steps
+  MUST persist and resume by CAS after restart.
+- `ACP-S04` Status MUST be cursor-addressable, delta-only, bounded, redacted,
+  and inert with respect to authoritative state.
+- `ACP-C01` Every candidate MUST be immutable and content-bound to repository,
+  base, head/tree, target, ownership, graph, frozen inputs, and policy.
+- `ACP-C02` Candidate changes MUST invalidate prior verification and review PASS
+  evidence.
+- `ACP-C03` Worker reports and callbacks MUST remain claims until provider and
+  independent verifier evidence confirm them.
+- `ACP-V01` Required verification MUST record independent provenance and a
+  complete candidate/toolchain/environment/profile identity.
+- `ACP-V02` Required skipped, unavailable, canceled, truncated-critical, stale,
+  or ambiguous verification MUST be non-passing.
+- `ACP-W01` A mandatory review barrier MUST remain closed while any required
+  attempt is missing, active, stale, failed, blocked, skipped, or inconclusive.
+- `ACP-W02` Findings, correction cycles, RED/GREEN evidence, residual
+  acceptance, and supersession MUST be immutable and auditable.
+- `ACP-W03` At most one correction owner may mutate an overlapping ownership
+  set, and a rejected or superseded candidate MUST never integrate.
+- `ACP-I01` Integration MUST follow the exact persisted DAG index and bind
+  parent, candidate, ownership, gate, result, ancestry, and tree evidence.
+- `ACP-I02` Only declared generated outputs MAY be regenerated automatically;
+  authored or ambiguous conflicts MUST stop for policy input.
+- `ACP-I03` Gate execution MUST use deterministic resource locks and MUST NOT
+  classify contention as a product regression.
+- `ACP-I04` Candidate pre-gates and post-integration combined gates MUST use
+  distinct immutable subjects. Every combined-gate receipt MUST bind the exact
+  `IntegrationSnapshot`, integration-apply receipt, and result tree; all
+  required combined gates MUST pass before final integration receipt,
+  publication, or disposition.
+- `ACP-P01` Publication MUST require explicit authority bound to the exact head,
+  target, strategy, and policy and MUST NOT infer administrative bypass.
+- `ACP-P02` Credentialed publication MUST preserve publisher-owned isolation
+  and verify the resulting remote head and target tree.
+- `ACP-L01` Each primitive and managed resource MUST have its own disposition
+  and closure receipt; one receipt MUST NOT stand in for another resource.
+- `ACP-L02` Close-check MUST fail until all journal-derived pending categories
+  and compatibility `PendingWorkGate` counters are zero.
+- `ACP-D01` Every implementation node MUST record
+  `execution_placement`, `parallelism_primitive`, `placement_rationale`,
+  `capability_requirements`, `lifecycle_owner`, and `fallback`.
+- `ACP-D02` A node whose scope can outgrow its primitive MUST also record
+  `promotion_trigger`; a static node records the explicit value `none`.
+- `ACP-D03` Missing capability, evidence, authority, or policy MUST select only a
+  semantics-preserving fallback or a fail-closed blocked state.
+
 ### Durable model
 
 The core model is provider-neutral and safe to persist:
@@ -520,13 +1215,17 @@ type ExecutionPlacement struct {
     CapabilityRequirements []string
     LifecycleOwner         string
     Fallback               string
+    PromotionTrigger       string
 }
 ```
 
 The durable JSON field names are `parallelism_primitive`,
 `execution_placement`, `placement_rationale`, `capability_requirements`,
-`lifecycle_owner`, and `fallback`. Missing or implied values invalidate
-dispatch.
+`lifecycle_owner`, and `fallback`. Those six fields are mandatory.
+`promotion_trigger` is additionally mandatory when scope growth, capability
+loss, or duration can require movement to another primitive; tasks with no
+promotion path persist the explicit value `none`. Missing or implied required
+values invalidate dispatch.
 
 Placement is provider-neutral and selects exactly one primitive:
 
@@ -836,7 +1535,9 @@ The gateway exposes only versioned JSON endpoints. Agent-control endpoints are:
 ```text
 GET  /v1/capabilities
 POST /v1/control-runs
+GET  /v1/control-runs/status?after_global_cursor=...
 GET  /v1/control-runs/{control_run_id}
+GET  /v1/control-runs/{control_run_id}/status?after_cursor=...
 POST /v1/control-runs/{control_run_id}/tasks
 POST /v1/control-runs/{control_run_id}/tasks/{task_id}/attempts
 GET  /v1/control-runs/{control_run_id}/attempts/{attempt_id}?after_cursor=...
@@ -848,7 +1549,12 @@ POST /v1/control-runs/{control_run_id}/evidence
 POST /v1/control-runs/{control_run_id}/close
 ```
 
-Every mutating request requires a stable action idempotency key. Reads and waits
+Every mutating request requires a stable action idempotency key. The per-run
+status route returns only that run's bounded material delta; the central status
+route requires separate `control:list` authority and returns only the redacted
+global projection in authoritative `JournalPosition` order. Their cursor
+domains are disjoint and read-only. Other
+reads and waits
 accept an event cursor when the selected primitive advertises one and return
 the next cursor. Attempt creation durably records placement before dispatch.
 The action result records only runtime identities actually returned. Message,
@@ -1025,7 +1731,8 @@ The gateway Secret stores only:
   `cancel`
 - allowed control actions: `control:create`, `task:create`, `work:dispatch`,
   `work:observe`, `work:send`, `work:wait`, `work:interrupt`, `work:close`,
-  `evidence:write`, and `control:close`
+  `evidence:write`, and `control:close`; separately privileged operator
+  credentials may add `control:list` for the redacted installation-wide view
 - allowed harness IDs
 - allowed project identities and cross-project communication edges
 - maximum child depth
@@ -1194,6 +1901,7 @@ Commands:
 ```text
 paje-agent capabilities
 paje-agent control create --file <path-or->
+paje-agent control list [--after-global-cursor <cursor>]
 paje-agent control status --control-run <id> [--after-cursor <cursor>]
 paje-agent task create --control-run <id> --file <path-or->
 paje-agent work dispatch --control-run <id> --task <id> --file <path-or->
@@ -1826,6 +2534,33 @@ This design is complete only when evidence proves all of the following:
    current-versus-future matrix.
 19. The second harness remains unnamed until a committed evidence record passes
    the selection gate.
+20. The journal replays every typed action and event into byte-equivalent
+    per-run and installation-wide projections by contiguous immutable
+    `JournalPosition`; concurrent, late, and restart-boundary appends neither
+    reorder the global feed nor produce duplicate external work or an invented
+    outcome.
+21. Ownership grants, expansion, transfer, release, adopted-session detach,
+    managed resource allocation, cleanup, and primitive-specific closure are
+    each receipt-backed and survive restart.
+22. Immutable candidate snapshots, independent verifier provenance, mandatory
+    review barriers, finding/correction/supersession transitions, resource-
+    locked gates, exact DAG integration, generated-only conflict handling,
+    candidate pre-gates, post-integration combined gates bound to the exact
+    `IntegrationSnapshot` result tree, explicit publication authority, and
+    target-tree verification enforce the empirical orchestration contract.
+23. At least two unrelated control runs advance simultaneously through
+    interleaved callbacks and gates while another run is stalled or awaiting
+    authority and another remains cleanup-incomplete; unaffected runs continue
+    and close without cross-run identity, cursor, ownership, credential,
+    evidence, resource, or status contamination.
+24. Central admission applies bounded installation, principal, run, project,
+    primitive, and shared-resource quotas with deterministic fairness and
+    starvation prevention. Real shared resources serialize only their
+    contenders; unrelated executor, gate, integration, and publication work has
+    no global mutex or head-of-line blocking.
+25. Coordinator restart performs a bounded fair scan across all active runs and
+    due leases, resumes exact actions by CAS, and does not scan or retry one
+    failing run to the exclusion of others.
 
 ## External Interface References
 
