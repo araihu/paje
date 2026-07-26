@@ -21,6 +21,15 @@ that `code-change@v1` has no external consumers or production run records, so
 this design intentionally changes that contract in place. It does not create a
 legacy decoder, migration path, or `code-change@v2` alias.
 
+Refrozen on 2026-07-26 from exact base
+`1a5c3024e9a995103b218f54a4d81886d6e0715c` after three independent correction
+audits. Integrated receipts remain history. Rejected `PW-12`, `PW-12.1`, and
+`PW-12.2` commits are evidence only and MUST NOT be reused or cherry-picked.
+Requirements `PW-EX01..PW-EX03`, `PW-WS01`, `PW-EN01`, `PW-SC01`, `PW-H01`,
+`PW-EV01`, `PW-PU01`, and `PW-AC01..PW-AC03` below are the stable correction
+contract. A support/current claim is forbidden until the standard rendered
+`codex-go@1` production profile passes the corrected live acceptance path.
+
 ## Problem
 
 The current Pajé image combines two responsibilities:
@@ -259,10 +268,13 @@ error chains and are projected into generic safe durable failures.
 The workload image contains the harness, repository tools, and a minimal
 `paje-sandbox-init` process, but no Pajé coordinator, Hatchet client, memory
 client, publisher, submission gateway, secret provider client, or
-container-engine client. `paje-sandbox-init` only reads the executor-created
-private command material, constructs the exact child environment, and replaces
-itself with the declared command. The workload does not receive the Docker
-socket or any provider control credential.
+container-engine client. `paje-sandbox-init` is a no-shell PID 1 supervisor. It
+reads the executor-created private command material, constructs the exact child
+environment, starts the declared command, confirms the post-success operating-
+system child identity, publishes a private child-start acknowledgement, forwards
+signals, reaps descendants, and preserves the declared child's exact exit
+status. A pre-exec write or direct `syscall.Exec` is insufficient evidence. The
+workload does not receive the Docker socket or any provider control credential.
 
 ## Worker Profile Contract
 
@@ -362,6 +374,11 @@ Tool and harness names are unique within a profile. Executables are bare names
 resolved through the workload image's exact `PATH`; absolute host paths and
 path traversal are invalid.
 
+The canonical sandbox path is
+`/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin` for agent, verification, and
+publisher re-verification. Profiles and repository input cannot append,
+prepend, replace, or shadow it.
+
 ### Resource and network policy
 
 Every OCI profile declares positive CPU, memory, and PID limits within
@@ -454,14 +471,24 @@ The Docker adapter creates a private in-container `tmpfs`, copies materialized
 bytes through the Engine API before process start, applies private ownership
 and modes, and then starts `paje-sandbox-init`. For environment delivery, the
 init process reads the private file after container start, adds the value only
-to the target child environment, removes the materialization, and `execve`s the
-declared command. No value appears in Docker container configuration,
+to the target child environment, removes the materialization, starts the
+declared child, and confirms that exact start before acknowledging
+presentation. No value appears in Docker container configuration,
 inspection metadata, CLI arguments, image layers, bind-mount sources, durable
 requests, or container labels.
 
 Harnesses that need writable state receive a private writable copy in another
 attempt-scoped `tmpfs`; the operator's source is never mutated. Codex uses this
 mechanism for `CODEX_HOME`.
+
+The Codex mapping is exact: only capability `harness.codex-auth`, its persisted
+binding revision, `delivery: directory`, and normalized target
+`/run/paje/secrets/codex` may map to `CODEX_HOME=/run/paje/secrets/codex` in the
+agent child. No other capability, target, delivery, or caller-supplied
+`CODEX_HOME` is accepted. Validation computes the complete command,
+environment, materialization, baseline, stage-managed, and target collision
+set before the first `Broker.Acquire`; broker, harness, executor, and workflow
+copies are defensive and cannot share caller-owned maps or byte slices.
 
 The broker returns an in-memory lease with an opaque identifier and expiry no
 later than the attempt deadline. Revocation is idempotent. The executor and
@@ -580,10 +607,17 @@ resources use deterministic labels derived from the complete attempt identity.
 `Inspect`, `Cancel`, and `Destroy` rediscover resources from those labels and
 are idempotent.
 
-`Result` preserves whether the command was created, started, and completed;
-exit status; bounded stdout and stderr; duration; truncation; and generic safe
-runtime facts. This evidence is sufficient to enforce retry semantics without
-persisting raw provider responses.
+`State` and `Result` distinguish `resource_created`, `bootstrap_started`,
+`child_started`, `terminal_complete`, `destroyed`, and `unknown`; none is
+inferred from another. `child_started` exists only after the executor observes
+the declared operating-system child successfully start and persists an
+immutable `ChildStartReceipt` bound to the complete `AttemptID`, canonical
+command and its digest, and complete environment-declaration digest. `Inspect` must
+rediscover and validate that exact receipt. Missing, uncertain, or rebound
+identity is `unknown`/`ambiguous_attempt`, never proof of non-start or a license
+to rerun. `Result` also preserves exact exit status, bounded stdout and stderr,
+duration, truncation, and generic safe runtime facts without persisting raw
+provider responses.
 
 ## Execution Lifecycle
 
@@ -610,22 +644,29 @@ retried under the existing Resolve lease semantics.
 Execute uses one attempt-isolated worktree and the persisted profile snapshot:
 
 1. Acquire exact durable Execute ownership.
-2. Prepare a fresh worktree at the resolved base SHA.
-3. Ask the executor to verify the exact runtime image and platform.
-4. Run each harness and tool probe in a secret-free one-shot sandbox.
-5. Run repository preflight through secret-free sandboxes and compile the
+2. Canonicalize and validate the complete probe, agent, verification, and
+   publisher command/environment declarations plus every baseline,
+   stage-managed, materialization, target, and environment-key collision.
+   Any conflict fails before the first secret `Acquire`.
+3. Prepare a fresh, detached, self-contained Git worktree at the resolved base
+   SHA. Its metadata and reachable objects live inside the one workspace bind;
+   it contains no host-absolute `.git` indirection, alternates, or live remote
+   credentials, and cleanup removes that complete attempt-owned workspace.
+4. Ask the executor to verify the exact runtime image and platform.
+5. Run each harness and tool probe in a secret-free one-shot sandbox.
+6. Run repository preflight through secret-free sandboxes and compile the
    verification commands.
-6. Build the bounded agent prompt.
-7. Acquire the exact agent-stage secret leases.
-8. Run the harness command in one agent sandbox with the worktree writable.
-9. Destroy the agent sandbox and revoke every lease with bounded non-canceled
+7. Build the bounded agent prompt.
+8. Acquire the exact agent-stage secret leases.
+9. Run the harness command in one agent sandbox with the worktree writable.
+10. Destroy the agent sandbox and revoke every lease with bounded non-canceled
    compensation.
-10. Run each verification command in a fresh secret-free sandbox over the
+11. Run each verification command in a fresh secret-free sandbox over the
     modified worktree.
-11. Capture and validate the Git artifact, apply change policy, persist and
+12. Capture and validate the Git artifact, apply change policy, persist and
     checkpoint the artifact, and record bounded safe evidence.
-12. Destroy every remaining sandbox and remove runtime and worktree state.
-13. Persist the final Execute attempt only while exact ownership still holds.
+13. Destroy every remaining sandbox and remove runtime and worktree state.
+14. Persist the final Execute attempt only while exact ownership still holds.
 
 The workflow checks durable ownership before and after every sandbox, secret,
 artifact, and final-state side effect. A stale worker may clean only resources
@@ -655,7 +696,8 @@ The run record persists:
   failure status;
 - secret capability names and binding revisions;
 - executor attempt identities and generic lifecycle states;
-- agent and verification environment key names, never values;
+- per-attempt environment-key names only after the exact child-start receipt
+  proves those declarations were presented to that child, never values;
 - existing transcript, verification, capture, artifact, policy, approval,
   publication, and cleanup evidence under current size and safety limits.
 
@@ -672,6 +714,22 @@ memory exclude:
 
 Canonical run validation treats the resolved profile snapshot and digest as
 immutable and write-once. A retry cannot observe a newer profile revision.
+Acquisition failure, bootstrap non-start, and skipped verification produce no
+presented-key evidence. Confirmed verification-attempt state is persisted or
+derived separately from the presented-key union and binds the exact child-start
+receipts. A confirmed secret-free verification child may legitimately present
+zero non-baseline keys, so an empty union does not imply that no child ran.
+Top-level agent and verification key sets remain exact derived unions of child-
+confirmed attempts only.
+
+Publisher validation binds both facts. No confirmed verification attempt
+requires an empty union and is valid only when the frozen verification plan
+requires zero attempts. One or more confirmed attempts require the exact union
+derived from their receipts, and that union may be empty. A required/scheduled
+attempt without confirmation is rejected, as are partial or extra keys, an
+inverse claim that contradicts attempt receipts, and any attempt/key drift. The
+mandatory matrix is: no attempt plus empty union; confirmed-empty; confirmed-
+nonempty; partial; extra; inverse; and drift.
 
 ## Failure, Retry, Cancellation, and Recovery
 
@@ -735,8 +793,10 @@ For each one-shot sandbox the adapter:
 6. Creates a private secret `tmpfs` and copies leased material and bounded
    command metadata through the Engine archive API before start.
 7. Starts `paje-sandbox-init`, which constructs the exact child environment,
-   removes transient environment materializations, and replaces itself with
-   the declared executable without invoking a shell.
+   removes transient environment materializations, starts the declared child
+   without a shell, observes the post-success child identity, and publishes
+   the bound receipt only after that observation; it then remains PID 1 to
+   forward signals, reap descendants, and preserve the exact exit status.
 8. Streams bounded stdout and stderr, waits for an exact terminal state, and
    records generic lifecycle evidence.
 9. Cancels by stopping and then force-killing within bounded intervals.
@@ -804,20 +864,72 @@ README, site, chart notes, values descriptions, and support matrices must label
 local Docker execution as current only after acceptance, host execution as
 development-only, and Podman, remote, and Kubernetes execution as planned.
 
+## Stable Correction Requirement Index
+
+The following identifiers are the durable acceptance vocabulary. Historical
+numbered checklist items remain implementation receipts; closure is computed
+from these IDs and every canonical remaining-work node disposition, never from
+a fixed session or criterion count.
+
+- `PW-EX01` — execution evidence distinguishes resource creation, bootstrap or
+  init start, declared-child start, terminal completion, destruction, and
+  unknown without inferring one phase from another.
+- `PW-EX02` — the immutable child-start receipt binds the full `AttemptID`,
+  canonical command and its digest, and complete environment-declaration digest;
+  `Inspect` validates the same binding and treats uncertainty or rebinding as
+  ambiguity.
+- `PW-EX03` — the workload uses a no-shell PID 1 supervisor, or an equally
+  strong post-success OS observation, to acknowledge the declared child only
+  after it starts, forward signals, reap descendants, and preserve exact exit
+  status; a pre-exec write and direct `syscall.Exec` are insufficient.
+- `PW-WS01` — every attempt uses one detached, self-contained Git workspace
+  whose metadata and objects are inside its single bind, with no host-absolute
+  `.git`, alternates, live remote credentials, or incomplete cleanup.
+- `PW-EN01` — agent, verification, and publisher re-verification use exactly
+  `/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin`.
+- `PW-SC01` — complete command, environment, target, and materialization
+  collision validation finishes before the first secret acquisition.
+- `PW-H01` — only the exact tuple (`harness.codex-auth`, persisted binding
+  revision, `directory`, `/run/paje/secrets/codex`) maps to `CODEX_HOME`; every
+  other shape is rejected and all broker/harness/executor/workflow data is
+  defensively cloned.
+- `PW-EV01` — environment-key evidence is per-attempt and exists only after
+  child-confirmed presentation; acquisition failure, bootstrap non-start, and
+  skipped verification contribute no keys, while top-level sets are exact
+  derived unions of confirmed attempts and confirmed attempt state is tracked
+  separately from those unions.
+- `PW-PU01` — publisher validation MUST bind confirmed verification-attempt
+  state separately from the exact presented-key union: no confirmed attempt
+  requires an empty union and is valid only for a frozen zero-attempt plan,
+  while confirmed attempts require their exact union, which may itself be
+  empty. Missing required confirmation, partial, extra, inverse, and drift
+  pairings relative to per-attempt receipts fail closed; acceptance MUST cover
+  no attempt, confirmed-empty, confirmed-nonempty, partial, extra, inverse, and
+  drift.
+- `PW-AC01` — live acceptance uses the standard rendered `codex-go@1`
+  production profile with no acceptance-only command, image, path, secret, or
+  runtime workaround; support/current claims wait for this evidence.
+- `PW-AC02` — a real coordinator process is `SIGKILL`ed and restarted through
+  production recovery, proving conclusive pre-child retry, post-receipt
+  ambiguity/no rerun, and simultaneous unrelated-run progress.
+- `PW-AC03` — the production Docker workflow denies raw and base64-encoded
+  secret artifacts through broker materialization, Git capture, change policy,
+  run store, and artifact store, leaving no durable bytes or resources.
+
 ## Implementation Scope
 
-The implementation is delivered in five ordered slices:
+Accepted Tasks 1–11 remain immutable implementation history. Remaining work is
+cut into the exact non-overlapping sequence registered in the
+[portable-runtime plan](../plans/2026-07-25-portable-worker-profiles-and-isolated-execution.md#canonical-remaining-work-registry):
 
-1. Worker-profile and secret-binding contracts, strict registries, canonical
-   snapshots, and unit tests.
-2. Provider-neutral executor lifecycle, mock and host adapters, harness command
-   separation, and the reusable conformance suite.
-3. Local Docker Engine adapter, filesystem and environment secret sources,
-   lease handling, split images, and image tests.
-4. Breaking `code-change@v1` integration, durable record changes, restart
-   recovery, artifact evidence, and Hatchet/gateway fixture migration.
-5. Real Docker and live Codex acceptance, documentation, site, configuration,
-   Helm positioning, and release evidence.
+1. this five-document `PW-RF` refreeze;
+2. `PW-12.2` executor/workspace foundation (`PW-EX01..PW-EX03`, `PW-WS01`,
+   `PW-EN01`), followed by independent read-only review `PW-12.2R`;
+3. `PW-12.1` harness/workflow/artifact/publisher truth (`PW-SC01`, `PW-H01`,
+   `PW-EV01`, `PW-PU01`), followed by `PW-12.1R`;
+4. `PW-12` product acceptance, docs, site, and Helm (`PW-AC01..PW-AC03`),
+   followed by `PW-12R`; and
+5. parent-local `PW-FINAL` combined/security/live acceptance and close-check.
 
 Each slice keeps the repository buildable and its relevant tests passing. No
 public support claim changes before the matching end-to-end acceptance evidence
@@ -860,7 +972,8 @@ Every isolated executor must pass one reusable contract suite covering:
 - exact image/platform binding and unsupported-capability denial;
 - shell-free command and environment construction;
 - deterministic attempt labels and collision handling;
-- created, started, completed, canceled, unknown, and destroyed states;
+- resource-created, bootstrap-started, child-started, terminal-complete,
+  canceled, unknown, and destroyed states without phase inference;
 - bounded output, non-zero exit, timeout, context cancellation, and malformed
   provider state;
 - idempotent inspect, cancel, and destroy;
@@ -868,8 +981,9 @@ Every isolated executor must pass one reusable contract suite covering:
 - worktree mount access and sibling/host path denial;
 - secret materialization before start, stage isolation, revocation, and
   destruction;
-- sandbox-init command validation, no-shell `execve`, malformed command
-  material denial, and removal of transient environment materializations;
+- sandbox-init command validation, post-success child-start receipts, PID 1
+  signal forwarding and descendant reaping, malformed command material denial,
+  and removal of transient environment materializations;
 - resource, network, privilege, user, root filesystem, namespace, device, and
   socket restrictions;
 - safe diagnostics and provider-detail scrubbing.
@@ -930,46 +1044,48 @@ attempt resource must be absent after cleanup.
 
 ## Acceptance Criteria
 
-This design is implemented only when evidence proves all of the following:
+These unnumbered baseline assertions are preserved alongside the stable
+correction IDs. Completion is derived from every applicable stable ID and every
+canonical node disposition, not from the historical length of this list:
 
-1. `code-change@v1` requires an exact operator-owned worker-profile revision
+- `code-change@v1` requires an exact operator-owned worker-profile revision
    and rejects `environment_keys` and mutable runtime references.
-2. Resolve persists and validates an immutable safe profile snapshot, digest,
+- Resolve persists and validates an immutable safe profile snapshot, digest,
    capability list, and binding revisions without acquiring a secret.
-3. The coordinator image contains no agent harness or repository language
+- The coordinator image contains no agent harness or repository language
    runtime, and the workload image contains no Pajé service client or
    credential.
-4. The local Docker adapter runs probes, the agent, and verification in
+- The local Docker adapter runs probes, the agent, and verification in
    distinct one-shot sandboxes with the exact persisted image digest.
-5. Only the agent sandbox receives its approved capability leases; preflight
+- Only the agent sandbox receives its approved capability leases; preflight
    and verification receive no harness or workload secrets.
-6. Secret values, metadata, provider references, host paths, and engine details
+- Secret values, metadata, provider references, host paths, and engine details
    appear in no durable or user-visible surface.
-7. A workload cannot access the Docker socket, coordinator credentials,
+- A workload cannot access the Docker socket, coordinator credentials,
    publisher credentials, source checkout, or sibling worktrees.
-8. Retry occurs only after conclusive non-start proof. Any post-start unknown
+- Retry occurs only after conclusive non-start proof. Any post-start unknown
    state becomes nonretryable `ambiguous_attempt`.
-9. Cancellation terminates every descendant, revokes leases, destroys
+- Cancellation terminates every descendant, revokes leases, destroys
    sandboxes, removes the worktree, and becomes terminal only after confirmed
    cleanup.
-10. A checkpointed artifact remains authoritative across restart and is never
+- A checkpointed artifact remains authoritative across restart and is never
     regenerated by rerunning the agent.
-11. A real Codex workload changes a disposable repository, verification passes
+- A real Codex workload changes a disposable repository, verification passes
     without secrets, and the artifact reproduces the exact changed tree.
-12. Publisher re-verification uses the same persisted toolchain in secret-free
+- Publisher re-verification uses the same persisted toolchain in secret-free
     sandboxes before publisher credentials enter a publisher-owned process.
-13. Host execution remains explicit, secret-free, and development-only.
-14. Helm, README, site, and support matrices do not claim Kubernetes, Podman,
+- Host execution remains explicit, secret-free, and development-only.
+- Helm, README, site, and support matrices do not claim Kubernetes, Podman,
     remote, or distributed execution before the corresponding adapter passes
     conformance and live acceptance.
-15. Existing durable workflow, approval, publisher, memory, artifact, race,
+- Existing durable workflow, approval, publisher, memory, artifact, race,
     vet, cross-build, chart, image, and live acceptance gates remain green.
-16. Agent Control Plane acceptance proves every task records its execution
+- Agent Control Plane acceptance proves every task records its execution
     placement, primitive, rationale, capability requirements, lifecycle owner,
     and fallback; the concrete Codex mapping, promotion, missing-capability
     fallback, concurrency limits, and overlapping-subagent mutation denial all
     pass.
-17. Portable executor acceptance remains a lower-layer gate and is never used
+- Portable executor acceptance remains a lower-layer gate and is never used
     as evidence that placement-attempt lifecycle, persistent-session archive,
     ephemeral runtime close, native fan-out aggregation, multi-project
     orchestration, or typed zero-pending-work closure is complete.

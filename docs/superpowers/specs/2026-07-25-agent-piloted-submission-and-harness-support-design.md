@@ -21,6 +21,14 @@ The repository state inspected for this design is `86537ae`. The current beta
 implementation remains the source of truth for shipped behavior until the
 implementation plan for this design is completed.
 
+Refrozen on 2026-07-26 from exact base
+`1a5c3024e9a995103b218f54a4d81886d6e0715c` after the ACP-15 adversarial audit
+and empirical Home Lab control-plane analysis. Integrated receipts remain
+historical truth. Rejected ACP-15 implementation commits are evidence of failed
+approaches only and MUST NOT be reused or cherry-picked. Requirements
+`ACP-M09..ACP-M15` and `ACP-HL01..ACP-HL12` below are the canonical correction
+contract, and the canonical continuation plan is the only active task cut.
+
 ## Canonical Product Position
 
 Pajé is a self-hosted durable Agent Control Plane for code agents. It lets one
@@ -681,6 +689,197 @@ Evidence must show fair bounded admission, continued progress and closure of
 unaffected runs, no cross-run callback/event/cursor/idempotency collision, no
 credential or evidence leakage, and deterministic recovery of every due lease.
 
+#### Refrozen authoritative admission, scheduling, and handoff contract
+
+Every admission, queue, backpressure, release, lease, expiry, and
+authoritative-handoff transition is one bounded typed delta committed through
+ACP-J06 `AuthoritativeStore.Commit`. The journal `Feed` and `Payload` bytes are
+the only authority. Process memory and checkpoints are verified caches rebuilt
+from position zero; they cannot accept a transition, retain an otherwise lost
+reservation, or fill a missing tombstone. A delta contains the changed record
+and the minimum predecessor identity required to validate it. It never copies
+the queue, lease table, run history, or lifetime admission history into every
+outcome payload.
+
+Semantic replay binds all of: installation ID, `ControlRunID`, action ID,
+idempotency key, outcome event ID and kind, semantic operation, exact subject,
+graph revision, and generation. Rebuild decodes the exact typed reservation and
+outcome schema, loads the exact payload digest, recomputes the semantic key,
+and rejects any rebinding, missing member, duplicate identity, or changed
+replay. The canonical JSON decoder preserves integers losslessly with typed
+fields or `json.Number`; a `float64` round trip is forbidden. Sequence numbers
+are assigned inside the successful global/run CAS, never before it, and the
+returned immutable receipt is the only proof that an assignment won.
+
+No new journal kind is required by this refreeze. The following
+`ControlActionKind` plus typed `semantic_operation` mapping is frozen; changing
+it or adding a kind requires a separate predecessor that exclusively owns
+`internal/controlplane/journal/**` and updates schema, migration, replay, and
+projection fixtures before any consumer dispatch:
+
+| Transition | Existing action kind | Exact `semantic_operation` values |
+| --- | --- | --- |
+| admission and queue | `allocate_resource` | `admission_reserve`, `queue_enqueue`, `queue_admit`, `backpressure_defer` |
+| release and tombstone | `dispose_resource` | `admission_release`, `queue_release`, `lease_release`, `lease_expire` |
+| lease acquire or renew | `allocate_resource` | `lease_acquire`, `lease_renew` |
+| recovery observation | `observe` | `start_observation`, `observe_effect`, `cancel_or_fence`, `scanner_apply` |
+| authoritative evidence handoff | `send` | `evidence_handoff_issue`, `evidence_handoff_grant`, `evidence_handoff_acknowledge` |
+
+The ACP-15A/ACP-15C layering has one mutation authority. ACP-15A exclusively
+owns journal-authoritative admission, lease, release/expiry, backpressure, and
+handoff transition APIs plus their immutable receipts. ACP-15C consumes that
+integrated interface to select fair work and drive recovery; it cannot write an
+admission/lease/handoff record directly, maintain a second authoritative
+projection, or bypass ACP-15A when applying a scheduler decision.
+
+Weighted-fair arithmetic is explicit and saturating. Virtual finish, enqueue
+sequence, age credit, retry generation, and recovery step use lossless unsigned
+integers. Virtual finish saturates at `MaxUint64`; age credit and release
+subtraction cannot underflow; the consecutive-admission ceiling is exactly two
+while another run is eligible; aging and backoff saturate at their policy
+caps. Zero or invalid weight is a typed policy error, never division by zero.
+Values `2^53+1`, `MaxUint64`, and every overflow/underflow boundary are
+mandatory fixtures.
+
+Released and expired records are exact immutable tombstones retaining the
+original request identity and terminal receipt. `now >= ExpiresAt` is terminal;
+an expired lease cannot be acquired or renewed. Exact replay returns the
+original tombstone, while changed request, subject, mode, generation, expiry,
+or outcome conflicts. Locks are scoped by exact `ResourceKey` and mode. There
+is no process-wide or installation-wide mutex spanning journal I/O; unrelated
+keys and unrelated runs continue while one commit, provider observation, or
+filesystem operation is slow.
+
+Recovery identity is the tuple `(installation_id, ControlRunID, ActionID,
+generation)`. Diagnostics use typed safe codes and bounded redacted fields;
+they exclude prompts, provider payloads, host paths, credentials, secret
+metadata, and raw errors. One scan pass has a 250 millisecond hard budget and
+reserves the final 50 milliseconds for persisting its cursor/outcome. It stops
+starting provider observations after the 200 millisecond work boundary,
+persists before the deadline, and resumes fairly from the durable cursor.
+
+Ambiguous provider work uses certified two-phase fenced reconciliation:
+
+1. `StartObservation` reserves an observation generation bound to the exact
+   installation/run/action/subject.
+2. `Observe` is effect-free and returns a typed provider fact plus receipt or
+   explicit ambiguity.
+3. `CancelOrFence` proves cancellation/not-performed or establishes a provider
+   fence that prevents the observed generation from mutating state.
+4. The fair recovery scanner alone performs `scanner_apply` through ACP-J06.
+
+Observation code cannot apply projections, release a lease, start a retry, or
+acknowledge a handoff. A retry is permitted only after proven canceled or
+not-performed evidence. Ambiguity creates no overlapping generation. Late,
+revoked, foreign, or fenced results are rejected before any mutation.
+
+An authoritative evidence handoff uses one store-backed
+`EvidenceHandoffSubject` binding installation, control run, graph revision,
+edge ID, producer project/task/attempt/action/generation, consumer
+project/task/attempt/action/generation, and exact evidence digest. `Issue`,
+`Grant`, and `Acknowledge` are separate ACP-J06 commits and return opaque IDs
+whose payload membership is revalidated on every use. Fabricated, mutated,
+cross-run, cross-edge, or cross-generation IDs fail closed. An
+`EvidenceDisclosure` is a bounded redacted view for UI or diagnostics and is
+explicitly non-authoritative: reading or editing it cannot grant, acknowledge,
+release, or advance work.
+
+Acceptance includes journal-only rebuild with empty caches; two-service global
+quota races; response loss at every commit boundary; semantic rebinding; CAS
+sequence concurrency; `MaxUint64` and `2^53+1`; arithmetic saturation;
+tombstones at, before, and after expiry; more than 1 MiB of lifetime history
+with every individual delta bounded; equal IDs across runs; safe diagnostics;
+fairness and no head-of-line blocking; fenced late results and ambiguity; exact
+handoff versus disclosure; and the scan-cursor persistence reserve.
+
+#### Empirical Home Lab operational contract
+
+The Home Lab analysis adds operational truth without making harness/UI state
+authoritative. A managed task progresses only through journal-backed domain
+phases `DISCOVERED`, `AUDITING_READ_ONLY`, `READY_FOR_OWNERSHIP`, `OWNED`,
+`EXECUTING`, `VERIFYING`, and `ACCEPTED`. Exceptional phases are `DEFERRED`,
+`NEEDS_INPUT`, `ROLLBACK_REQUIRED`, and `FAILED`. A control run may additionally
+be `FROZEN_SECURITY` or `QUIESCENT`. Provider, terminal, YAML, and UI labels are
+observations; they cannot skip or synthesize these phases.
+
+`AuthorityLease` is typed and expiring across exact Git/live `ProjectRef` and
+`ManagedResource` subjects. It binds allowed and forbidden operations,
+preconditions digest, issued/expiry times, renewal generation, expansion or
+handoff subject, authority principal, and immutable receipts. Expansion is a
+new conflict-checked grant. Expiry, suspension, revocation, and handoff are
+journal facts; none is inferred from silence or provider state.
+
+`RunInbox` is an append-only run-scoped projection over the journal. Each item
+binds `JournalPosition`, run sequence, event ID, correlation ID, task, attempt,
+action generation, producer, consumer, payload digest, and optional immutable
+acknowledgement receipt. Missing, duplicate, and out-of-order callbacks are
+claims reconciled by these identities. A provider-visible terminal session is
+still observed until its exact terminal event and close obligation are
+committed.
+
+`PendingWorkGate` has one exact kind from `time_not_before`,
+`external_status`, `workflow_terminal`, `evidence_required`,
+`no_overlap_window`, `human_approval`, or `security_containment`. Each gate
+binds resolver authority and an exact wake event ID or wake time. Deferred work
+with a wake condition enters zero-hot-poll `QUIESCENT`; only its exact wake fact
+can make it ready again.
+
+A task declares `EvidenceRequirement` values. Submitted `Evidence` is an
+immutable claim, and an `Attestation` is an independently produced verdict over
+one exact evidence subject and policy. `DONE` or a terminal provider status is
+only a claim. Every mandatory attestation must pass before `ACCEPTED`, and a
+restart during `VERIFYING` resumes the exact verifier generation without
+duplicating it.
+
+Executor and harness capability enforcement occurs before provider invocation.
+The declared capability set is exactly `read_only`, `secret_metadata_only`,
+`safe_history`, `repository_mutation`, `cluster_mutation`, and `remote_exec`.
+`safe_history` applies a deny/redaction policy; it is not unrestricted history.
+`read_only` forbids create, update, delete, and exec. `secret_metadata_only`
+forbids secret payload retrieval. Missing capability is a pre-invocation
+denial, never an adapter best effort.
+
+`SecurityIncident` progresses `detected -> frozen -> containing -> contained ->
+resume_authorized | closed`. Detection records preserved evidence and applies
+the narrowest scoped freeze. Freeze suspends or revokes affected leases,
+creates a `security_containment` gate, and does not stall unrelated runs or
+resources. Resume requires explicit authority and an exact containment
+receipt; UI dismissal or provider recovery is insufficient.
+
+`supervised_by` is distinct from `lifecycle_owner`. A supervisor may observe,
+correlate, and request action but cannot close, archive, release ownership, or
+dispose a resource without lifecycle authority. Close-check reports owned
+close obligations separately from externally owned supervised dependencies.
+
+`ApplyStrategy` is one of `gitops_reconcile`, `exact_remote_patch`,
+`api_mutation`, or `workflow_trigger`. It binds exact preimage/version/UID,
+postcondition, rollback or compensation, required authority, and observation
+path. A rollout that depends on restore evidence remains behind an
+`evidence_required` gate until the exact attestation passes.
+
+ACP-20 integration/publication exclusively owns the typed `ApplyStrategy`
+contract. ACP-16 owns `AuthorityLease`, its subject, operation bounds, and
+preconditions, but neither defines nor consumes an apply strategy. ACP-20
+validates the strategy enum and its exact preimage/version/UID, postcondition,
+rollback or compensation, observation, and authority against the ACP-16 lease
+facts before any repository, provider, credential, or publication side effect.
+
+All new operational state rebuilds exclusively from the authoritative journal.
+Status, YAML, provider views, and UI remain derived. Bounded redacted
+determinism metrics may measure callback duplicates/reordering, poll results,
+conflicts, gates, lease changes, reopens, incidents, rollbacks, wakeups, and
+quiescence time/cost. Metrics are non-authoritative and cannot change replay or
+scheduling. Acceptance exercises these requirements across simultaneous
+unrelated `ControlRun` values.
+
+Adversarial fixtures include missing, duplicate, and out-of-order callbacks;
+terminal-visible sessions without a committed terminal fact; authority
+expansion conflict; `read_only` create/exec; `secret_metadata_only` payload
+request; incident freeze/resume while unrelated work progresses; deferred
+quiescence and exact wake; supervision without lifecycle ownership; restore
+evidence gating before rollout; and restart during `VERIFYING` without a
+duplicate verifier.
+
 #### CAS graph revisions, exact ownership, and managed resources
 
 Every graph update is an immutable `TaskGraphRevision` written with
@@ -1090,6 +1289,77 @@ downgrades a mandatory invariant.
 - `ACP-M08` Project credentials, evidence namespaces, publication authority,
   and handoffs MUST remain isolated; cross-project flow requires an explicit
   typed edge.
+- `ACP-M09` Every admission, queue, backpressure, release, lease, expiry, and
+  authoritative-handoff transition MUST be one bounded typed ACP-J06
+  `AuthoritativeStore.Commit` delta; `Feed` plus `Payload` are authority and
+  process/checkpoint state is verified cache only; lifetime history MUST NOT be
+  copied into every payload.
+- `ACP-M10` Semantic replay MUST bind action ID, idempotency key, outcome event
+  ID/kind, installation, run, semantic operation, exact subject, graph
+  revision, and generation, and rebuild MUST reject any reservation, outcome,
+  payload-schema, or subject rebinding.
+- `ACP-M11` Numeric decoding MUST be typed and lossless; sequence assignment
+  MUST occur at successful CAS time; receipts MUST be immutable; virtual
+  finish, consecutive-admission count two, aging, and backoff arithmetic MUST
+  use explicit saturating rules.
+- `ACP-M12` Released and expired state MUST retain exact immutable tombstones,
+  `now >= ExpiresAt` MUST be terminal, changed replay MUST conflict, locks MUST
+  be `ResourceKey`-specific, and no global mutex may span journal I/O.
+- `ACP-M13` Recovery MUST bind installation, `ControlRunID`, `ActionID`, and
+  generation, emit typed secret-safe diagnostics, and enforce a 250 millisecond
+  scan budget with the final 50 milliseconds reserved for persistence.
+- `ACP-M14` Ambiguous work MUST use certified fenced `StartObservation`,
+  effect-free `Observe`, `CancelOrFence`, and scanner-owned apply; retry
+  requires proven canceled/not-performed state, overlapping retry is forbidden,
+  and late or revoked results MUST be ignored before mutation.
+- `ACP-M15` Authoritative evidence handoff MUST bind an
+  `EvidenceHandoffSubject` to installation, run, graph revision, edge, producer
+  and consumer project/task/attempt/action/generation, and evidence digest;
+  `Issue`, `Grant`, and `Acknowledge` MUST commit through ACP-J06, while
+  `EvidenceDisclosure` remains explicitly non-authoritative.
+- `ACP-HL01` Operational task phases `DISCOVERED`, `AUDITING_READ_ONLY`,
+  `READY_FOR_OWNERSHIP`, `OWNED`, `EXECUTING`, `VERIFYING`, `ACCEPTED`,
+  `DEFERRED`, `NEEDS_INPUT`, `ROLLBACK_REQUIRED`, and `FAILED`, plus run
+  `FROZEN_SECURITY` and `QUIESCENT`, MUST be journal-backed and independent of
+  harness or UI observation.
+- `ACP-HL02` Typed expiring `AuthorityLease` records MUST bind exact Git
+  `ProjectRef`, live `ProjectRef`, or `ManagedResource`, allowed/forbidden
+  operations, preconditions digest, expiry/renewal, expansion/handoff, and
+  receipts.
+- `ACP-HL03` `RunInbox` MUST be monotonic and journal-backed with exact
+  position, run sequence, event/correlation, task/attempt/action generation,
+  producer/consumer, payload digest, and acknowledgement receipt.
+- `ACP-HL04` Typed pending-work gates `time_not_before`, `external_status`,
+  `workflow_terminal`, `evidence_required`, `no_overlap_window`,
+  `human_approval`, and `security_containment` MUST bind one resolver authority
+  and one exact wake event/time, and deferred-with-wakeup work MUST enter zero-
+  hot-poll `QUIESCENT`.
+- `ACP-HL05` `EvidenceRequirement`, immutable `Evidence`, and independent
+  `Attestation` MUST remain distinct; `DONE` is a claim and mandatory
+  attestations gate `ACCEPTED`.
+- `ACP-HL06` Executor/harness capabilities MUST be enforced before provider
+  invocation for `read_only`, `secret_metadata_only`, safe history with
+  redaction/deny, `repository_mutation`, `cluster_mutation`, and `remote_exec`.
+- `ACP-HL07` `SecurityIncident` MUST follow detected/frozen/containing/
+  contained/resume-authorized-or-closed transitions with scoped freeze, lease
+  suspension or revocation, preserved evidence, containment gate, and explicit
+  resume.
+- `ACP-HL08` `supervised_by` MUST remain distinct from `lifecycle_owner`, and
+  close-check MUST separately report owned close obligations and externally
+  owned supervised dependencies.
+- `ACP-HL09` `ApplyStrategy` MUST be one of `gitops_reconcile`,
+  `exact_remote_patch`, `api_mutation`, or `workflow_trigger` and bind exact
+  preimage/version/UID, postcondition, rollback or compensation, observation,
+  and authority; ACP-20 MUST own and validate the typed contract before every
+  side effect, while ACP-16 remains the earlier owner of lease/precondition
+  facts only.
+- `ACP-HL10` Every new operational state MUST rebuild exclusively from the
+  authoritative journal; provider status, YAML, and UI remain derived.
+- `ACP-HL11` Callback, polling, conflict, gate, lease, reopen, incident,
+  rollback, wake, and quiescence metrics MUST be bounded, redacted, and
+  non-authoritative.
+- `ACP-HL12` Acceptance MUST prove the empirical contract across simultaneous
+  unrelated `ControlRun` values without cross-run blocking or contamination.
 - `ACP-G01` Graph revisions, frozen inputs, ownership, and handoffs MUST be
   immutable and CAS-versioned.
 - `ACP-G02` Grant, expansion, transfer, release, and revocation MUST bind exact
@@ -1279,6 +1549,17 @@ The durable JSON field names are `parallelism_primitive`,
 loss, or duration can require movement to another primitive; tasks with no
 promotion path persist the explicit value `none`. Missing or implied required
 values invalidate dispatch.
+
+Promotion is specifically the handoff of work whose current primitive has
+become insufficient, such as a bounded read-only ephemeral review growing into
+long or mutating work that needs a distinct persistent session and exclusive
+ownership. Candidate completion, review acceptance, integration, cleanup, and
+ordinary dependency readiness are not promotion triggers. A static persistent
+or local-sequential node records `none`. If fallback selects a different
+primitive, terminal closure follows the primitive actually selected:
+ephemeral execution requires runtime-close, while local-sequential execution
+requires terminal evidence plus an inactive marker and never fabricates or
+requires subagent runtime-close.
 
 Placement is provider-neutral and selects exactly one primitive:
 
@@ -2171,9 +2452,10 @@ Codex becomes the first fully integrated harness only when:
    work closure;
 7. a scoped token cannot exceed its project, repository, identity, action,
    harness, or leaf-depth policy;
-8. a live Codex control session creates at least three persistent child sessions
-   across at least two projects, exercises an ephemeral subagent and native
-   fan-out additionally, exchanges capability-supported messages, handles
+8. a live Codex control session materializes every persistent-session scenario
+   required by the canonical requirement registry across at least two projects,
+   exercises every additionally required primitive scenario, exchanges
+   capability-supported messages, handles
    parent steering, integrates evidence, resumes after coordinator restart,
    archives every persistent session, and records close evidence for every
    other attempt;
@@ -2314,8 +2596,8 @@ does not automatically certify another.
 #### AP-6: Durable multi-agent control
 
 - One real originating Codex control agent receives a long specification and
-  creates at least three acknowledged `persistent_session` children across at
-  least two `ProjectRef` values.
+  creates every acknowledged `persistent_session` child required by the
+  canonical acceptance graph across at least two `ProjectRef` values.
 - The same graph records all placement fields for one short read-only
   `ephemeral_subagent` task, one bounded `harness_native_parallel` fan-out, and
   one dependency-conflicted `local_sequential` task.
@@ -2458,8 +2740,8 @@ bar, not to an unevidenced vendor choice.
   probes;
 - opt-in live Codex execution;
 - opt-in live Codex agent-piloted round trip;
-- opt-in live Codex multi-agent control with at least three persistent sessions,
-  two projects, additional ephemeral and native fan-out attempts, steering,
+- opt-in live Codex multi-agent control with every canonical placement node,
+  at least two projects, required ephemeral and native fan-out attempts, steering,
   coordinator restart, evidence integration, persistent archival, subagent
   runtime close, native terminal aggregation, and no active local work;
 - a second harness may not be labeled supported until the same required suite
@@ -2554,9 +2836,10 @@ This design is complete only when evidence proves all of the following:
    capability requirements, lifecycle owner, and fallback; Codex placement,
    promotion, missing-capability fallback, concurrency limits, and overlapping
    subagent mutation denial pass acceptance.
-7. A live control agent receives a long specification, creates at least three
-   persistent child sessions across at least two projects, additionally
-   exercises an ephemeral subagent and native fan-out, exchanges
+7. A live control agent receives a long specification, creates every
+   persistent child session required by the canonical acceptance graph across
+   at least two projects, additionally exercises each required nonpersistent
+   primitive, exchanges
    capability-supported messages, handles one steering event, integrates
    evidence, survives coordinator restart, archives every persistent session,
    closes every nonpersistent attempt with its required evidence, and proves

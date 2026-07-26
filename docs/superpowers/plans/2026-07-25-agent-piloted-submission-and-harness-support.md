@@ -135,9 +135,9 @@ with the boundary summarized in the
   barriers, finding/correction/supersession history, exact DAG integration,
   generated-only conflict handling, explicit publication authority, target-tree
   verification, and resource-specific closure receipts are mandatory.
-- Every implementation node uses its canonical `ACP-NN` ID. The portable-worker
-  image gate is `PW-07`; it is not ACP Task 7 and does not grant mutation of the
-  portable-worker documents in this plan.
+- Every implementation node uses its canonical ID. `PW-FINAL` is the corrected
+  portable lower-plane gate; it is not an ACP task and grants no ACP writer
+  mutation of portable-worker documents or lower executor/workspace paths.
 
 ---
 
@@ -228,8 +228,8 @@ Pajé never invents one.
   run/project/credential/evidence namespace isolation.
 - `internal/controlplane/ownership/**` and `resources/**`: exact claim CAS,
   origin/cleanup authority, managed-resource ledger, and terminal receipts.
-- `internal/workspace/gitworktree/**`: immutable-base managed Git-worktree
-  allocation, observation, recovery, and cleanup.
+- `internal/workspace/gitworktree/**`: PW-12.2-owned immutable-base managed Git-
+  workspace provider consumed read-only by ACP resource orchestration.
 - `internal/controlplane/reconcile/**`, `supervisor/**`, and `adoption/**`:
   all-action ambiguity reconciliation, callback-plus-cursor monitor leases,
   exact runtime registration, adopted-resource policy, and primitive closure.
@@ -307,9 +307,10 @@ Pajé never invents one.
 - `internal/acceptance/codex_agent_pilot_test.go`: opt-in live originating
   Codex-to-Pajé leaf round trip.
 - `internal/acceptance/codex_control_plane_test.go`: opt-in long-spec control
-  agent with three persistent children, two projects, additional ephemeral and
-  native fan-out attempts, steering, restart, evidence, primitive-specific
-  close, and typed zero-pending-work closure.
+  agent over every canonical graph-node disposition and the placements selected
+  by current capabilities, including concurrent unrelated projects, steering,
+  restart, evidence, primitive-specific close, and typed zero-pending-work
+  closure.
 - `internal/acceptance/positioning_test.go`: README, Chart, docs, and matrix
   regression checks.
 - `charts/paje/*`: optional gateway Deployment/Service, persistence, scoped
@@ -331,23 +332,23 @@ This is the only implementation DAG for this plan. `ACP-00` through `ACP-04`
 are the integrated foundation present at baseline
 `984d8797fc3650e2654b1413a47b1ae30b357c4c`. Their detailed task sections are
 retained as the contract and verification record; they are not reimplemented.
-`ACP-14`, `ACP-14.1`, and `ACP-15` through `ACP-21` reconcile the three
-empirical analyses into the foundation before the remaining gateway, client,
-plugin, packaging, certification, acceptance, documentation, and completion
-work.
+`ACP-14` and `ACP-14.1` are integrated terminal predecessors. Remaining
+`ACP-15A..ACP-15D`, `ACP-15R`, and `ACP-16..ACP-21` reconcile the three
+empirical analyses into that foundation before gateway, client, plugin,
+packaging, certification, acceptance, documentation, and completion work. The
+old monolithic `ACP-15` writer is retired.
 
-`PW-07` means Task 7, “Split Images, Real Docker Conformance, and Worker Profile
-Fixture,” in the
-[portable-worker implementation plan](./2026-07-25-portable-worker-profiles-and-isolated-execution.md#task-7-split-images-real-docker-conformance-and-worker-profile-fixture).
-It is an external prerequisite, not an ACP task. That prerequisite is satisfied:
-candidate `0ceabae5aade12c02034ea94858e3914ac960e25` passed independent review and
-was integrated and reverified by the parent as
-`740b355660ae8f29210911ae1a5c3514797a2449`. The parent dispatches `ACP-16`,
-`ACP-17`, `ACP-19`, `ACP-08`, or `ACP-09` only after integrating this
-specification commit on top of that parent head and freezing the accepted image,
-profile, and live-Docker evidence digests as successor inputs. This plan does
-not grant any writer ownership of the portable-worker documents or `PW-07`
-implementation paths.
+The accepted `PW-07` receipt at parent
+`740b355660ae8f29210911ae1a5c3514797a2449` remains implementation history but
+is not sufficient for the correction IDs. `PW-FINAL` in the
+[portable-worker implementation plan](./2026-07-25-portable-worker-profiles-and-isolated-execution.md#canonical-remaining-work-registry)
+is the external lower-execution-plane prerequisite for ACP nodes that consume
+or overlap its corrected runtime/product surfaces. It does not prove Agent
+Control Plane or Pajé product completion. ACP-15A/B/C/D/R may proceed on their
+disjoint control-plane paths after this refreeze; ACP-16/17/19/08/09/10 wait for
+integrated `PW-FINAL`. ACP-20 additionally waits for the accepted PW-12.1 truth
+contract. No ACP writer owns the five portable documents or PW-12.2 workspace/
+executor paths.
 
 ```mermaid
 flowchart LR
@@ -357,21 +358,27 @@ flowchart LR
     A00 --> A04["ACP-04 Scoped HTTP API: integrated"]
     A03 --> A04
 
-    A04 --> A14["ACP-14 Authoritative journal and projections"]
-    A14 --> A141["ACP-14.1 Atomic semantic journal transaction"]
-    A141 --> A15["ACP-15 Multi-run admission and isolation"]
-    A15 --> A16["ACP-16 Ownership and managed resources"]
-    A15 --> A17["ACP-17 Runtime supervisor and closure"]
-    PW07["PW-07 satisfied at parent 740b355"] --> A16
-    PW07 --> A17
+    A04 --> A14["ACP-14 journal: integrated ab0d5aa"]
+    A14 --> A141["ACP-14.1 transaction: integrated cf242c5"]
+    A141 --> A15A["ACP-15A admission authority"]
+    A141 --> A15B["ACP-15B isolation and operational domain"]
+    A15A --> A15C["ACP-15C fair scheduler"]
+    A15B --> A15D["ACP-15D combined admission/isolation gate"]
+    A15C --> A15D
+    A15D --> A15R["ACP-15R independent semantic review"]
+    A15R --> A16["ACP-16 Ownership and managed resources"]
+    A15R --> A17["ACP-17 Runtime supervisor and closure"]
+    PWF["PW-FINAL corrected portable lower plane"] --> A16
+    PWF --> A17
 
     A16 --> A18["ACP-18 Candidate review and correction"]
     A17 --> A18
     A18 --> A19["ACP-19 Gate scheduler and provenance"]
-    PW07 --> A19
+    PWF --> A19
     A18 --> A20["ACP-20 Exact integration and publication"]
     A19 --> A20
-    A15 --> A21["ACP-21 Delta status and central view"]
+    PWF --> A20
+    A15R --> A21["ACP-21 Delta status and central view"]
     A17 --> A21
     A20 --> A21
 
@@ -384,20 +391,21 @@ flowchart LR
     A17 --> A07
     A05 --> A08["ACP-08 Gateway packaging"]
     A07 --> A08
-    PW07 --> A08
+    PWF --> A08
     A19 --> A09["ACP-09 Harness certification"]
     A05 --> A09
-    PW07 --> A09
+    PWF --> A09
     A07 --> A10["ACP-10 Live acceptance"]
     A08 --> A10
     A09 --> A10
     A20 --> A10
     A21 --> A10
+    PWF --> A10
     A10 --> A11["ACP-11 Public documentation"]
     A11 --> A12["ACP-12 Second-harness evidence gate"]
     A12 --> A13["ACP-13 Final completion gates"]
     A14 --> A13
-    A15 --> A13
+    A15R --> A13
     A16 --> A13
     A17 --> A13
     A18 --> A13
@@ -513,22 +521,29 @@ successor base and may mutate only its listed ownership.
 - `fallback`: `local_sequential`; otherwise block.
 - `promotion_trigger`: `none`.
 
-#### ACP-14 — Authoritative action/event journal and projections
+#### ACP-14 — Authoritative action/event journal and projections (integrated)
 
-- Dependencies: `ACP-04` and this committed specification revision.
+- Dependencies: historical integrated `ACP-04` and the accepted journal design
+  frozen at ACP-14 dispatch; already satisfied.
 - Ownership paths: `internal/controlplane/journal/**`,
   `internal/controlplane/projection/**`, and exclusive migration edits to
   `internal/controlplane/{types.go,store.go,service.go}` plus their focused
   tests; no other writer may touch those shared files.
-- Frozen inputs: baseline `984d8797fc3650e2654b1413a47b1ae30b357c4c`,
-  requirements `ACP-J01..J05`, and the current snapshot/action compatibility
-  fixtures.
+- Frozen inputs: historical dispatch base
+  `c35a7a3c68e27ac935831f018f5736d815833cc9`, requirements `ACP-J01..J05`, and
+  the snapshot/action compatibility fixtures accepted by review.
 - Test-first acceptance gates: exact replay equality, changed-input conflict,
   corrupt/nonmonotonic journal denial, contiguous installation-wide position,
   byte-stable interleaved feed rebuild, old-snapshot migration, and crash
   injection before/after reserve, append, invoke-result bind, checkpoint, and
   per-run/global cursor advancement.
-- Integration order: slot 14, first new implementation commit.
+- Integration receipt: final accepted candidate
+  `c1b7953d06e0f0aae5ba7983f1065cf3b40c6ae8` passed independent review with no
+  Critical or Important findings and was parent-integrated as
+  `ab0d5aa64b01af256ba7ee1e2ac1bc045645e2bd` (`feat: make control journal
+  authoritative`). That integrated commit is an ancestor of exact refreeze base
+  `1a5c3024e9a995103b218f54a4d81886d6e0715c`.
+- Integration order: historical slot 14; terminal and never redispatched.
 - `execution_placement`: `isolated_journal_core_worktree`.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: foundational restart-critical shared-schema mutation
@@ -539,7 +554,7 @@ successor base and may mutate only its listed ownership.
 - `fallback`: `local_sequential` with sole ownership; never shared writer.
 - `promotion_trigger`: `none`.
 
-#### ACP-14.1 — Atomic semantic journal transaction and payload authority
+#### ACP-14.1 — Atomic semantic journal transaction and payload authority (integrated)
 
 - Dependencies: `ACP-14` and the integrated portable execution checkpoint
   through `PW-09`.
@@ -563,7 +578,8 @@ successor base and may mutate only its listed ownership.
   `27297122350a8b20bae1c88013e746ec6b1065ea` passed independent review with no
   Critical or Important findings and was integrated as parent
   `cf242c529a084152c4285513e6fb439fb0ed70b7`.
-- Integration order: slot 14.1 immediately after ACP-14 and before ACP-15.
+- Integration order: historical slot 14.1 immediately after ACP-14; terminal
+  before ACP-15A/B and never redispatched.
 - `execution_placement`: `isolated_authoritative_journal_worktree`.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: restart-critical cross-run CAS and filesystem
@@ -576,51 +592,159 @@ successor base and may mutate only its listed ownership.
   with a side store or mutable projection.
 - `promotion_trigger`: `none`.
 
-#### ACP-15 — Central multi-run admission, scheduler, and isolation
+#### ACP-15A — Authoritative admission and lease transitions
 
-- Dependencies: `ACP-14.1` integrated at
-  `cf242c529a084152c4285513e6fb439fb0ed70b7`.
-- Ownership paths: `internal/controlplane/admission/**`,
-  `internal/controlplane/scheduler/**`, and
-  `internal/controlplane/isolation/**`; status and runtime reconciler paths are
-  forbidden.
-- Frozen inputs: ACP-14 journal/projection interfaces, ACP-14.1
-  `AuthoritativeStore.Commit` plus immutable `Payload` retrieval, canonical
-  project identity, requirements `ACP-M01..M08`, and versioned quota/fairness
-  policy.
-- Test-first acceptance gates: concurrent unrelated runs, per-installation/
-  principal/run/project/primitive quotas, bounded burst, fair ordering, aging,
-  backpressure, no starvation, actual-shared-resource contention, identical
-  unrelated paths, no global mutex, and bounded fair restart scan.
-- Integration order: slot 15 immediately after ACP-14.1.
-- `execution_placement`: `isolated_multirun_scheduler_worktree`.
+ACP-15A is the sole writer of authoritative admission, lease, release/expiry,
+backpressure, and evidence-handoff transition APIs and receipts. ACP-15C may
+select work and request these transitions only through the integrated ACP-15A
+interface; it owns no duplicate mutation path or authoritative projection.
+
+- Dependencies: integrated `ACP-14.1` and this refrozen specification.
+- Ownership paths: `internal/controlplane/admission/**` only.
+- Frozen inputs: `ACP-J06`, exact existing journal kind/semantic-operation
+  mapping, `ACP-M01..M15`, canonical scope/resource identity, and typed numeric
+  codecs.
+- Test-first acceptance gates: journal-only rebuild; installation quota race;
+  response-loss; semantic rebinding; CAS sequence concurrency; `MaxUint64` and
+  `2^53+1`; overflow/underflow/saturation; released/expired tombstone boundary;
+  greater-than-1MiB lifetime stress; cross-run equal IDs; safe diagnostics;
+  exact Commit delta bounds; and no journal-I/O-wide mutex.
+- Integration order: slot 15A after ACP-14.1; may run in parallel with ACP-15B
+  because their ownership is disjoint.
+- `execution_placement`: `isolated_admission_authority_worktree`.
 - `parallelism_primitive`: `persistent_session`.
-- `placement_rationale`: centralized concurrency logic is independently
-  testable but restart-sensitive and security-critical.
-- `capability_requirements`: deterministic clock, controllable queues/leases,
-  race tests, multi-run fault fixtures.
+- `placement_rationale`: restart-critical cross-run CAS and lease authority
+  require durable isolated mutation and independent review.
+- `capability_requirements`: deterministic clock, journal fault injection,
+  typed lossless decoding, race/count-20 tests, exact base acknowledgement.
 - `lifecycle_owner`: parent control-run owner.
-- `fallback`: implement in `local_sequential` with one exclusive writer; the
-  product remains blocked until full multi-run scoping, fairness, and
-  concurrency gates pass.
+- `fallback`: parent-local sequential sole writer; never a side store, copied
+  history payload, float decoder, or installation-wide I/O mutex.
 - `promotion_trigger`: `none`.
+
+#### ACP-15B — Run isolation, inbox, gates, and operational domain
+
+- Dependencies: integrated `ACP-14.1` and this refrozen specification.
+- Ownership paths: `internal/controlplane/isolation/**` only.
+- Frozen inputs: `ACP-J06`, exact scope identity, `ACP-HL01`, `ACP-HL03`,
+  `ACP-HL04`, and the authoritative journal/projection contract.
+- Test-first acceptance gates: cross-run equal IDs; journal-only RunInbox
+  rebuild; missing/duplicate/out-of-order callbacks; terminal-visible session;
+  exact gate wake event/time; deferred zero-hot-poll `QUIESCENT`; simultaneous
+  unrelated ControlRuns; and status/YAML/UI observation never mutating state.
+- Integration order: slot 15B after ACP-14.1; may run in parallel with ACP-15A.
+- `execution_placement`: `isolated_run_isolation_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: authoritative operational-domain and inbox/gate state
+  is restartable cross-run mutation with disjoint package ownership.
+- `capability_requirements`: journal fixtures, deterministic wake clock,
+  callback permutation generator, multi-run race tests.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: parent-local sequential sole writer; no hot poll, UI authority,
+  single-run shortcut, or ownership expansion.
+- `promotion_trigger`: `none`.
+
+#### ACP-15C — Fair centralized scheduler
+
+- Dependencies: integrated `ACP-15A`.
+- Ownership paths: `internal/controlplane/scheduler/**` only.
+- Frozen inputs: ACP-15A admission/lease receipts, `ACP-M01..M15`, versioned
+  quota/fairness policy, exact `ResourceKey`, and journal-backed scan cursor.
+- Test-first acceptance gates: deterministic virtual-finish saturation,
+  consecutive count exactly two, aging/backoff, fairness, no starvation, no
+  head-of-line blocking, resource-key-specific locks, unrelated progress,
+  250ms scan with 50ms persistence reserve, cursor restart, lease expiry, and
+  fenced late-result/ambiguity/no-overlapping-retry cases.
+- Integration order: slot 15C after ACP-15A; it must not edit admission or
+  isolation paths.
+- `execution_placement`: `isolated_fair_scheduler_worktree`.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: long fault-heavy scheduler work consumes a frozen
+  admission interface and needs isolated restart/audit value.
+- `capability_requirements`: deterministic clock, controllable queue/lease and
+  observation fakes, race/count-20 tests, scan-budget instrumentation.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: parent-local sequential sole writer; never a global mutex across
+  journal I/O or a single-run scheduler.
+- `promotion_trigger`: `none`.
+
+#### ACP-15D — Combined authoritative admission/isolation gate
+
+- Dependencies: integrated `ACP-15B` and `ACP-15C`.
+- Ownership paths: none; validation only in the parent integration worktree.
+- Frozen inputs: exact integrated A/B/C SHAs, all `ACP-M01..M15`,
+  `ACP-HL01`, `ACP-HL03`, `ACP-HL04`, and ACP-J06 mapping.
+- Test-first acceptance gates: run every A/B/C adversarial suite together;
+  journal-only rebuild; cross-run equal identifiers; global quota race;
+  fairness/no HOL blocking; exact cursor/persistence reserve; terminal-visible
+  callback permutations; quiescent exact wake; and concurrent unrelated-run
+  progress under race/count-20.
+- Integration order: slot 15D, parent-local after A/B/C integration and before
+  any ACP-16/17/21 dispatch.
+- `execution_placement`: parent integration worktree.
+- `parallelism_primitive`: `local_sequential`.
+- `placement_rationale`: combined conflict, interface, and authority validation
+  shares integrated state and must not create another writer.
+- `capability_requirements`: integrated repository, all focused/full Go gates,
+  ownership and DAG audit.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: reopen the exact owning A/B/C writer; never patch in the gate.
+- `promotion_trigger`: `none`.
+
+#### ACP-15R — Independent admission/isolation semantic review
+
+- Dependencies: accepted terminal `ACP-15D` gate.
+- Ownership paths: none; read-only candidate and evidence review.
+- Frozen inputs: integrated A/B/C diffs, D evidence, `ACP-M01..M15`, and
+  `ACP-HL01`, `ACP-HL03`, `ACP-HL04`.
+- Test-first acceptance gates: bidirectional audit of Commit authority, replay
+  binding, numeric losslessness, tombstones, lock granularity, recovery/fencing,
+  evidence handoff/disclosure, operational phases/inbox/gates/quiescence, and
+  simultaneous unrelated runs; zero Critical or Important findings.
+- Integration order: slot 15R after D and before ACP-16/17/21.
+- `execution_placement`: bounded shared-context read-only review runtime.
+- `parallelism_primitive`: `ephemeral_subagent`.
+- `placement_rationale`: independent semantic review is bounded and requires no
+  mutation or persistent worktree.
+- `capability_requirements`: repository/test evidence read only; no provider or
+  writer capability.
+- `lifecycle_owner`: parent control-run owner.
+- `fallback`: independent parent-local read-only review; writers cannot
+  self-approve, and the fallback closes with a local inactive marker rather
+  than subagent runtime-close evidence.
+- `promotion_trigger`: if the bounded review grows into long or mutating work,
+  stop at a verified read-only checkpoint and dispatch a distinct
+  `persistent_session` writer with exact exclusive ownership; review completion
+  or integration is not promotion.
+
+#### Home Lab audit-cut reconciliation (no additional writers)
+
+The audit labels are aliases into existing exclusive owners, not dispatchable
+nodes: proposed `ACP-15.1` maps to ACP-15B (`ACP-HL01`, `ACP-HL03`,
+`ACP-HL04`); `ACP-16.1` maps to ACP-16 (`ACP-HL02`) and ACP-20 (`ACP-HL09`);
+`ACP-17.1` maps to ACP-17 (`ACP-HL06..ACP-HL08`); `ACP-18.1` maps to ACP-18
+(`ACP-HL05`); `ACP-21.1` maps to ACP-21 (`ACP-HL10`, `ACP-HL11`); and
+`ACP-10.1` maps to ACP-10 (`ACP-HL12` plus the combined empirical adversarial
+gate). This preserves one registry/detail entry and one writer per path while
+making the empirical cut acyclic.
 
 #### ACP-16 — Exact ownership, adopted origins, and managed resources
 
-- Dependencies: `ACP-15` and satisfied `PW-07` receipt at parent integration
-  `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Dependencies: accepted `ACP-15R` and integrated portable `PW-FINAL`.
 - Ownership paths: `internal/controlplane/ownership/**`,
-  `internal/controlplane/resources/**`, and
-  `internal/workspace/gitworktree/**`; no journal, supervisor, candidate, or
-  integration paths.
-- Frozen inputs: ACP-15 admission/resource-key contract, accepted PW-07 image
-  and profile digests, canonical project/base fixtures, and requirements
-  `ACP-G01..G03` and `ACP-R01..R02`.
+  `internal/controlplane/resources/**` only; no journal, portable workspace,
+  supervisor, candidate, or integration paths.
+- Frozen inputs: ACP-15A/15C admission/resource-key contract, accepted portable image
+  and profile digests, canonical project/base fixtures, typed `AuthorityLease`,
+  and requirements `ACP-G01..G03`, `ACP-R01..R02`, and `ACP-HL02`. ACP-16 does
+  not define or consume `ApplyStrategy`.
 - Test-first acceptance gates: one winner for overlapping same-project grants,
   unrelated-project path concurrency, expansion/transfer/release CAS,
   acknowledgement, no idle release, created/adopted cleanup authority,
-  partial allocation restart, dirty/unique retention, and resource-specific
-  cleanup receipts.
+  partial allocation restart, dirty/unique retention, resource-specific
+  cleanup receipts, lease expansion conflict, exact Git/live/managed-resource
+  scope, allowed/forbidden operation denial, precondition digest, expiry/
+  renewal/handoff receipts, and no unrelated-run interference.
 - Integration order: slot 16; may run in parallel with ACP-17 only after their
   frozen interfaces and disjoint paths are committed.
 - `execution_placement`: `isolated_ownership_resources_worktree`.
@@ -630,25 +754,28 @@ successor base and may mutate only its listed ownership.
 - `capability_requirements`: managed-workspace provider, exact repository
   probes, Docker/profile fixtures, CAS/fault injection.
 - `lifecycle_owner`: parent control-run owner.
-- `fallback`: block if the frozen PW-07 evidence digests or safe
+- `fallback`: block if the frozen portable evidence digests or safe
   managed-resource observation are unavailable.
 - `promotion_trigger`: `none`.
 
 #### ACP-17 — Runtime registration, supervisor, adoption, and closure
 
-- Dependencies: `ACP-15` and satisfied `PW-07` receipt at parent integration
-  `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Dependencies: accepted `ACP-15R` and integrated portable `PW-FINAL`.
 - Ownership paths: `internal/controlplane/reconcile/**`,
   `internal/controlplane/supervisor/**`,
   `internal/controlplane/adoption/**`, and narrowly bounded additions to
   `internal/agentharness/{harness.go,contracttest/**,mock/**}`.
-- Frozen inputs: ACP-14 action semantics, ACP-15 fair due-lease scheduler,
-  PW-07 runtime fixtures, and current primitive-specific harness contract.
+- Frozen inputs: ACP-14 action semantics, ACP-15C fair due-lease scheduler,
+  portable runtime fixtures, current primitive-specific harness contract, and
+  requirements `ACP-HL06..ACP-HL08`.
 - Test-first acceptance gates: wrong-ID acknowledgement, callback-first,
   poll-first, callback loss, cursor regression/future cursor, persisted
   backoff/lease takeover, adopted detach-only/none authority, every ambiguous
-  lifecycle action, per-primitive receipts, and one failing run not blocking an
-  unrelated due lease.
+  lifecycle action, per-primitive receipts, executor/harness denial of
+  `read_only` create/exec and `secret_metadata_only` payload reads, scoped
+  incident freeze/contain/resume with unrelated progress, supervisor without
+  lifecycle ownership, separately reported owned-close versus supervised
+  dependencies, and one failing run not blocking an unrelated due lease.
 - Integration order: slot 17; parallel with ACP-16 only on disjoint paths, then
   integrated after ACP-16 to freeze the combined lifecycle surface.
 - `execution_placement`: `isolated_runtime_supervisor_worktree`.
@@ -670,12 +797,15 @@ successor base and may mutate only its listed ownership.
   `internal/controlplane/correction/**`.
 - Frozen inputs: immutable project/ownership/resource evidence from ACP-16,
   terminal/callback observation from ACP-17, and requirements
-  `ACP-C01..C03`, `ACP-V01..V02`, and `ACP-W01..W03`.
+  `ACP-C01..C03`, `ACP-V01..V02`, `ACP-W01..W03`, and `ACP-HL05`.
 - Test-first acceptance gates: malformed/mismatched callbacks, immutable
   candidate identity, stale-evidence invalidation, independent provenance,
   arrival-order-independent review barrier, structured findings, exact-only
   deduplication, single correction writer, RED/GREEN exception authority,
-  rejection, amendment, and immutable supersession.
+  rejection, amendment, immutable supersession, Task `EvidenceRequirement`,
+  independently produced `Evidence`/`Attestation`, mandatory-attestation
+  gating of `ACCEPTED`, restoration evidence before rollout, and restart during
+  `VERIFYING` without a duplicate verifier.
 - Integration order: slot 18 after both lifecycle predecessors.
 - `execution_placement`: `isolated_candidate_review_worktree`.
 - `parallelism_primitive`: `persistent_session`.
@@ -690,13 +820,12 @@ successor base and may mutate only its listed ownership.
 
 #### ACP-19 — Resource-locked gate scheduler and verification provenance
 
-- Dependencies: `ACP-18` and satisfied `PW-07` receipt at parent integration
-  `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Dependencies: `ACP-18` and integrated portable `PW-FINAL`.
 - Ownership paths: `internal/controlplane/gates/**` and
   `internal/verification/scheduler/**`; publisher and integration paths are
   forbidden.
 - Frozen inputs: candidate identity/provenance contract from ACP-18, accepted
-  PW-07 worker image/profile digest, distinct candidate/combined gate-subject
+  portable worker image/profile digest, distinct candidate/combined gate-subject
   schema, versioned gate definitions, and actual shared-resource key schema.
 - Test-first acceptance gates: subject-kind/ID/tree/toolchain/environment
   invalidation, candidate receipt denial for combined gates, required-skip
@@ -704,35 +833,39 @@ successor base and may mutate only its listed ownership.
   retry, lock fairness, same-resource serialization, unrelated gate
   concurrency, no head-of-line blocking, and restart at queue/lock/run/result
   boundaries.
-- Integration order: slot 19 after ACP-18 and PW-07.
+- Integration order: slot 19 after ACP-18 and portable `PW-FINAL`.
 - `execution_placement`: `isolated_gate_scheduler_worktree`.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: environment-heavy restartable scheduling and
   provenance need durable isolation.
-- `capability_requirements`: isolated executor, PW-07 workload image,
+- `capability_requirements`: isolated executor, accepted portable workload image,
   cancellation, deterministic locks/clock, fault injection.
 - `lifecycle_owner`: parent control-run owner.
 - `fallback`: local deterministic mock evidence only; release acceptance blocks
-  if the frozen PW-07 live proof cannot be reproduced.
+  if the frozen portable live proof cannot be reproduced.
 - `promotion_trigger`: `none`.
 
 #### ACP-20 — Exact DAG integration and authority-bound publication
 
-- Dependencies: `ACP-18`, `ACP-19`.
+- Dependencies: `ACP-18`, `ACP-19`, integrated portable `PW-FINAL`, and its
+  accepted `PW-12.1` truth-contract receipt.
 - Ownership paths: `internal/controlplane/integration/**`,
   `internal/controlplane/publication/**`, and narrowly reviewed extensions to
   `internal/publisher/**`; token-bearing adapters remain publisher-owned.
 - Frozen inputs: integration-eligible candidate/review evidence, candidate
   pre-gate receipts, typed gate-subject contract,
   persisted integration order, generated-output manifest, secure publisher
-  contract, and requirements `ACP-I01..I04` and `ACP-P01..P02`.
+  contract, ACP-16 `AuthorityLease`/precondition facts, and requirements
+  `ACP-I01..I04`, `ACP-P01..P02`, and `ACP-HL09`; ACP-20 exclusively defines
+  the typed `ApplyStrategy` contract.
 - Test-first acceptance gates: exact parent/candidate/tree integration,
   response-loss ancestry reconciliation, immutable integration snapshot,
   candidate/combined gate subject separation, exact-result-tree combined
   gates, generated-only regeneration, authored/ambiguous conflict stop,
-  same-target locking without global mutex, explicit authority, target drift,
-  idempotent PR/merge, credential isolation, and final remote target-tree
-  equality.
+  same-target locking without global mutex, exact strategy enum and bound
+  preimage/version/UID/postcondition/rollback/authority validation before any
+  side effect, target drift, idempotent PR/merge, credential isolation, and
+  final remote target-tree equality.
 - Integration order: slot 20 after ACP-19.
 - `execution_placement`: `isolated_integration_publication_worktree`.
 - `parallelism_primitive`: `persistent_session`.
@@ -742,24 +875,29 @@ successor base and may mutate only its listed ownership.
   secure publisher fixture, provider observation, fault injection.
 - `lifecycle_owner`: parent control-run owner.
 - `fallback`: `local_sequential` before credential creation; authored conflict,
-  authority gap, or target drift blocks.
+  authority gap, target drift, missing preimage/version/UID, postcondition,
+  rollback/compensation, or apply authority blocks.
 - `promotion_trigger`: `none`.
 
 #### ACP-21 — Per-run delta status and redacted central view
 
-- Dependencies: `ACP-15`, `ACP-17`, `ACP-20`.
+- Dependencies: accepted `ACP-15R`, `ACP-17`, `ACP-20`.
 - Ownership paths: `internal/controlplane/status/**` and exact status-only files
   `internal/controlplane/httpapi/status.go` and `status_test.go`, plus the
   narrowly bounded `control:list` action addition in
   `internal/submission/auth/{policy.go,policy_test.go}`.
 - Frozen inputs: ACP-14 per-run cursor plus authoritative installation feed and
-  `JournalPosition`, ACP-15 global fair-scheduler projection, ACP-17 supervisor
-  state, ACP-20 integration/publication states, and v1 HTTP redaction limits.
+  `JournalPosition`, ACP-15A/15C global fair-scheduler projection, ACP-17 supervisor
+  state, ACP-20 integration/publication states, v1 HTTP redaction limits, and
+  `ACP-HL10..ACP-HL11`.
 - Test-first acceptance gates: byte-stable rebuild, per-run `after_cursor`,
   delta-only output, unchanged silence, global/per-run cursor separation,
   concurrent/interleaved/late event ordering, restart at append boundaries,
   bounded redaction, subscriber replay, no cross-run mutation, and proof that
-  status calls cannot acknowledge or mutate state.
+  status calls cannot acknowledge or mutate state, journal-only reconstruction
+  of every new state, and bounded redacted non-authoritative metrics for
+  callbacks, polling, conflicts, gates, leases, reopens, incidents, rollbacks,
+  wakeups, and quiescence time/cost.
 - Integration order: slot 21 after ACP-20; last empirical core node.
 - `execution_placement`: `isolated_status_projection_worktree`.
 - `parallelism_primitive`: `persistent_session`.
@@ -833,34 +971,32 @@ successor base and may mutate only its listed ownership.
 
 #### ACP-08 — Optional gateway/image packaging
 
-- Dependencies: `ACP-05`, `ACP-07`, and the satisfied `PW-07` receipt at parent
-  integration `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Dependencies: `ACP-05`, `ACP-07`, and integrated portable `PW-FINAL`.
 - Ownership paths: `charts/paje/**`, `Dockerfile`, and exact ACP-08 image
-  acceptance files; portable `Dockerfile.worker-codex` remains PW-07-owned.
-- Frozen inputs: accepted PW-07 coordinator/worker split, final gateway/client
+  acceptance files; portable `Dockerfile.worker-codex` remains portable-owned.
+- Frozen inputs: accepted portable coordinator/worker split, final gateway/client
   binaries, chart credential model.
 - Test-first acceptance gates: Helm render/lint, Secret separation, image
   content, exact revision, and static acceptance in ACP-08.
-- Integration order: slot 25 after ACP-07 and PW-07; resolve shared Dockerfile
+- Integration order: slot 25 after ACP-07 and `PW-FINAL`; resolve shared Dockerfile
   ownership centrally, never with concurrent writers.
 - `execution_placement`: `isolated_packaging_worktree`.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: shared release surfaces and image acceptance require a
   single durable owner.
-- `capability_requirements`: accepted PW-07 artifacts, Helm, Docker/static image
+- `capability_requirements`: accepted portable artifacts, Helm, Docker/static image
   fixtures.
 - `lifecycle_owner`: parent control-run owner.
-- `fallback`: block if the frozen PW-07 artifacts are unavailable;
+- `fallback`: block if the frozen portable artifacts are unavailable;
   `local_sequential` only for central conflict resolution.
 - `promotion_trigger`: `none`.
 
 #### ACP-09 — Formal harness certification
 
-- Dependencies: `ACP-05`, `ACP-19`, and the satisfied `PW-07` receipt at
-  parent integration `740b355660ae8f29210911ae1a5c3514797a2449`.
+- Dependencies: `ACP-05`, `ACP-19`, and integrated portable `PW-FINAL`.
 - Ownership paths: `internal/runner/contracttest/**`, exact Codex/local runner,
   executil/environment/processguard tests, and `docs/harness-certification.md`.
-- Frozen inputs: PW-07 workload image and tool versions, ACP-19 provenance and
+- Frozen inputs: accepted portable workload image and tool versions, ACP-19 provenance and
   gate semantics, ACP-05 process-guard baseline, and exact harness protocol.
 - Test-first acceptance gates: reusable contract, transcript, cancellation,
   sandbox, credential, version, race, and certification-schema tests in ACP-09.
@@ -870,7 +1006,7 @@ successor base and may mutate only its listed ownership.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: security-heavy independent certification benefits from
   isolated mutation and long-running tests.
-- `capability_requirements`: PW-07 image, process/sandbox probes, exact Codex
+- `capability_requirements`: accepted portable image, process/sandbox probes, exact Codex
   binary, race tests.
 - `lifecycle_owner`: parent control-run owner.
 - `fallback`: deterministic local suite only with explicit non-release concern;
@@ -879,16 +1015,23 @@ successor base and may mutate only its listed ownership.
 
 #### ACP-10 — Live leaf, control-plane, and multi-run acceptance
 
-- Dependencies: `ACP-07`, `ACP-08`, `ACP-09`, `ACP-20`, `ACP-21`.
+- Dependencies: `ACP-07`, `ACP-08`, `ACP-09`, `ACP-20`, `ACP-21`, and integrated
+  portable `PW-FINAL`.
 - Ownership paths: `internal/acceptance/codex*_test.go`, bounded acceptance
   helpers/testdata, plugin acceptance fixtures, and post-pass
   `docs/evidence/codex-*.yaml`.
 - Frozen inputs: exact committed implementation SHA, disposable project base
-  SHAs, plugin and image versions/digests, scoped non-production credentials.
+  SHAs, plugin and image versions/digests, scoped non-production credentials,
+  and `ACP-HL01..ACP-HL12`.
 - Test-first acceptance gates: existing leaf/control scenarios plus simultaneous
-  unrelated runs, interleaved callbacks, shared-resource contention, unrelated
-  gate concurrency, stalled/awaiting-authority run, cleanup-incomplete run,
-  restart, fairness, unaffected progress, and zero cross-run contamination.
+  unrelated runs; missing/duplicate/out-of-order callbacks; terminal-visible
+  session; lease expansion conflict; `read_only` create/exec denial;
+  `secret_metadata_only` payload-request denial; scoped incident freeze/resume
+  with unrelated progress; deferred quiescence and exact wake; supervisor
+  without lifecycle ownership; restore-evidence gate before rollout; restart
+  during `VERIFYING` without duplicate verifier; shared-resource contention;
+  unrelated gate concurrency; stalled/awaiting-authority and cleanup-incomplete
+  runs; fairness; and zero cross-run contamination.
 - Integration order: slot 27 after every production/certification dependency.
 - `execution_placement`: `isolated_live_acceptance_worktree`.
 - `parallelism_primitive`: `persistent_session`.
@@ -936,12 +1079,15 @@ successor base and may mutate only its listed ownership.
   positioning tests.
 - `lifecycle_owner`: parent control-run owner.
 - `fallback`: record no selection.
-- `promotion_trigger`: evidence collection becomes a candidate-specific
-  implementation stream only after a selected decision and new approved plan.
+- `promotion_trigger`: `none`.
+- Follow-on: a selected decision may create a separately registered candidate-
+  specific implementation node only through a new approved graph/plan revision;
+  that dependency transition is not promotion of this local evidence gate.
 
 #### ACP-13 — Whole-system completion gates
 
-- Dependencies: `ACP-10`, `ACP-11`, `ACP-12`, and every `ACP-14..ACP-21` node.
+- Dependencies: `ACP-10`, `ACP-11`, `ACP-12`, `ACP-14`, `ACP-14.1`, every
+  `ACP-15A..ACP-15D` node, `ACP-15R`, and every `ACP-16..ACP-21` node.
 - Ownership paths: only files already introduced by their owning ACP nodes,
   this plan's checkboxes, and narrowly reviewed final-fix files; no scope
   expansion without a graph revision.
@@ -2143,7 +2289,14 @@ git add internal/submission/auth internal/submission/httpapi \
 git commit -m "feat: expose scoped agent API"
 ```
 
-### Task 14 (ACP-14): Make the typed action/event journal authoritative
+### Task 14 (ACP-14): Make the typed action/event journal authoritative — integrated receipt
+
+This task is terminal implementation history, not remaining work. Final
+candidate `c1b7953d06e0f0aae5ba7983f1065cf3b40c6ae8` was independently accepted
+and parent-integrated as `ab0d5aa64b01af256ba7ee1e2ac1bc045645e2bd`, which
+is present in exact refreeze base
+`1a5c3024e9a995103b218f54a4d81886d6e0715c`. Preserve the steps and gates below
+as its receipt; do not dispatch ACP-14 again.
 
 **Files:**
 - Create: `internal/controlplane/journal/types.go`
@@ -2168,7 +2321,7 @@ git commit -m "feat: expose scoped agent API"
   checkpoint/projection format.
 - Consumes no harness, repository, executor, HTTP, Hatchet, or publisher types.
 
-- [ ] **Step 1: Write failing authoritative journal and replay tests**
+- [x] **Step 1: Write failing authoritative journal and replay tests**
 
 Define the exact records:
 
@@ -2236,7 +2389,7 @@ Tests MUST prove:
   duplicate, reordered, gapped, or foreign events fail closed; and
 - an edited YAML/JSON diagnostic export never changes replayed state.
 
-- [ ] **Step 2: Run the journal tests and confirm the new packages are missing**
+- [x] **Step 2: Run the journal tests and confirm the new packages are missing**
 
 Run:
 
@@ -2247,7 +2400,7 @@ go test ./internal/controlplane/journal ./internal/controlplane/projection \
 
 Expected: FAIL because the journal and projection packages do not exist.
 
-- [ ] **Step 3: Implement reserve, append, and rebuild without dual authority**
+- [x] **Step 3: Implement reserve, append, and rebuild without dual authority**
 
 `journal.Store` exposes only:
 
@@ -2292,7 +2445,7 @@ In the same exclusive schema migration, add `PromotionTrigger string` to
 scope, ownership, or isolation changes can require promotion. The six base
 placement fields remain mandatory on every task and attempt.
 
-- [ ] **Step 4: Migrate current snapshots and lifecycle actions once**
+- [x] **Step 4: Migrate current snapshots and lifecycle actions once**
 
 On first open of ACP-00 snapshots without a journal, hold the installation
 migration/append lock, validate every snapshot completely, sort snapshots by
@@ -2306,7 +2459,7 @@ old files untouched and returns `ErrInvalidRecord`. A completed migration
 marker binds the terminal `JournalPosition` and makes every restart a read-only
 replay, never a second import.
 
-- [ ] **Step 5: Inject crashes at every action boundary**
+- [x] **Step 5: Inject crashes at every action boundary**
 
 Add a failpoint matrix for before/after reservation, global-position selection,
 canonical event visibility, per-run index repair, invocation handoff, result
@@ -2327,14 +2480,14 @@ git diff --check
 
 Expected: PASS with byte-stable replay and no duplicate effect.
 
-- [ ] **Step 6: Commit ACP-14 alone**
+- [x] **Step 6: Commit ACP-14 alone**
 
 ```bash
 git add internal/controlplane
 git commit -m "feat: make control journal authoritative"
 ```
 
-### Task 14.1 (ACP-14.1): Add the atomic semantic journal transaction
+### Task 14.1 (ACP-14.1): Add the atomic semantic journal transaction — integrated receipt
 
 **Files:**
 - Modify exclusively: `internal/controlplane/journal/types.go`
@@ -2396,141 +2549,174 @@ Important findings. The parent repeated the gates, integrated it as
 `cf242c529a084152c4285513e6fb439fb0ed70b7`, archived the durable task, and
 removed its isolated worktree.
 
-### Task 15 (ACP-15): Add fair centralized multi-run admission and isolation
+### Task 15A (ACP-15A): Implement authoritative admission and lease deltas
 
-**Files:**
-- Create: `internal/controlplane/admission/types.go`
-- Create: `internal/controlplane/admission/service.go`
-- Create: `internal/controlplane/admission/service_test.go`
-- Create: `internal/controlplane/scheduler/queue.go`
-- Create: `internal/controlplane/scheduler/queue_test.go`
-- Create: `internal/controlplane/isolation/scope.go`
-- Create: `internal/controlplane/isolation/scope_test.go`
+**Files:** create/modify only `internal/controlplane/admission/**`.
 
-**Interfaces:**
-- Consumes ACP-14 journal/projection interfaces, ACP-14.1
-  `journal.AuthoritativeStore`, and canonical project IDs.
-- Produces durable `RunAdmission`, `ReadyWorkItem`, `QuotaPolicy`, `ResourceKey`,
-  `LeaseRequest`, `RunScope`, `ProjectScope`, and opaque `CredentialScope`
-  records used by ownership, supervision, gates, integration, publication,
-  evidence, cleanup, status, and recovery.
-- Does not invoke a harness, executor, repository, or publisher.
+**Interfaces:** consumes ACP-J06 `AuthoritativeStore.Commit`, `Feed`, and
+`Payload`; produces typed `RunAdmission`, quota/backpressure, lease, tombstone,
+and `EvidenceHandoffSubject` receipts for ACP-15C and downstream nodes. It uses
+the frozen existing action-kind/`semantic_operation` mapping from the design.
+If implementation proves a new journal kind necessary, stop and add a separate
+exclusive journal predecessor; this task has no implicit journal edit authority.
 
-- [ ] **Step 1: Write failing run-scope and callback-binding tests**
+- [ ] **Step 1: Write the full failing authority/replay matrix**
 
-Use two runs with intentionally equal task IDs, attempt IDs, relative paths,
-client keys, and provider-local cursor strings. Prove that each derived ID and
-lookup includes `ControlRunID`, and that a callback/event/result containing the
-other run's runtime binding is rejected before projection mutation.
+Cover empty-cache journal-only rebuild; two-service installation quota CAS;
+response loss at every commit boundary; exact semantic binding of action,
+idempotency, outcome ID/kind, installation, run, operation, subject, graph
+revision, and generation; malformed reservation/outcome/payload schemas;
+changed replay; concurrent CAS sequence assignment; `2^53+1`, `MaxUint64`, and
+lossless decoding; overflow, underflow, and saturation; `now >= ExpiresAt`;
+exact released/expired tombstone replay; more than 1 MiB of lifetime history
+with bounded individual deltas; cross-run equal IDs; safe diagnostics; and
+slow unrelated `ResourceKey` progress with no journal-I/O-wide mutex.
 
-`RunScope` binds installation and control run. `ProjectScope` adds principal
-and canonical project identity. `CredentialScope` adds one declared purpose
-and opaque credential handle; it never contains secret material. Tests create
-equal provider-local credential, evidence, cleanup, and subscription IDs under
-different scopes and prove no lookup, status projection, handoff, or authority
-receipt can cross those scopes. An explicit cross-project handoff exposes only
-its declared evidence digest and acknowledgement.
+- [ ] **Step 2: Write failing authoritative handoff and fenced-recovery tests**
 
-Define canonical scope keys:
+Bind the exact `EvidenceHandoffSubject`. Prove `Issue`, `Grant`, and
+`Acknowledge` are separate commits; fabricated, changed, cross-edge/run/
+generation identities fail; and `EvidenceDisclosure` cannot mutate authority.
+Exercise `StartObservation`, effect-free `Observe`, `CancelOrFence`, and
+scanner-owned apply, including proven not-performed retry, ambiguity with no
+overlap, and late/revoked/fenced result rejection before mutation.
 
-```go
-type OwnershipKey struct {
-    ProjectIdentity string `json:"project_identity"`
-    Namespace       string `json:"namespace"`
-    Unit            string `json:"unit"`
-}
+- [ ] **Step 3: Implement one bounded typed delta per transition**
 
-type ResourceKey struct {
-    Kind      string `json:"kind"`
-    Namespace string `json:"namespace"`
-    Identity  string `json:"identity"`
-}
-```
+Journal payloads contain only the changed record and minimum predecessor
+identity. Process/checkpoint state is verified cache. Use typed integers or
+`json.Number`, assign sequence at successful CAS, return immutable receipts,
+persist exact terminal tombstones, and key every recovery action by
+installation/run/action/generation.
 
-Tests prove `service-a:internal/api` and `service-b:internal/api` do not
-conflict, while two repositories declaring the same Kubernetes namespace,
-local Docker registry, target branch, or verifier device do.
-
-- [ ] **Step 2: Write failing deterministic fairness and backpressure tests**
-
-`QuotaPolicy` contains installation, principal, run, project, primitive,
-verifier, integration, publication, and per-`ResourceKey` limits plus weights
-from 1 through 16. The exact scheduling rule is:
-
-1. discard ineligible items without losing their durable ready record;
-2. order eligible items by lowest virtual finish, then enqueue sequence, run ID,
-   and item ID;
-3. after admission add `ceil(1024 / weight)` to that run's virtual finish;
-4. allow at most two consecutive admissions from one run while another run is
-   eligible; and
-5. every 60 seconds waiting reduces effective virtual finish by 1, capped at
-   300, without crossing zero.
-
-Tests cover 100 runs, unequal weights, bounded per-run burst, quota exhaustion,
-deterministic restart, continuous arrivals, and proof that every continuously
-eligible run is admitted within a bounded number of releases. A blocked,
-awaiting-authority, failed, or cleanup-only run must not consume an execution
-slot.
-
-- [ ] **Step 3: Run focused tests and confirm the packages are missing**
+- [ ] **Step 4: Run and commit ACP-15A alone**
 
 ```bash
-go test ./internal/controlplane/admission \
-  ./internal/controlplane/scheduler ./internal/controlplane/isolation -count=1
-```
-
-Expected: FAIL because the packages do not exist.
-
-- [ ] **Step 4: Implement durable admission and resource-specific leases**
-
-Reserve every queue transition through ACP-14.1 `AuthoritativeStore.Commit`.
-`Admit` returns either one
-receipt or a durable backpressure record containing the limiting quota and next
-eligibility. Never invoke external work from the scheduler package.
-
-Lock compatibility is explicit: `read` shares with `read`; `write` is exclusive
-for the exact `ResourceKey`; unrelated keys never contend. Queue and lease IDs
-bind control run, action, key, mode, generation, and enqueue sequence. There is
-no key representing all executors, all tests, all integrations, or all
-publications.
-
-- [ ] **Step 5: Implement bounded fair all-run restart scanning**
-
-Each recovery tick reads at most 100 active-run index entries or runs for at
-most 250 milliseconds, whichever comes first. It persists the global scan
-cursor, selects due leases through the same fair queue, processes at most one
-action per run per pass while another run is due, and applies per-action typed
-backoff. One reconcile error is recorded for that action and the scan continues.
-
-- [ ] **Step 6: Run concurrency, race, and starvation gates**
-
-```bash
-go test -race ./internal/controlplane/admission \
-  ./internal/controlplane/scheduler ./internal/controlplane/isolation -count=1
-go test ./internal/controlplane/admission ./internal/controlplane/scheduler \
-  -run 'TestFair|TestQuota|TestBackpressure|TestRestart|TestCrossRun' -count=20
+go test ./internal/controlplane/admission -race -count=1
+go test ./internal/controlplane/admission -run 'TestJournal|TestReplay|TestCAS|TestNumeric|TestTombstone|TestHandoff|TestFence' -count=20
+go vet ./internal/controlplane/admission
 git diff --check
+git add internal/controlplane/admission
+git commit -m "feat: persist authoritative admission deltas"
 ```
 
-Expected: PASS with unrelated progress, bounded starvation, and no cross-run
-binding.
+### Task 15B (ACP-15B): Implement isolated run domain, inbox, and quiescent gates
 
-- [ ] **Step 7: Commit ACP-15 alone**
+**Files:** create/modify only `internal/controlplane/isolation/**`.
+
+**Interfaces:** consumes the journal authority and produces `RunScope`,
+`ProjectScope`, opaque `CredentialScope`, authoritative domain-phase and run-
+phase projections, monotonic `RunInbox`, and typed `PendingWorkGate` records.
+It does not implement scheduling, authority leases, harness invocation, status,
+or UI authority.
+
+- [ ] **Step 1: Write failing scope, phase, inbox, and callback tests**
+
+Use intentionally equal task/attempt/action/runtime/correlation IDs across two
+runs. Require exact installation/run/generation bindings and legal transitions
+among `DISCOVERED`, `AUDITING_READ_ONLY`, `READY_FOR_OWNERSHIP`, `OWNED`,
+`EXECUTING`, `VERIFYING`, `ACCEPTED`, `DEFERRED`, `NEEDS_INPUT`,
+`ROLLBACK_REQUIRED`, `FAILED`, plus run `FROZEN_SECURITY` and `QUIESCENT`.
+Cover missing, duplicate, and out-of-order callbacks and a terminal-visible
+session. Provider/UI status is observation only.
+
+- [ ] **Step 2: Write failing gate/quiescence and rebuild tests**
+
+Require a journal-backed `RunInbox` with `JournalPosition`, run sequence,
+event/correlation/task/attempt/action-generation, producer/consumer, payload
+digest, and acknowledgement receipt. Cover every gate kind:
+`time_not_before`, `external_status`, `workflow_terminal`, `evidence_required`,
+`no_overlap_window`, `human_approval`, and `security_containment`, with exact
+resolver authority and wake event/time. Deferred-with-wakeup work must enter
+zero-hot-poll `QUIESCENT`, rebuild from the journal alone, and wake exactly once.
+
+- [ ] **Step 3: Implement and commit ACP-15B alone**
 
 ```bash
-git add internal/controlplane/admission internal/controlplane/scheduler \
-  internal/controlplane/isolation
-git commit -m "feat: schedule concurrent control runs fairly"
+go test ./internal/controlplane/isolation -race -count=1
+go test ./internal/controlplane/isolation -run 'TestScope|TestPhase|TestInbox|TestCallback|TestGate|TestQuiescent|TestRebuild' -count=20
+go vet ./internal/controlplane/isolation
+git diff --check
+git add internal/controlplane/isolation
+git commit -m "feat: isolate authoritative control-run state"
 ```
+
+ACP-15A and ACP-15B may run concurrently only from the same exact base and only
+with the disjoint ownership above. The parent reviews and integrates each exact
+candidate before dispatching ACP-15C.
+
+### Task 15C (ACP-15C): Implement the fair centralized scheduler
+
+**Files:** create/modify only `internal/controlplane/scheduler/**`.
+
+**Interfaces:** consumes integrated ACP-15A admission/lease receipts and
+produces deterministic ready ordering, exact-resource locks, backpressure, and
+the fair recovery scanner. It requests authoritative transitions through the
+integrated ACP-15A API, never edits admission/isolation/journal state directly,
+never maintains a second authority, and never invokes provider mutation
+directly.
+
+- [ ] **Step 1: Write failing arithmetic, fairness, and locking tests**
+
+Order eligible items by saturating virtual finish, enqueue sequence, run ID,
+and item ID. Add `ceil(1024/weight)`, cap consecutive admissions at exactly two
+when another run is eligible, age every 60 seconds to a maximum credit of 300
+without underflow, and saturate all counters/backoff. Cover 100 runs, unequal
+weights, continuous arrivals, quota exhaustion, no starvation, no head-of-line
+blocking, same-resource serialization, and unrelated-resource concurrency.
+
+- [ ] **Step 2: Write failing recovery-budget and fencing tests**
+
+One scan is at most 100 active entries and 250ms, stops starting observations
+at 200ms, reserves 50ms to persist cursor/outcome, handles at most one action
+per run while another is due, and resumes fairly. Cover cursor loss/restart,
+expiry boundary, response loss, observation ambiguity, proven cancel/non-start,
+no overlapping retry, late/revoked results, typed backoff, and one failing run
+not blocking an unrelated due lease.
+
+- [ ] **Step 3: Implement and commit ACP-15C alone**
+
+```bash
+go test ./internal/controlplane/scheduler -race -count=1
+go test ./internal/controlplane/scheduler -run 'TestFair|TestQuota|TestSaturat|TestLock|TestNoHead|TestScan|TestFence' -count=20
+go vet ./internal/controlplane/scheduler
+git diff --check
+git add internal/controlplane/scheduler
+git commit -m "feat: schedule control runs fairly"
+```
+
+### Task 15D (ACP-15D): Run the parent-local combined gate
+
+**Files:** none. Do not patch from this node.
+
+- [ ] Integrate the independently accepted A/B/C candidates in dependency
+  order and verify exact changed-path ownership and no concurrent overlap.
+- [ ] Run admission, isolation, scheduler, journal/projection, full control-
+  plane race, focused count-20, vet, global journal rebuild, callback
+  permutations, quiescent wake, fairness/no-HOL, handoff/disclosure, fenced
+  recovery, scan-reserve, and simultaneous unrelated-run gates together.
+- [ ] Persist one immutable combined-gate receipt or return a finding to the
+  exact owning writer. Do not create a fourth implementation writer.
+
+### Task 15R (ACP-15R): Independently review the combined semantics
+
+**Files:** none; bounded read-only review.
+
+- [ ] Review implementation-to-spec and spec-to-implementation for every
+  `ACP-M01..ACP-M15`, `ACP-HL01`, `ACP-HL03`, and `ACP-HL04` requirement.
+- [ ] Inspect exact journal deltas/replay, numeric boundaries, tombstones,
+  resource-lock granularity, recovery fencing, handoff/disclosure, phases,
+  inbox, gate/quiescence, multi-run fairness, and diagnostic safety.
+- [ ] Report findings without editing. Promotion requires zero unresolved
+  Critical or Important findings. Close evidence follows the actual primitive:
+  an `ephemeral_subagent` requires terminal wait/read plus runtime-close; the
+  parent-local fallback requires terminal evidence plus an inactive marker.
 
 ### Task 16 (ACP-16): Implement exact ownership and managed resource lifecycles
 
-`PW-07` is satisfied by independently reviewed candidate
-`0ceabae5aade12c02034ea94858e3914ac960e25`, parent-integrated as
-`740b355660ae8f29210911ae1a5c3514797a2449`. Dispatch this task only from the
-successor head produced by integrating this specification commit on top of that
-parent head, with the accepted worker image, profile, and live-Docker evidence
-digests frozen in the task inputs.
+Dispatch only after integrated portable `PW-FINAL`, with its accepted worker
+image/profile, live-Docker evidence, and PW-12.2 self-contained workspace
+contract frozen as read-only inputs.
 
 **Files:**
 - Create: `internal/controlplane/ownership/types.go`
@@ -2539,15 +2725,22 @@ digests frozen in the task inputs.
 - Create: `internal/controlplane/resources/types.go`
 - Create: `internal/controlplane/resources/service.go`
 - Create: `internal/controlplane/resources/service_test.go`
-- Create: `internal/workspace/gitworktree/manager.go`
-- Create: `internal/workspace/gitworktree/manager_test.go`
 
 **Interfaces:**
-- Consumes ACP-15 `OwnershipKey`, `ResourceKey`, admission, and lease records.
+- Consumes ACP-15A/15C `OwnershipKey`, `ResourceKey`, admission, and lease records.
 - Produces `OwnershipClaim`, `ManagedResource`, `Origin`, `CleanupAuthority`,
-  allocation/disposition receipts, and a managed Git-worktree provider.
+  allocation/disposition receipts, and orchestration over the accepted managed
+  Git-workspace provider without editing it.
 - Does not own runtime supervision, candidate review, gate execution,
   integration, or publication.
+
+- [ ] **Home Lab correction gate (`ACP-HL02`): write failing lease tests first**
+
+Add a typed expiring `AuthorityLease` bound to exact Git `ProjectRef`, live
+`ProjectRef`, and `ManagedResource`, with allowed/forbidden operations,
+preconditions digest, expiry/renewal, scope expansion, handoff, and immutable
+receipts. Cover expansion races/conflicts, changed replay, suspension/revocation
+during security freeze, expiry boundaries, and unrelated-resource progress.
 
 - [ ] **Step 1: Write failing ownership transition and namespace tests**
 
@@ -2585,7 +2778,7 @@ same-project overlaps yield one grant. Identical paths in unrelated canonical
 projects both become active. Explicit shared-resource namespaces conflict
 across repositories.
 
-- [ ] **Step 2: Write failing managed-resource and workspace tests**
+- [ ] **Step 2: Write failing managed-resource/provider-contract tests**
 
 `ManagedResource` binds resource ID/key, control run, task/attempt, project,
 base SHA, origin, cleanup authority and its authority receipt, creating or
@@ -2601,15 +2794,15 @@ authority can be cleaned once. An adopted resource with an exact
 produces only a detach receipt. `none`, dirty, unique, unmanaged, or
 unintegrated resources remain pending and cannot be deleted.
 
-Git-worktree tests resolve an exact base SHA before allocation, keep the source
-checkout unchanged, reject dirty/stale/symlink/escape roots, recover partial
-creation, and remove only the exact managed clean worktree after disposition.
+Provider-contract tests consume the frozen PW-12.2 workspace conformance
+fixtures to resolve an exact base SHA, observe recovery, and remove only an
+eligible managed workspace. They do not edit the provider package.
 
 - [ ] **Step 3: Run tests and verify the packages are missing**
 
 ```bash
 go test ./internal/controlplane/ownership \
-  ./internal/controlplane/resources ./internal/workspace/gitworktree -count=1
+  ./internal/controlplane/resources -count=1
 ```
 
 Expected: FAIL because the packages do not exist.
@@ -2643,7 +2836,7 @@ and action; it never calls provider delete/archive.
 
 ```bash
 go test -race ./internal/controlplane/ownership \
-  ./internal/controlplane/resources ./internal/workspace/gitworktree -count=1
+  ./internal/controlplane/resources -count=1
 go test ./internal/controlplane/ownership ./internal/controlplane/resources \
   -run 'TestConcurrent|TestTransfer|TestAdopted|TestRestart|TestCleanup' -count=20
 PAJE_DOCKER_ACCEPTANCE=1 go test ./internal/controlplane/resources \
@@ -2651,23 +2844,21 @@ PAJE_DOCKER_ACCEPTANCE=1 go test ./internal/controlplane/resources \
 git diff --check
 ```
 
-Expected: PASS against the exact accepted PW-07 image/profile evidence.
+Expected: PASS against exact accepted `PW-FINAL` image/profile/workspace evidence.
 
 - [ ] **Step 6: Commit ACP-16 alone**
 
 ```bash
-git add internal/controlplane/ownership internal/controlplane/resources \
-  internal/workspace/gitworktree
+git add internal/controlplane/ownership internal/controlplane/resources
 git commit -m "feat: manage control ownership and resources"
 ```
 
 ### Task 17 (ACP-17): Build the cursor supervisor and primitive closure reconciler
 
-`PW-07` is satisfied at parent integration
-`740b355660ae8f29210911ae1a5c3514797a2449`. Dispatch from the successor head
-that contains that integration plus this specification commit and its frozen
-evidence digests. ACP-17 may be implemented in parallel with ACP-16 only after
-ACP-15 freezes their disjoint interfaces; the parent integrates ACP-16 first
+Dispatch from the exact head containing integrated portable `PW-FINAL` plus
+this specification commit and its frozen evidence digests. ACP-17 may be
+implemented in parallel with ACP-16 only after
+ACP-15R freezes their disjoint interfaces; the parent integrates ACP-16 first
 and ACP-17 second.
 
 **Files:**
@@ -2684,11 +2875,22 @@ and ACP-17 second.
 - Modify narrowly: `internal/agentharness/mock/harness_test.go`
 
 **Interfaces:**
-- Consumes ACP-14 actions and ACP-15 fair due-lease admission.
+- Consumes ACP-14 actions and ACP-15C fair due-lease admission.
 - Produces `MonitorLease`, `RuntimeBinding`, `RegistrationReceipt`,
   `AdoptionReceipt`, and primitive-specific `CloseReceipt` services.
 - Extends reconciliation to every external lifecycle action without weakening
   the existing exact runtime-ID and capability contract.
+
+- [ ] **Home Lab correction gate (`ACP-HL06..ACP-HL08`): write failing policy
+  and incident tests first**
+
+Enforce `read_only`, `secret_metadata_only`, safe redacted/denied history,
+`repository_mutation`, `cluster_mutation`, and `remote_exec` before provider
+invocation. Model `detected -> frozen -> containing -> contained ->
+resume_authorized|closed`, scoped freeze, lease suspension/revocation,
+preserved evidence, containment gate, and explicit resume. Keep `supervised_by`
+distinct from `lifecycle_owner`; close-check reports owned-close obligations
+separately from externally owned supervised dependencies.
 
 - [ ] **Step 1: Write failing runtime-binding and supervisor tests**
 
@@ -2751,7 +2953,7 @@ Expected: FAIL because the packages do not exist.
 
 - [ ] **Step 4: Implement callback-plus-poll supervision and all-action reconciliation**
 
-Use ACP-15 admission for each due monitor action. The deterministic backoff
+Use ACP-15A/15C admission for each due monitor action. The deterministic backoff
 sequence is 30 seconds, 60 seconds, 2 minutes, then 5 minutes capped, with a
 stable action-ID-derived jitter of at most 10 percent persisted in
 `NextWakeAt`. Typed transient/contention results advance the step. Material
@@ -2805,6 +3007,14 @@ git commit -m "feat: supervise and close agent runtimes"
   `Finding`, `CorrectionCycle`, and supersession records.
 - Does not integrate, publish, execute a mutating reviewer, or accept a semantic
   finding without policy authority.
+
+- [ ] **Home Lab correction gate (`ACP-HL05`): write failing evidence and
+  attestation tests first**
+
+Add Task `EvidenceRequirement`, immutable `Evidence`, and independently
+produced `Attestation`. `DONE` is only a claim; every mandatory attestation must
+pass before `ACCEPTED`. Cover restoration evidence before rollout and restart
+during `VERIFYING` without starting a duplicate verifier.
 
 - [ ] **Step 1: Write failing candidate and provenance tests**
 
@@ -2904,10 +3114,8 @@ git commit -m "feat: enforce candidate review barriers"
 
 ### Task 19 (ACP-19): Schedule provenance-bound gates with real resource locks
 
-`PW-07` is satisfied at parent integration
-`740b355660ae8f29210911ae1a5c3514797a2449`. Dispatch only after this
-specification commit is integrated on top of that parent head, the accepted
-image/profile evidence digests are frozen, and ACP-18 is frozen.
+Dispatch only after this specification commit, integrated portable `PW-FINAL`,
+and ACP-18 are frozen with exact accepted image/profile evidence digests.
 
 **Files:**
 - Create: `internal/controlplane/gates/types.go`
@@ -2918,8 +3126,8 @@ image/profile evidence digests are frozen, and ACP-18 is frozen.
 - Create: `internal/verification/scheduler/process_test.go`
 
 **Interfaces:**
-- Consumes ACP-15 `ResourceKey`/fair leases, ACP-18 immutable candidates and
-  verification provenance, and the accepted PW-07 executor/profile.
+- Consumes ACP-15A/15C `ResourceKey`/fair leases, ACP-18 immutable candidates and
+  verification provenance, and the accepted portable executor/profile.
 - Produces immutable `CandidateGateRun`, `CombinedGateRun`, and lock/result
   receipts. The combined subject is supplied only from ACP-20's frozen
   integration snapshot.
@@ -2987,7 +3195,7 @@ Expected: FAIL because the packages do not exist.
 - [ ] **Step 4: Implement fair acquire-run-bind-release**
 
 Reserve the gate, enqueue all sorted lock keys atomically, acquire through
-ACP-15, record lock receipts, invoke the executor once, bind bounded output and
+ACP-15A/15C, record lock receipts, invoke the executor once, bind bounded output and
 result, then release each exact lease. Partial acquisition releases already
 held leases before retry. Only typed contention/transient infrastructure errors
 may create a new generation. Semantic failure waits for a new candidate or
@@ -2999,7 +3207,7 @@ integration-apply receipt, and result tree. Before and after execution the
 managed workspace tree must equal that exact result tree. Neither gate kind can
 reuse the other's receipt.
 
-- [ ] **Step 5: Run race, restart, PW-07, and contention gates**
+- [ ] **Step 5: Run race, restart, portable-runtime, and contention gates**
 
 ```bash
 go test -race ./internal/controlplane/gates \
@@ -3039,14 +3247,34 @@ git commit -m "feat: schedule provenance-bound verification"
   candidate pre-gate receipts plus typed gate scheduler, the persisted graph
   integration order, and explicit publication authority.
 - Produces immutable `IntegrationAttempt`, `IntegrationSnapshot`, final
-  `IntegrationReceipt`, `PublicationIntent`, and target-tree verification
-  receipts.
+  `IntegrationReceipt`, typed `ApplyStrategy`, `PublicationIntent`, and target-
+  tree verification receipts. This is the sole `ApplyStrategy` owner.
 - Reuses the secure publisher-owned repository/config boundary; it never runs
   token-bearing Git in a verification or integration workspace.
+
+- [ ] **Home Lab correction gate (`ACP-HL09`): write failing strategy tests
+  first**
+
+Use typed `ApplyStrategy` values `gitops_reconcile`, `exact_remote_patch`,
+`api_mutation`, and `workflow_trigger`. Bind exact preimage/version/UID,
+postcondition, rollback or compensation, and authority; reject drift, absent
+rollback authority, changed replay, or strategy substitution before mutation.
+Validation completes before creating an integration workspace, acquiring a
+credential, invoking a repository/provider operation, or persisting an apply
+side effect.
 
 - [ ] **Step 1: Write failing exact integration and replay tests**
 
 ```go
+type ApplyStrategy string
+
+const (
+    ApplyGitOpsReconcile ApplyStrategy = "gitops_reconcile"
+    ApplyExactRemotePatch ApplyStrategy = "exact_remote_patch"
+    ApplyAPIMutation ApplyStrategy = "api_mutation"
+    ApplyWorkflowTrigger ApplyStrategy = "workflow_trigger"
+)
+
 type Attempt struct {
     ID                      string `json:"id"`
     ControlRunID            string `json:"control_run_id"`
@@ -3062,7 +3290,7 @@ type Attempt struct {
     GeneratorManifestDigest string `json:"generator_manifest_digest"`
     CandidateGateProfileDigest string `json:"candidate_gate_profile_digest"`
     CombinedGateProfileDigest  string `json:"combined_gate_profile_digest"`
-    Strategy                string `json:"strategy"`
+    Strategy                ApplyStrategy `json:"strategy"`
 }
 
 type IntegrationSnapshot struct {
@@ -3106,7 +3334,7 @@ manifest. Authored, mixed, unknown, dirty-tree, path-escape, or generator-drift
 conflicts return `needs_input` without rebase, force, or guessed edits.
 
 Two integration attempts for different repositories or target/resource keys
-run concurrently. Attempts for the same target key serialize through ACP-15.
+run concurrently. Attempts for the same target key serialize through ACP-15C.
 There is no global integration mutex.
 
 - [ ] **Step 3: Write failing publication authority and target-tree tests**
@@ -3186,11 +3414,20 @@ git commit -m "feat: integrate and publish verified candidates"
 
 **Interfaces:**
 - Consumes ACP-14 per-run cursors and canonical installation `Feed` ordered by
-  `JournalPosition`, ACP-15 admission/backpressure projection, ACP-17 supervisor
+  `JournalPosition`, ACP-15A/15C admission/backpressure projection, ACP-17 supervisor
   state, and ACP-20 integration/publication state.
 - Produces per-run delta status and a distinct redacted installation-wide view.
 - Performs no acknowledgement, action completion, lease renewal, or workflow
   mutation.
+
+- [ ] **Home Lab correction gate (`ACP-HL10..ACP-HL11`): write failing rebuild
+  and metric tests first**
+
+Rebuild every new operational state exclusively from the authoritative journal;
+status, YAML, provider UI, and process checkpoints remain derived. Emit only
+bounded redacted non-authoritative determinism metrics for callbacks, polling,
+conflicts, gates, lease changes, reopens, incidents, rollbacks, wakeups, and
+quiescence time/cost. Metric deletion or corruption cannot change authority.
 
 - [ ] **Step 1: Write failing per-run delta and redaction tests**
 
@@ -4043,11 +4280,9 @@ git commit -m "feat: package Codex Pajé integration"
 
 ### Task 8 (ACP-08): Deploy the optional gateway with pairwise credential isolation
 
-Use the `PW-07` artifacts from parent integration
-`740b355660ae8f29210911ae1a5c3514797a2449` as frozen inputs after this
-specification commit is integrated on top. `Dockerfile` is then assigned to the
-single ACP-08 writer; `Dockerfile.worker-codex` and portable-worker documents
-remain immutable inputs.
+Use integrated portable `PW-FINAL` artifacts as frozen inputs. `Dockerfile` is
+then assigned to the single ACP-08 writer; `Dockerfile.worker-codex` and
+portable-worker documents remain immutable inputs.
 
 **Files:**
 - Modify: `charts/paje/Chart.yaml`
@@ -4206,11 +4441,10 @@ git commit -m "feat: package isolated submission gateway"
 
 ### Task 9 (ACP-09): Formalize execution certification and ratify Codex
 
-Use the accepted `PW-07` worker image/profile and live-Docker evidence from
-parent integration `740b355660ae8f29210911ae1a5c3514797a2449` after this
-specification commit is integrated on top. Any digest drift creates a new
-certification candidate and invalidates the frozen receipt. ACP-05 must also be
-integrated first because ACP-05 and ACP-09 sequentially own the same
+Use the accepted portable `PW-FINAL` worker image/profile and live-Docker
+evidence after this specification commit is integrated on top. Any digest drift
+creates a new certification candidate and invalidates the frozen receipt.
+ACP-05 must also be integrated first because ACP-05 and ACP-09 sequentially own the same
 `internal/processguard/guard_linux_test.go` path.
 
 **Files:**
@@ -4441,6 +4675,17 @@ git commit -m "test: formalize Codex harness certification"
   control run and centralized concurrent-run isolation scenario.
 - Produces concrete certification evidence only after a successful opt-in run.
 
+- [ ] **Home Lab empirical acceptance (`ACP-HL12`): freeze the adversarial
+  scenario before implementation**
+
+The scenario includes simultaneous unrelated ControlRuns; missing, duplicate,
+and out-of-order callbacks; a terminal-visible session; authority expansion
+conflict; `read_only` create/exec denial; `secret_metadata_only` payload denial;
+scoped incident freeze/resume while an unrelated run advances; deferred
+`QUIESCENT` with exact wake; supervisor without lifecycle ownership; restore-
+evidence gate before rollout; and restart during `VERIFYING` without a duplicate
+verifier.
+
 - [ ] **Step 1: Extend the existing live Codex test with formal assertions**
 
 Keep its disposable two-module repository and exact one-line edit. Add:
@@ -4513,10 +4758,10 @@ The control-plane test:
 
 1. opens one real Codex control agent with
    `$orchestrating-with-paje` and a long specification;
-2. requires a durable graph with at least three `persistent_session` children
-   assigned across the two exact `ProjectRef` values;
-3. requires at least two ready, disjoint persistent children to run
-   concurrently;
+2. derives the required graph and placements from stable requirement IDs and
+   canonical node dispositions across the two exact `ProjectRef` values;
+3. requires every simultaneously ready, disjoint node admitted by the recorded
+   capability/quota policy to progress concurrently;
 4. verifies every task records placement, rationale, capability requirements,
    lifecycle owner, and fallback; places one short read-only review on an
    ephemeral Codex subagent, dispatches an additional bounded homogeneous
@@ -4670,9 +4915,10 @@ PAJE_CODEX_CONTROL_APP_ID="$PAJE_CODEX_CONTROL_APP_ID" \
   -run 'TestCodex(AgentControlPlane|CentralMultiRun)Acceptance' -v -count=1
 ```
 
-Expected: PASS with at least three acknowledged persistent children over at
-least two projects; additional ephemeral, native fan-out, and sequential
-placement decisions; safe subagent promotion and missing-capability fallback;
+Expected: PASS with every dispatched persistent child acknowledged across the
+required unrelated projects; every selected ephemeral, native-fan-out, and
+sequential placement disposition; safe subagent promotion and missing-
+capability fallback;
 no overlapping mutable ownership; scoped message exchange; one steering event;
 persistent callback plus cursor-aware recovery; ephemeral terminal/runtime
 close; deterministic fan-out aggregation/cancel; evidence integration;
@@ -5179,11 +5425,12 @@ targets.
 
 Expected: live Codex execution, leaf agent-pilot, and Agent Control Plane
 acceptance pass at the exact implementation commit. The control evidence
-includes persistent/ephemeral/native-fan-out/sequential placement, subagent
-promotion, missing-capability fallback, concurrency enforcement, no overlapping
-mutation, three persistent children, two projects, steering, restart recovery,
-persistent archival, ephemeral runtime close, deterministic native aggregation,
-no active local work, and a zero typed pending-work gate. Any opted-in missing
+includes every canonical node disposition and selected persistent/ephemeral/
+native-fan-out/sequential placement, subagent promotion, missing-capability
+fallback, concurrency enforcement, no overlapping mutation, unrelated-project
+progress, steering, restart recovery, persistent archival, ephemeral runtime
+close, deterministic native aggregation, no active local work, and a zero typed
+pending-work gate. Any opted-in missing
 prerequisite is fatal. The same evidence proves simultaneous unrelated runs,
 fair bounded admission, interleaved callback/result/cursor isolation,
 resource-specific contention, unaffected progress around one
@@ -5236,7 +5483,9 @@ gate plus Steps 2-6.
 
 - [ ] **Step 8: Mark the plan complete and verify diff hygiene**
 
-Check every completed checkbox in this plan, then run:
+Enumerate every canonical registry node and stable requirement ID, require one
+terminal disposition and primitive-specific close receipt for each applicable
+attempt, then run:
 
 ```bash
 git diff --check
@@ -5244,9 +5493,9 @@ git status --short
 git log --oneline --decorate -15
 ```
 
-Expected: no unchecked implementation task, no uncommitted implementation
-file, and a reviewable dependency-ordered commit sequence matching every
-`ACP-00..ACP-21` node.
+Expected: no active or unknown canonical node, no uncommitted implementation
+file, and a reviewable dependency-ordered commit sequence matching integrated
+`ACP-00..ACP-14.1`, `ACP-15A..ACP-15D`, `ACP-15R`, and `ACP-16..ACP-21`.
 
 - [ ] **Step 9: Commit final review fixes and evidence**
 

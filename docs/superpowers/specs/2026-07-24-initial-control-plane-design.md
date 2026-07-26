@@ -121,6 +121,34 @@ require an explicit durable authorization. The provider-neutral Agent Control
 Plane owns these decisions and receipts above the portable isolated execution
 plane; the executor never becomes the orchestration authority.
 
+### 2026-07-26 durable-child refreeze
+
+The canonical continuation is refrozen at repository base
+`1a5c3024e9a995103b218f54a4d81886d6e0715c`. The refreeze preserves every
+integrated implementation receipt while invalidating rejected ACP-15 and
+portable-runtime candidates as implementation inputs. The normative
+requirements are defined exactly once in the two linked designs:
+
+- the Agent Control Plane design owns `ACP-M09..ACP-M15` and
+  `ACP-HL01..ACP-HL12`; and
+- the portable-worker design owns `PW-EX01..PW-EX03`, `PW-WS01`, `PW-EN01`,
+  `PW-SC01`, `PW-H01`, `PW-EV01`, `PW-PU01`, and `PW-AC01..PW-AC03`.
+
+The [Agent Control Plane continuation plan](../plans/2026-07-25-agent-piloted-submission-and-harness-support.md#canonical-continuation-dag)
+replaces the monolithic ACP-15 writer with disjoint admission, isolation, and
+scheduler writers followed by a parent-local combined gate. It also assigns
+the empirical Home Lab contract to existing downstream owners rather than
+creating overlapping `.1` writers. The
+[portable-runtime continuation registry](../plans/2026-07-25-portable-worker-profiles-and-isolated-execution.md#canonical-remaining-work-registry)
+replaces the historical fixed-session checklist with dependency-ordered
+durable writers, read-only independent review gates, and a local final gate.
+
+Closure is dynamic. It enumerates every canonical requirement ID and every
+canonical node, requires one terminal disposition and the primitive-specific
+close evidence for each placement, and rejects missing, duplicate, stale, or
+unknown entries. No fixed number of sessions, criteria, tasks, or attempts is a
+close invariant.
+
 ## Approaches Considered
 
 ### 1. Application workflow plus Hatchet adapter

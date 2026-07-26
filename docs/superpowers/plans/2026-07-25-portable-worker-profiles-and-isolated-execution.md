@@ -1,6 +1,8 @@
 # Pajé Portable Worker Profiles and Isolated Execution Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Accepted Tasks 1–11 below are preserved receipts.
+> Dispatch only the canonical remaining-work nodes and their independent review
+> gates; do not treat historical unchecked boxes as active blockers.
 
 **Goal:** Replace `code-change@v1`'s ambient runner and environment selection
 with immutable operator-owned worker profiles, separately bound secret
@@ -79,50 +81,208 @@ regression suite.
 
 ---
 
-## Implementation Coordination Model (Not Product Runtime)
+## Canonical Remaining-Work Registry
 
-This historical implementation control task owns the integration branch and
-dispatches five disposable worktree-backed Codex tasks in dependency order. It
-is a development-session coordination plan, not the Pajé Agent Control Plane
-runtime:
+This registry supersedes the fixed historical implementation-session cut. It
+is a development control plane, not product runtime. Accepted Tasks 1–11 and
+their implementation receipts remain intact. Rejected ACP-15, PW-12, PW-12.1,
+and PW-12.2 candidates are evidence only and must not be reused or cherry-picked.
 
-| Worker session | Plan tasks | Placement | Rationale | Integrated deliverable |
-| --- | --- | --- | --- | --- |
-| `contracts` | 1-2 | `persistent_session` | Long, mutating contract work with independent review and restart value | Worker-profile and secret-binding contracts and registries |
-| `execution-core` | 3-5 | `persistent_session` | Long isolated implementation over exclusive packages | Executor conformance, harness protocol, sandbox init, and host adapter |
-| `docker-runtime` | 6-7 | `persistent_session` | Runtime isolation, Docker side effects, and standalone proof | Docker adapter, secure materialization, split images, and profile fixture |
-| `workflow` | 8-10 | `persistent_session` | Durable-state mutation and restart-heavy acceptance | Durable resolution, execute/recovery flow, and publisher re-verification |
-| `product` | 11-12 | `persistent_session` | Broad but exclusively owned integration slice with live gates | Composition, configuration, adversarial/live gates, docs, site, and Helm |
+```mermaid
+flowchart TD
+    RF["PW-RF five-document refreeze"] --> F["PW-12.2 executor/workspace foundation"]
+    F --> FR["PW-12.2R independent review"]
+    FR --> T["PW-12.1 harness/workflow/artifact/publisher truth"]
+    T --> TR["PW-12.1R independent review"]
+    TR --> P["PW-12 product acceptance/docs/site/Helm"]
+    P --> PR["PW-12R independent review"]
+    PR --> G["PW-FINAL combined gate and close-check"]
+```
 
-Each row's durable dispatch record also contains
-`execution_placement=worktree_backed`, `parallelism_primitive`,
-`placement_rationale`, `capability_requirements`, `lifecycle_owner`,
-`fallback`, exact ownership, and concurrency budget. These five cuts
-prefer persistent sessions because they are long, mutating, independently
-testable, worktree-isolated, and restart/audit worthy.
+No two concurrent writer nodes own overlapping paths. A review node is
+read-only and reports findings to its lifecycle owner; it never fixes the
+candidate. Completion, review acceptance, integration, and cleanup are terminal
+or dependency transitions, never promotion. Static `persistent_session` and
+`local_sequential` nodes record `promotion_trigger: none`. An ephemeral review
+promotes only when its bounded read-only scope grows into long or mutating work;
+it stops at a verified checkpoint and hands off to a distinct persistent writer
+with exact exclusive ownership. Close evidence always follows the primitive
+actually selected: ephemeral review requires runtime-close, while its parent-
+local fallback requires an inactive marker.
 
-For each session the control task:
+#### PW-RF — five-document specification refreeze
 
-1. creates a Codex project task in a new worktree starting at the latest
-   integrated commit;
-2. gives it only the assigned plan tasks and requires one clean commit per plan
-   task;
-3. waits for completion or an explicit blocker without editing that worktree;
-4. reviews its commits and diff, runs the assigned tests, and fixes or returns
-   findings before integration;
-5. cherry-picks the accepted commits into the control branch and runs the
-   cross-slice smoke gate `go test ./... && go vet ./... && git diff --check`;
-6. archives the worker task and removes no branch or worktree until Git confirms
-   every accepted commit is present in the control branch; and
-7. creates the next worker task from the new control-plane `HEAD`.
+- Dependencies: exact accepted main base recorded by the lifecycle owner.
+- Owned paths: only the five canonical design/plan documents named by this
+  refreeze contract.
+- Acceptance: stable `PW-*` IDs, non-overlapping ownership, an acyclic dynamic
+  registry, resolved Markdown links/fences/Mermaid, and one clean docs commit.
+- `execution_placement`: isolated specification-refreeze worktree.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: long, restartable, audit-critical mutation of shared
+  product contracts with exact ownership.
+- `capability_requirements`: local Git/read/write/test tools; no provider,
+  secret, publication, or child-dispatch capability.
+- `lifecycle_owner`: parent control task.
+- `fallback`: block; never edit these documents from a shared or user worktree.
+- `promotion_trigger`: `none`.
 
-No worker task receives release, GitHub, Hatchet, Mem0, registry, or publisher
-credentials. The final product session may run local Docker acceptance but may
-not push images, branches, or releases.
+#### PW-12.2 — executor/workspace foundation
+
+- Dependencies: integrated `PW-RF`.
+- Owned paths: `internal/executor/**`, `internal/sandboxinit/**`,
+  `cmd/paje-sandbox-init/**`, and `internal/workspace/gitworktree/**` only.
+- Acceptance: `PW-EX01`, `PW-EX02`, `PW-EX03`, `PW-WS01`, and `PW-EN01`, plus
+  focused count-20, race, vet, full Go, Linux amd64/arm64 build, ownership, and
+  clean-worktree gates.
+- `execution_placement`: isolated implementation worktree.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: restart-sensitive, mutating lower-plane work with
+  process, Docker, filesystem, and recovery side effects.
+- `capability_requirements`: Go 1.26.1, local Docker where available, Linux
+  cross-builds, exact Git base; no repository or publisher credential.
+- `lifecycle_owner`: parent control task.
+- `fallback`: block when isolated placement or exact lower ownership is
+  unavailable; do not widen into harness/workflow/product paths.
+- `promotion_trigger`: `none`.
+
+#### PW-12.2R — independent executor/workspace review
+
+- Dependencies: terminal candidate from `PW-12.2`.
+- Owned paths: none; read-only review of the candidate diff and test evidence.
+- Acceptance: bidirectional review against `PW-EX01..PW-EX03`, `PW-WS01`, and
+  `PW-EN01`, including pre-child retry, post-receipt ambiguity, signal/exit
+  fidelity, workspace self-containment, cleanup, and no ownership escape.
+- `execution_placement`: bounded shared-context review runtime.
+- `parallelism_primitive`: `ephemeral_subagent`.
+- `placement_rationale`: bounded independent read-only audit needs shared
+  candidate context but no durable mutation lifecycle.
+- `capability_requirements`: repository read and test evidence only.
+- `lifecycle_owner`: parent control task.
+- `fallback`: parent-local read-only review; never let the writer self-approve,
+  and close with terminal evidence plus an inactive local-work marker.
+- `promotion_trigger`: if the bounded review grows into long or mutating work,
+  stop at a verified read-only checkpoint and hand off to a distinct
+  `persistent_session` writer with exact exclusive ownership.
+
+#### PW-12.1 — harness/workflow/artifact/publisher truth
+
+- Dependencies: integrated `PW-12.2` after accepted `PW-12.2R`.
+- Owned paths: `internal/harness/**`,
+  `internal/workflow/codechange/execute.go`,
+  `internal/workflow/codechange/execute_test.go`,
+  `internal/workflow/codechange/resolve_test.go`, `internal/artifact/**`, and
+  `internal/publisher/**` only.
+- Acceptance: `PW-SC01`, `PW-H01`, `PW-EV01`, and `PW-PU01`, including exact
+  Codex tuple denial, defensive-copy mutation tests, no pre-child presented-key
+  evidence, separately derived confirmed-attempt state and exact key unions,
+  plus publisher cases for no attempt, confirmed-empty, confirmed-nonempty,
+  partial, extra, inverse, and drift.
+- `execution_placement`: isolated implementation worktree.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: durable workflow and evidence mutation crosses several
+  disjoint packages and needs restartable, independently reviewable ownership.
+- `capability_requirements`: Go 1.26.1, accepted executor contract, local tests;
+  no live Codex, publisher, GitHub, or production secret credential.
+- `lifecycle_owner`: parent control task.
+- `fallback`: block until the accepted foundation is integrated; do not alter
+  executor, sandbox-init, workspace, documentation, site, or chart paths.
+- `promotion_trigger`: `none`.
+
+#### PW-12.1R — independent truth-contract review
+
+- Dependencies: terminal candidate from `PW-12.1`.
+- Owned paths: none; read-only candidate review.
+- Acceptance: adversarial validation of collision-before-acquire, exact harness
+  tuple, defensive clones, child-confirmed evidence derivation, publisher
+  confirmation/key-union truth including the complete seven-case matrix,
+  durable redaction, and ownership.
+- `execution_placement`: bounded shared-context review runtime.
+- `parallelism_primitive`: `ephemeral_subagent`.
+- `placement_rationale`: independent focused semantic audit is bounded and
+  mutation-free.
+- `capability_requirements`: repository read and test evidence only.
+- `lifecycle_owner`: parent control task.
+- `fallback`: parent-local independent read-only review, closed by terminal
+  evidence plus an inactive local-work marker.
+- `promotion_trigger`: if the bounded review grows into long or mutating work,
+  stop at a verified read-only checkpoint and hand off to a distinct
+  `persistent_session` writer with exact exclusive ownership.
+
+#### PW-12 — product acceptance, documentation, site, and Helm
+
+- Dependencies: integrated `PW-12.1` after accepted `PW-12.1R`.
+- Owned paths: `internal/acceptance/**`, `docs/worker-profiles.md`,
+  `docs/worker-secrets.md`, `docs/executors.md`, `README.md`, `site/**`,
+  `charts/paje/values.yaml`, `charts/paje/values.schema.json`,
+  `charts/paje/templates/configmap.yaml`,
+  `charts/paje/templates/deployment.yaml`,
+  `charts/paje/templates/secret.yaml`, `charts/paje/templates/NOTES.txt`,
+  `charts/paje/templates/_helpers.tpl`, and `charts/paje/render_test.go` only.
+- Acceptance: `PW-AC01`, `PW-AC02`, and `PW-AC03`; the product task removes
+  the retired `_helpers.tpl` source for `.Values.adapters.runner` and
+  `.Values.codexAuth`, proves the standard rendered `codex-go@1` profile live,
+  and makes no current/support claim before that proof.
+- `execution_placement`: isolated product-acceptance worktree on a Linux Docker
+  host with disposable repositories and test-owned resources.
+- `parallelism_primitive`: `persistent_session`.
+- `placement_rationale`: long, credential-sensitive live acceptance and broad
+  but exclusive product-surface mutation require restartable isolation.
+- `capability_requirements`: local production Docker workflow, standard
+  `codex-go@1`, opt-in Codex auth, site/Helm toolchains; GitHub publication is
+  not required and no push/release authority is granted.
+- `lifecycle_owner`: parent control task.
+- `fallback`: missing live prerequisites leaves `PW-AC01..PW-AC03` unverified
+  and blocks support claims and promotion; no acceptance-only workaround.
+- `promotion_trigger`: `none`.
+
+#### PW-12R — independent product/security/live review
+
+- Dependencies: terminal candidate from `PW-12` with raw live evidence.
+- Owned paths: none; read-only review of candidate, logs, stores, and resource
+  cleanup evidence with secret values redacted.
+- Acceptance: independently confirms standard-profile live execution,
+  coordinator `SIGKILL` recovery, unrelated-run progress, raw/base64 secret
+  denial across every durable boundary, truthful product claims, Helm source
+  retirement, and no leaked resource.
+- `execution_placement`: bounded isolated review runtime.
+- `parallelism_primitive`: `ephemeral_subagent`.
+- `placement_rationale`: security/live evidence needs independent scrutiny but
+  no writer authority.
+- `capability_requirements`: read-only candidate and redacted live evidence;
+  no secret acquisition or mutation.
+- `lifecycle_owner`: parent control task.
+- `fallback`: parent-local independent read-only security review; unavailable
+  evidence blocks rather than passes; the fallback closes with terminal
+  evidence plus an inactive local-work marker.
+- `promotion_trigger`: if the bounded review grows into long or mutating work,
+  stop at a verified read-only checkpoint and hand off to a distinct
+  `persistent_session` writer with exact exclusive ownership.
+
+#### PW-FINAL — combined gate, publication readiness, cleanup, and close-check
+
+- Dependencies: integrated `PW-12` after accepted `PW-12R`, and terminal
+  dispositions for every canonical portable node.
+- Owned paths: none during validation; any correction is dispatched back to
+  the single owning writer as a new reviewed candidate.
+- Acceptance: dynamically enumerates every stable requirement ID and canonical
+  node disposition, runs combined/security/live gates, proves primitive-
+  specific close evidence, verifies cleanup and publication readiness, and
+  records unavailable optional gates as unverified rather than passing.
+- `execution_placement`: parent integration worktree.
+- `parallelism_primitive`: `local_sequential`.
+- `placement_rationale`: final integration, conflict, security, publication,
+  cleanup, and lifecycle accounting share authoritative state.
+- `capability_requirements`: integrated repository, all required local/live
+  tools and evidence; publication authority remains separately explicit.
+- `lifecycle_owner`: parent control task.
+- `fallback`: reopen the exact owning node; never patch across ownership or
+  close with nonzero/unknown pending work.
+- `promotion_trigger`: `none`.
 
 ## Agent Control Plane Placement Contract
 
-The production Agent Control Plane must not copy the fixed five-session layout.
+The production Agent Control Plane must not copy the retired historical session layout.
 For every task it negotiates the current harness capability set and selects
 exactly one provider-neutral primitive:
 
@@ -723,10 +883,13 @@ type Document struct {
 
 Bound JSON to 1 MiB, disallow unknown fields and trailing values, require the
 fixed workspace and secret roots, validate every executable/argument/key/path,
-read environment secret files after container start, unlink the document and
-environment files, change to the validated directory, and call
-`syscall.Exec` directly. Tests execute a helper binary and assert argv/env,
-file removal, malformed input denial, and no shell expansion.
+and read environment secret files after container start. `PW-EX03` supersedes
+the historical direct-`syscall.Exec` instruction: the final helper is a
+no-shell PID 1 supervisor that unlinks transient material, starts the declared
+child, publishes the bound receipt only after post-success OS observation,
+forwards signals, reaps descendants, and returns the exact child exit status.
+Tests execute a helper binary and assert argv/env, receipt binding, signal/exit
+fidelity, file removal, malformed input denial, and no shell expansion.
 
 - [ ] **Step 5: Run, format, and commit Task 4**
 
@@ -1180,6 +1343,10 @@ ID/digest, image digest/platform, harness ID/version, tool probe outcomes,
 generic lifecycle flags, exit/duration/truncation, safe environment key names,
 and verification results. Reject any artifact or diagnostic containing a
 detector match, provider/source value, engine detail, or ephemeral host path.
+Record confirmed attempt identity/generation separately from each attempt's
+presented-key names, and derive top-level key unions from confirmed child-start
+receipts only; a confirmed attempt with zero non-baseline keys remains an
+explicit confirmed-empty attempt.
 
 - [ ] **Step 6: Run the workflow, artifact, policy, race, and fencing gates**
 
@@ -1229,6 +1396,24 @@ func TestPublishVerifiesPersistedProfileBeforeCredentials(t *testing.T) {
     }
 }
 ```
+
+Persist or derive confirmed verification-attempt identities separately from
+their presented-key union. Add the complete `PW-PU01` table before production
+changes:
+
+| Case | Confirmed attempts | Presented-key union | Expected |
+| --- | --- | --- | --- |
+| no attempt | frozen plan requires zero | empty | accept |
+| confirmed-empty | exact child-start receipt | empty | accept |
+| confirmed-nonempty | exact child-start receipt | exact nonempty union | accept |
+| partial | exact receipts | missing derived key | reject |
+| extra | exact receipts | unpresented key | reject |
+| inverse | receipt facts and claimed confirmation disagree | any | reject |
+| drift | attempt identity/generation or keys differ from receipts | any | reject |
+
+An empty union never proves that no verification child ran. Missing confirmed-
+attempt evidence fails when verification was required or receipts prove a child
+started.
 
 - [ ] **Step 2: Run publisher tests and confirm they fail**
 
@@ -1358,6 +1543,7 @@ git commit -m "feat: compose portable worker execution"
 - Modify: `charts/paje/templates/deployment.yaml`
 - Modify: `charts/paje/templates/secret.yaml`
 - Modify: `charts/paje/templates/NOTES.txt`
+- Modify: `charts/paje/templates/_helpers.tpl`
 - Modify: `charts/paje/render_test.go`
 - Create: `internal/acceptance/worker_isolation_test.go`
 - Create: `internal/acceptance/worker_restart_test.go`
@@ -1398,7 +1584,9 @@ not execute code-change workloads until a Kubernetes Job executor exists and
 never mounts a Docker socket. Document profile/binding ownership, revisioning,
 rotation, environment-delivery risks, Docker host/VM topology, host-development
 limits, cleanup/recovery, image build/publish/digest rendering, and support
-matrix semantics.
+matrix semantics. Remove the retired `_helpers.tpl` validation source that
+still references `.Values.adapters.runner` or `.Values.codexAuth`; no rendered
+or dead template path may retain either source.
 
 - [ ] **Step 4: Add the full adversarial and live acceptance gates**
 
@@ -1412,14 +1600,22 @@ attempt resources. A deliberate coordinator interruption must prove created
 non-start retry, running ambiguity, cancellation confirmation, checkpoint
 authority, and no agent rerun.
 
+The coordinator case uses a real process `SIGKILL` and production restart
+recovery: a conclusive pre-child case retries, a persisted child-start receipt
+becomes ambiguity with no rerun, and an unrelated simultaneous ControlRun keeps
+making progress. Inject raw and base64 variants through the production broker/
+workflow and prove denial by Git capture, change policy, run store, and artifact
+store with no durable bytes or resources.
+
 - [ ] **Step 5: Run a real Codex disposable-repository acceptance**
 
-With `PAJE_CODEX_ACCEPTANCE=1` and `PAJE_DOCKER_ACCEPTANCE=1`, build/push the
-workload to a temporary local registry, render the exact digest/platform
-profile, bind a disposable Codex auth directory, run a real code change, verify
-in a fresh secret-free sandbox, reproduce the exact Git tree from the artifact,
-and assert source/sibling/engine/secret/descendant cleanup. Skip with an explicit
-prerequisite message when auth is unavailable; never print or persist auth.
+With `PAJE_CODEX_ACCEPTANCE=1` and `PAJE_DOCKER_ACCEPTANCE=1`, use the standard
+rendered production `codex-go@1` profile without an acceptance-only command,
+image, path, secret, or runtime override. Bind a disposable Codex auth
+directory, run a real code change, verify in a fresh secret-free sandbox,
+reproduce the exact Git tree from the artifact, and assert source/sibling/
+engine/secret/descendant cleanup. Missing auth is explicit unverified evidence
+and blocks current/support claims; never print or persist auth.
 
 - [ ] **Step 6: Run all final gates**
 
@@ -1456,28 +1652,30 @@ git commit -m "docs: publish portable worker support"
 
 ## Final Portable-Runtime Control-Task Verification
 
-After integrating and archiving all five worker sessions, the control task must:
+`PW-FINAL` is local-sequential and dynamically derives its gate from the
+stable requirement index and canonical registry. It must:
 
-1. confirm `git status --short` is empty and inspect every integrated commit;
-2. run every Task 12 final gate available in the local environment;
-3. inspect Docker for any Pajé-labeled containers, networks, or volumes left by
-   acceptance and remove only exact test-owned resources after confirming their
-   labels;
-4. review the implementation bidirectionally against all seventeen design
-   acceptance criteria;
-5. run a fresh security-focused diff review of profile, secret, executor,
-   workflow, publisher, image, and chart boundaries;
-6. record unavailable credential-backed gates as explicit unverified evidence,
-   never as passing;
-7. use `superpowers:finishing-a-development-branch` to present integration
-   options only after all required local gates pass; and
-8. verify the consumer Agent Control Plane tests every required placement
-   field, the concrete Codex primitive mapping, subagent-to-session promotion,
-   missing-capability fallback, concurrency limits, and overlapping mutable
-   subagent denial, plus durable attempts and primitive-specific close evidence
-   for persistent sessions, ephemeral subagents, native fan-out, and local
-   sequential work; and
-9. mark this portable-runtime implementation goal complete only when the
-   specification is fully implemented, no worker task remains active, and no
-   required work remains. Do not present this lower-layer completion as proof
-   that the separate Agent Control Plane runtime is complete.
+1. confirm clean Git state and inspect every accepted integrated commit and
+   independent review disposition;
+2. enumerate every `PW-EX*`, `PW-WS*`, `PW-EN*`, `PW-SC*`, `PW-H*`, `PW-EV*`,
+   `PW-PU*`, and `PW-AC*` requirement; reject missing, duplicate, stale, or
+   unverified required evidence;
+3. run all combined, race, vet, cross-build, site, chart, Docker, standard
+   `codex-go@1`, coordinator-restart, unrelated-run, and secret-denial gates;
+4. inspect Docker for Pajé-labeled containers, networks, or volumes and remove
+   only exact test-owned resources after confirming their labels;
+5. run a fresh independent security review of profile, secret, executor,
+   workflow, artifact, publisher, image, docs, site, and chart boundaries;
+6. require primitive-specific close evidence: archive receipts for every
+   persistent writer, runtime-close receipts for every ephemeral review, exact
+   terminal aggregation/cancel evidence for any native fan-out, and an inactive
+   marker for local-sequential work;
+7. require a terminal disposition for every registry node and a typed pending-
+   work gate with no active, unknown, deferred-without-wakeup, or unreviewed
+   entry; record optional credential-backed gates as unverified, never passing;
+8. reopen the exact owning writer for every correction, then repeat its
+   independent review and integration gate; and
+9. declare the portable lower execution plane complete only after all required
+   evidence and cleanup are conclusive. This is not evidence that the separate
+   Agent Control Plane or the full Pajé product is complete, and publication
+   still requires explicit authority.
