@@ -86,6 +86,18 @@ func TestCanonicalizeUsesCanonicalJSONAndDefensiveCopies(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeRequiresSecretBindingRevision(t *testing.T) {
+	profile := validOCIProfile()
+	if got, err := Canonicalize(profile); err != nil || got.Secrets[0].BindingRevision != 7 {
+		t.Fatalf("Canonicalize() binding revision = %d, %v, want 7", got.Secrets[0].BindingRevision, err)
+	}
+
+	profile.Secrets[0].BindingRevision = 0
+	if _, err := Canonicalize(profile); err == nil {
+		t.Fatal("zero secret binding revision was accepted")
+	}
+}
+
 func TestSnapshotClonePreservesSliceShapeAndDoesNotAlias(t *testing.T) {
 	t.Run("nil slices", func(t *testing.T) {
 		clone := (Snapshot{}).Clone()
@@ -103,7 +115,7 @@ func TestSnapshotClonePreservesSliceShapeAndDoesNotAlias(t *testing.T) {
 
 	t.Run("nested values", func(t *testing.T) {
 		original := Snapshot{
-			Tools: []Tool{{Probe: Probe{Args: []string{"version"}}}},
+			Tools:   []Tool{{Probe: Probe{Args: []string{"version"}}}},
 			Secrets: []SecretRequirement{{Capability: "workload.token"}},
 		}
 		clone := original.Clone()
@@ -199,7 +211,7 @@ func TestHostProfileIsSecretFreeAndDeclaresNoUnenforceableOCISettings(t *testing
 		"resources": func(p *Snapshot) { p.Resources.CPUMillis = 1 },
 		"secrets": func(p *Snapshot) {
 			p.Secrets = []SecretRequirement{{
-				Capability: "harness.codex-auth", Stage: StageAgent,
+				Capability: "harness.codex-auth", BindingRevision: 1, Stage: StageAgent,
 				Delivery: DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
 			}}
 		},
@@ -230,8 +242,8 @@ func validOCIProfile() Snapshot {
 			{Name: "go", Version: "1.26.1", Probe: Probe{Executable: "go", Args: []string{"version"}, OutputContains: "go1.26.1"}},
 		},
 		Secrets: []SecretRequirement{
-			{Capability: "workload.api-token", Stage: StageAgent, Delivery: DeliveryEnvironment, Target: "WORKLOAD_API_TOKEN", Required: true},
-			{Capability: "harness.codex-auth", Stage: StageAgent, Delivery: DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true},
+			{Capability: "workload.api-token", BindingRevision: 11, Stage: StageAgent, Delivery: DeliveryEnvironment, Target: "WORKLOAD_API_TOKEN", Required: true},
+			{Capability: "harness.codex-auth", BindingRevision: 7, Stage: StageAgent, Delivery: DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true},
 		},
 	}
 }

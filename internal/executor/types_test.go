@@ -358,7 +358,7 @@ func validOCIRequest(t *testing.T) Request {
 			Probe: workerprofile.Probe{Executable: "go", Args: []string{"version"}, OutputContains: "go1.26.1"},
 		}},
 		Secrets: []workerprofile.SecretRequirement{{
-			Capability: "harness.codex-auth", Stage: workerprofile.StageAgent,
+			Capability: "harness.codex-auth", BindingRevision: 1, Stage: workerprofile.StageAgent,
 			Delivery: workerprofile.DeliveryFile, Target: "/run/paje/secrets/codex-auth.json", Required: true,
 		}},
 	}

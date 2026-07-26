@@ -64,11 +64,12 @@ type Tool struct {
 }
 
 type SecretRequirement struct {
-	Capability string `json:"capability" yaml:"capability"`
-	Stage      string `json:"stage" yaml:"stage"`
-	Delivery   string `json:"delivery" yaml:"delivery"`
-	Target     string `json:"target" yaml:"target"`
-	Required   bool   `json:"required" yaml:"required"`
+	Capability      string `json:"capability" yaml:"capability"`
+	BindingRevision uint64 `json:"binding_revision" yaml:"binding_revision"`
+	Stage           string `json:"stage" yaml:"stage"`
+	Delivery        string `json:"delivery" yaml:"delivery"`
+	Target          string `json:"target" yaml:"target"`
+	Required        bool   `json:"required" yaml:"required"`
 }
 
 // Snapshot is the normalized, safe, durable worker profile contract. Digest

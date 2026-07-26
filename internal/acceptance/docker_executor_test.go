@@ -536,11 +536,12 @@ process.stdout.write(process.env.WORKLOAD_API_TOKEN);
 	t.Run("oversized bootstrap archive fails closed", func(t *testing.T) {
 		target := newLiveDockerExecutor(t, worker)
 		requirement := workerprofile.SecretRequirement{
-			Capability: "workload.api-token",
-			Stage:      workerprofile.StageAgent,
-			Delivery:   workerprofile.DeliveryEnvironment,
-			Target:     "WORKLOAD_API_TOKEN",
-			Required:   true,
+			Capability:      "workload.api-token",
+			BindingRevision: 1,
+			Stage:           workerprofile.StageAgent,
+			Delivery:        workerprofile.DeliveryEnvironment,
+			Target:          "WORKLOAD_API_TOKEN",
+			Required:        true,
 		}
 		profile := worker.profile.Clone()
 		profile.Secrets = []workerprofile.SecretRequirement{requirement}
@@ -787,18 +788,20 @@ func newSecretLiveRequest(t *testing.T, worker publishedWorker) (executor.Reques
 	t.Helper()
 	requirements := []workerprofile.SecretRequirement{
 		{
-			Capability: "harness.codex-auth",
-			Stage:      workerprofile.StageAgent,
-			Delivery:   workerprofile.DeliveryDirectory,
-			Target:     "/run/paje/secrets/codex",
-			Required:   true,
+			Capability:      "harness.codex-auth",
+			BindingRevision: 1,
+			Stage:           workerprofile.StageAgent,
+			Delivery:        workerprofile.DeliveryDirectory,
+			Target:          "/run/paje/secrets/codex",
+			Required:        true,
 		},
 		{
-			Capability: "workload.api-token",
-			Stage:      workerprofile.StageAgent,
-			Delivery:   workerprofile.DeliveryEnvironment,
-			Target:     "WORKLOAD_API_TOKEN",
-			Required:   true,
+			Capability:      "workload.api-token",
+			BindingRevision: 2,
+			Stage:           workerprofile.StageAgent,
+			Delivery:        workerprofile.DeliveryEnvironment,
+			Target:          "WORKLOAD_API_TOKEN",
+			Required:        true,
 		},
 	}
 	profile := worker.profile.Clone()

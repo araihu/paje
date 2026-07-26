@@ -607,7 +607,7 @@ func validAcquireRequest(deadline time.Time) AcquireRequest {
 		ProfileID:  workerprofile.ProfileID{Name: "codex-go", Revision: 1},
 		Capability: "workload.api-token", Binding: 3,
 		Delivery: workerprofile.SecretRequirement{
-			Capability: "workload.api-token", Stage: workerprofile.StageAgent,
+			Capability: "workload.api-token", BindingRevision: 3, Stage: workerprofile.StageAgent,
 			Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN", Required: true,
 		},
 		Deadline: deadline,

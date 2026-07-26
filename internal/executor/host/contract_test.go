@@ -79,7 +79,7 @@ func secretRequest(t *testing.T) executor.Request {
 	t.Helper()
 	request := helperRequest(t, "complete")
 	requirement := workerprofile.SecretRequirement{
-		Capability: "workload.token", Stage: workerprofile.StageAgent,
+		Capability: "workload.token", BindingRevision: 1, Stage: workerprofile.StageAgent,
 		Delivery: workerprofile.DeliveryFile, Target: "/run/paje/secrets/token", Required: true,
 	}
 	request.Profile = ociProfile(t, []workerprofile.SecretRequirement{requirement})

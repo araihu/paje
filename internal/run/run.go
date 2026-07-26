@@ -18,7 +18,9 @@ import (
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/publisher"
+	"github.com/araihu/paje/internal/secret"
 	"github.com/araihu/paje/internal/template"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 var (
@@ -103,27 +105,29 @@ type ArtifactWriteLease struct {
 }
 
 type Record struct {
-	ID                 string              `json:"id"`
-	Version            uint64              `json:"version"`
-	Template           template.ID         `json:"template"`
-	IdempotencyKey     string              `json:"idempotency_key,omitempty"`
-	InputHash          string              `json:"input_hash"`
-	Input              json.RawMessage     `json:"input"`
-	Status             Status              `json:"status"`
-	PublicationMode    string              `json:"publication_mode"`
-	RepositoryURI      string              `json:"repository_uri"`
-	BaseRef            string              `json:"base_ref"`
-	BaseSHA            string              `json:"base_sha,omitempty"`
-	MemorySnapshot     []memory.Memory     `json:"memory_snapshot,omitempty"`
-	ArtifactWriteLease *ArtifactWriteLease `json:"artifact_write_lease,omitempty"`
-	Artifact           *artifact.Reference `json:"artifact,omitempty"`
-	Approval           *approval.Result    `json:"approval,omitempty"`
-	Publication        *publisher.Result   `json:"publication,omitempty"`
-	OutcomeMemorySaved bool                `json:"outcome_memory_saved"`
-	Stages             []StageResult       `json:"stages"`
-	Failure            *Failure            `json:"failure,omitempty"`
-	CreatedAt          time.Time           `json:"created_at"`
-	UpdatedAt          time.Time           `json:"updated_at"`
+	ID                 string                  `json:"id"`
+	Version            uint64                  `json:"version"`
+	Template           template.ID             `json:"template"`
+	IdempotencyKey     string                  `json:"idempotency_key,omitempty"`
+	InputHash          string                  `json:"input_hash"`
+	Input              json.RawMessage         `json:"input"`
+	Status             Status                  `json:"status"`
+	PublicationMode    string                  `json:"publication_mode"`
+	RepositoryURI      string                  `json:"repository_uri"`
+	BaseRef            string                  `json:"base_ref"`
+	BaseSHA            string                  `json:"base_sha,omitempty"`
+	WorkerProfile      *workerprofile.Snapshot `json:"worker_profile,omitempty"`
+	SecretBindings     []secret.BindingRef     `json:"secret_bindings,omitempty"`
+	MemorySnapshot     []memory.Memory         `json:"memory_snapshot,omitempty"`
+	ArtifactWriteLease *ArtifactWriteLease     `json:"artifact_write_lease,omitempty"`
+	Artifact           *artifact.Reference     `json:"artifact,omitempty"`
+	Approval           *approval.Result        `json:"approval,omitempty"`
+	Publication        *publisher.Result       `json:"publication,omitempty"`
+	OutcomeMemorySaved bool                    `json:"outcome_memory_saved"`
+	Stages             []StageResult           `json:"stages"`
+	Failure            *Failure                `json:"failure,omitempty"`
+	CreatedAt          time.Time               `json:"created_at"`
+	UpdatedAt          time.Time               `json:"updated_at"`
 }
 
 type Reservation struct {
@@ -258,6 +262,13 @@ func CloneRecord(source Record) Record {
 			cloned.MemorySnapshot[index] = item
 			cloned.MemorySnapshot[index].Metadata = cloneMap(item.Metadata)
 		}
+	}
+	if source.WorkerProfile != nil {
+		value := source.WorkerProfile.Clone()
+		cloned.WorkerProfile = &value
+	}
+	if source.SecretBindings != nil {
+		cloned.SecretBindings = append([]secret.BindingRef(nil), source.SecretBindings...)
 	}
 	if source.Artifact != nil {
 		value := *source.Artifact

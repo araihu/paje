@@ -2,6 +2,8 @@ package runfilesystem_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -18,7 +20,9 @@ import (
 	"github.com/araihu/paje/internal/run"
 	runfilesystem "github.com/araihu/paje/internal/run/filesystem"
 	runmock "github.com/araihu/paje/internal/run/mock"
+	"github.com/araihu/paje/internal/secret"
 	"github.com/araihu/paje/internal/template"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 func TestReserveIsIdempotentAndDetectsHashConflict(t *testing.T) {
@@ -224,6 +228,72 @@ func TestSaveUsesCompareAndSwapAndReopensNestedRecord(t *testing.T) {
 	}
 }
 
+func TestFilesystemStoreRoundTripsResolvedWorkerProfileAndBindings(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := runfilesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := validReservation("run-resolved", "hash")
+	reservation.Input, err = run.CanonicalInput(json.RawMessage(`{
+		"task_description":"change",
+		"repository_uri":"https://example.test/repo.git",
+		"base_ref":"main",
+		"tags":{"app_id":"araihu-paje","user_id":"guilhermecastro"},
+		"worker_profile":"codex-go@1",
+		"profile":"go",
+		"publication":{"mode":"pull_request","provider":"github","target_branch":"main"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(reservation.Input)
+	reservation.InputHash = hex.EncodeToString(sum[:])
+	record, _, err := store.Reserve(context.Background(), reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := run.Transition(record, run.StatusResolving, record.UpdatedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err = run.UpsertStage(next, run.StageResult{
+		Name: "resolve", Status: run.StageRunning,
+		StartedAt: next.UpdatedAt, Attempts: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolving, err := store.Save(context.Background(), next, record.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next = withResolvedStateJSON(t, resolving)
+	saved, err := store.Save(context.Background(), next, resolving.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := runfilesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := reopened.Load(context.Background(), saved.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"worker_profile", "secret_bindings"} {
+		if !strings.Contains(string(encoded), `"`+field+`"`) {
+			t.Fatalf("filesystem round trip omitted %q: %s", field, encoded)
+		}
+	}
+}
+
 func TestBlankIdempotencyKeyCreatesDistinctCallerRunIDsWithoutIndex(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -338,4 +408,47 @@ func removeOnlyIndexFile(t *testing.T, root string) {
 	if err := os.Remove(filepath.Join(directory, entries[0].Name())); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func withResolvedStateJSON(t *testing.T, record run.Record) run.Record {
+	t.Helper()
+	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
+		APIVersion: workerprofile.APIVersionV1Alpha1,
+		Kind:       workerprofile.KindWorkerProfile,
+		Metadata:   workerprofile.ProfileID{Name: "codex-go", Revision: 1},
+		Runtime: workerprofile.Runtime{
+			Kind: workerprofile.RuntimeOCI, Image: "example.test/worker@sha256:" + strings.Repeat("a", 64),
+			Platform: "linux/amd64", Network: workerprofile.NetworkNone, ReadOnlyRoot: true,
+		},
+		Resources: workerprofile.Resources{CPUMillis: 1000, MemoryBytes: 1 << 30, PIDs: 64},
+		Harness:   workerprofile.Harness{ID: "codex", Version: "0.144.5"},
+		Secrets: []workerprofile.SecretRequirement{{
+			Capability: "harness.codex-auth", BindingRevision: 1, Stage: workerprofile.StageAgent,
+			Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["worker_profile"] = profile
+	fields["secret_bindings"] = []secret.BindingRef{{
+		Capability: "harness.codex-auth", Revision: 1,
+	}}
+	encoded, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result run.Record
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }

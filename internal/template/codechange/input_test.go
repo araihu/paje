@@ -14,6 +14,7 @@ func TestDecodeMinimalInput(t *testing.T) {
   "repository_uri": "https://github.com/araihu/paje.git",
   "base_ref": "main",
   "tags": {"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+  "worker_profile": "codex-go@1",
   "profile": "go",
   "publication": {"mode": "artifact"}
 }`))
@@ -34,6 +35,7 @@ func TestDecodeDefaultsAndRejectsExtraJSON(t *testing.T) {
   "repository_uri": "https://github.com/araihu/paje.git",
   "base_ref": "main",
   "tags": {"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+  "worker_profile": "codex-go@1",
   "checks": [{"name":"go test","executable":"go","timeout":"1m"}]
 }`))
 	if err != nil {
@@ -54,6 +56,7 @@ func TestDecodePreservesExplicitZeroMemoryLimit(t *testing.T) {
   "repository_uri": "https://github.com/araihu/paje.git",
   "base_ref": "main",
   "tags": {"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+  "worker_profile": "codex-go@1",
   "profile": "go",
   "memory_limit": 0
 }`))
@@ -65,12 +68,66 @@ func TestDecodePreservesExplicitZeroMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestDecodeRequiresExactWorkerProfileAndRejectsEnvironmentKeys(t *testing.T) {
+	valid := map[string]any{
+		"task_description": "update the parser",
+		"repository_uri":   "https://github.com/araihu/paje.git",
+		"base_ref":         "main",
+		"tags":             map[string]any{"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+		"worker_profile":   "codex-go@1",
+		"profile":          "go",
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "missing", mutate: func(value map[string]any) { delete(value, "worker_profile") }},
+		{name: "bare name", mutate: func(value map[string]any) { value["worker_profile"] = "codex-go" }},
+		{name: "legacy environment keys", mutate: func(value map[string]any) {
+			value["environment_keys"] = []string{"TOKEN"}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := clone(valid)
+			test.mutate(value)
+			raw, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := codechange.Decode(raw); err == nil {
+				t.Fatal("Decode() accepted non-exact worker profile input")
+			}
+		})
+	}
+
+	raw, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := codechange.Decode(raw)
+	if err != nil {
+		t.Fatalf("Decode(exact worker profile) error = %v", err)
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["worker_profile"] != "codex-go@1" {
+		t.Fatalf("worker_profile = %#v, want codex-go@1", fields["worker_profile"])
+	}
+}
+
 func TestDecodeRejectsInvalidInput(t *testing.T) {
 	valid := map[string]any{
 		"task_description": "update the parser",
 		"repository_uri":   "https://github.com/araihu/paje.git",
 		"base_ref":         "main",
 		"tags":             map[string]any{"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+		"worker_profile":   "codex-go@1",
 		"checks": []any{map[string]any{
 			"name": "go test", "executable": "go", "args": []any{"test", "./..."}, "timeout": "1m",
 		}},
@@ -88,6 +145,10 @@ func TestDecodeRejectsInvalidInput(t *testing.T) {
 		{name: "blank user tag", mutate: func(v map[string]any) { v["tags"] = map[string]any{"user_id": " ", "app_id": "araihu-paje"} }},
 		{name: "missing app tag", mutate: func(v map[string]any) { v["tags"] = map[string]any{"user_id": "guilhermecastro"} }},
 		{name: "blank app tag", mutate: func(v map[string]any) { v["tags"] = map[string]any{"user_id": "guilhermecastro", "app_id": " "} }},
+		{name: "missing worker profile", mutate: func(v map[string]any) { delete(v, "worker_profile") }},
+		{name: "bare worker profile", mutate: func(v map[string]any) { v["worker_profile"] = "codex-go" }},
+		{name: "floating worker profile", mutate: func(v map[string]any) { v["worker_profile"] = "codex-go@latest" }},
+		{name: "padded worker profile", mutate: func(v map[string]any) { v["worker_profile"] = " codex-go@1 " }},
 		{name: "negative memory limit", mutate: func(v map[string]any) { v["memory_limit"] = -1 }},
 		{name: "large memory limit", mutate: func(v map[string]any) { v["memory_limit"] = 1001 }},
 		{name: "shell fragment", mutate: func(v map[string]any) {
@@ -117,8 +178,7 @@ func TestDecodeRejectsInvalidInput(t *testing.T) {
 			v["publication"] = map[string]any{"mode": "pull_request", "provider": "github"}
 		}},
 		{name: "unsupported publication", mutate: func(v map[string]any) { v["publication"] = map[string]any{"mode": "merge"} }},
-		{name: "environment key contains equals", mutate: func(v map[string]any) { v["environment_keys"] = []any{"SAFE=value"} }},
-		{name: "duplicate environment key", mutate: func(v map[string]any) { v["environment_keys"] = []any{"SAFE", "SAFE"} }},
+		{name: "environment keys are unknown", mutate: func(v map[string]any) { v["environment_keys"] = []any{"SAFE"} }},
 	}
 
 	for _, tt := range tests {
@@ -141,7 +201,7 @@ func TestDefinitionValidatesInput(t *testing.T) {
 	if definition.ID() != codechange.ID {
 		t.Fatalf("Definition.ID() = %#v", definition.ID())
 	}
-	if err := definition.Validate(json.RawMessage(`{"task_description":"task","repository_uri":"repo","base_ref":"main","tags":{"user_id":"user","app_id":"app"},"checks":[{"name":"check","executable":"go","timeout":"1m"}]}`)); err != nil {
+	if err := definition.Validate(json.RawMessage(`{"task_description":"task","repository_uri":"repo","base_ref":"main","tags":{"user_id":"user","app_id":"app"},"worker_profile":"codex-go@1","checks":[{"name":"check","executable":"go","timeout":"1m"}]}`)); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -70,11 +70,14 @@ func TestExecuteUsesFreshRealWorktreeAndPersistsCompleteArtifact(t *testing.T) {
 	mem := &recordingMemory{result: []memory.Memory{{ID: "memory-1", Content: "Keep the public API stable"}}}
 	runs := runmock.NewStore()
 	artifacts := artifactmock.NewStore()
+	workerProfiles, secretBindings, executors, harnesses, _, _ := portableRuntimeDependencies(t)
 	service, err := New(Dependencies{
 		Templates: registry, Runs: runs, Memory: mem, Resolver: manager,
 		Workspaces: manager, Profiles: map[string]repository.Profile{
 			"generic": profile, "go": &fakeProfile{name: "go"},
 		},
+		WorkerProfiles: workerProfiles, SecretBindings: secretBindings,
+		Executors: executors, Harnesses: harnesses,
 		Environments: envPolicy, Agent: agent, Verifier: verifier,
 		Capturer: capturer, Policy: changePolicy, Artifacts: artifacts,
 		Publisher: publishermock.NewPublisher(structPublisherResult(), nil),
@@ -1406,8 +1409,9 @@ func rawForRepository(repositoryURI string) json.RawMessage {
 	value := map[string]any{
 		"idempotency_key": "real-worktree", "task_description": "Add changed.txt",
 		"repository_uri": repositoryURI, "base_ref": "HEAD",
-		"tags":    map[string]string{"user_id": "guilhermecastro", "app_id": "araihu-paje"},
-		"profile": "generic",
+		"tags":           map[string]string{"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+		"worker_profile": "codex-go@1",
+		"profile":        "generic",
 		"checks": []map[string]any{{
 			"name": "git status", "directory": ".", "executable": "git",
 			"args": []string{"status", "--short"}, "timeout": "1m", "required": true,

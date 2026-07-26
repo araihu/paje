@@ -82,7 +82,7 @@ func profileWithHarness(t *testing.T, id, version, capability string) workerprof
 	}
 	if capability != "" {
 		profile.Secrets = []workerprofile.SecretRequirement{{
-			Capability: capability, Stage: workerprofile.StageAgent,
+			Capability: capability, BindingRevision: 1, Stage: workerprofile.StageAgent,
 			Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
 		}}
 	}

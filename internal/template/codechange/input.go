@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/araihu/paje/internal/repository"
 	"github.com/araihu/paje/internal/template"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 const defaultMemoryLimit = 10
@@ -28,11 +28,15 @@ type Input struct {
 	MemoryQuery      string                       `json:"memory_query,omitempty"`
 	MemoryLimit      int                          `json:"memory_limit,omitempty"`
 	Tags             map[string]string            `json:"tags,omitempty"`
+	WorkerProfile    string                       `json:"worker_profile"`
 	Profile          string                       `json:"profile,omitempty"`
 	Checks           []verification.CommandSpec   `json:"checks,omitempty"`
 	ModuleExclusions []repository.ModuleExclusion `json:"module_exclusions,omitempty"`
-	EnvironmentKeys  []string                     `json:"environment_keys,omitempty"`
-	Publication      Publication                  `json:"publication,omitempty"`
+	// EnvironmentKeys remains an internal zero-value bridge until Task 9
+	// replaces the legacy Execute implementation. It is not part of the wire
+	// contract, so strict decoding rejects environment_keys as unknown.
+	EnvironmentKeys []string    `json:"-"`
+	Publication     Publication `json:"publication,omitempty"`
 }
 
 // Publication describes the requested durable output mode.
@@ -111,6 +115,11 @@ func normalizeAndValidate(input Input, memoryLimitSet bool) (Input, error) {
 	if err := normalizeTags(input.Tags); err != nil {
 		return Input{}, err
 	}
+	workerProfileID, err := workerprofile.ParseProfileID(input.WorkerProfile)
+	if err != nil {
+		return Input{}, fmt.Errorf("decode code-change@v1 input: worker profile must be an exact name@revision reference: %w", err)
+	}
+	input.WorkerProfile = workerProfileID.String()
 	if input.Profile == "" {
 		input.Profile = "generic"
 	}
@@ -133,9 +142,6 @@ func normalizeAndValidate(input Input, memoryLimitSet bool) (Input, error) {
 		input.Checks[index].Timeout = strings.TrimSpace(check.Timeout)
 	}
 	if err := normalizeModuleExclusions(input.ModuleExclusions); err != nil {
-		return Input{}, err
-	}
-	if err := normalizeEnvironmentKeys(&input.EnvironmentKeys); err != nil {
 		return Input{}, err
 	}
 	if input.Publication.Mode == "" {
@@ -176,22 +182,5 @@ func normalizeModuleExclusions(exclusions []repository.ModuleExclusion) error {
 		}
 		seen[exclusions[index].Path] = struct{}{}
 	}
-	return nil
-}
-
-func normalizeEnvironmentKeys(keys *[]string) error {
-	seen := make(map[string]struct{}, len(*keys))
-	for index, key := range *keys {
-		key = strings.TrimSpace(key)
-		if key == "" || strings.ContainsRune(key, '=') || strings.IndexByte(key, 0) >= 0 {
-			return fmt.Errorf("decode code-change@v1 input: invalid environment key %q", key)
-		}
-		if _, exists := seen[key]; exists {
-			return fmt.Errorf("decode code-change@v1 input: duplicate environment key %q", key)
-		}
-		seen[key] = struct{}{}
-		(*keys)[index] = key
-	}
-	sort.Strings(*keys)
 	return nil
 }

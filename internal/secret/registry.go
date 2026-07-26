@@ -95,7 +95,8 @@ type Registry interface {
 
 func (binding Binding) Authorizes(request ResolveRequest) bool {
 	return request.Ref == binding.ref && request.ProfileID == binding.authorization.ProfileID &&
-		request.Requirement.Capability == binding.ref.Capability && request.Requirement.Required &&
+		request.Requirement.Capability == binding.ref.Capability &&
+		request.Requirement.BindingRevision == binding.ref.Revision && request.Requirement.Required &&
 		request.Requirement.Stage == binding.authorization.Stage &&
 		request.Requirement.Delivery == binding.authorization.Delivery &&
 		request.Requirement.Target == binding.authorization.Target

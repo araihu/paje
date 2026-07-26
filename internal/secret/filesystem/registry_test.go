@@ -41,6 +41,9 @@ func TestResolveRequiresExactAuthorizationTuple(t *testing.T) {
 		"stage":    func(r *secret.ResolveRequest) { r.Requirement.Stage = "verification" },
 		"delivery": func(r *secret.ResolveRequest) { r.Requirement.Delivery = workerprofile.DeliveryFile },
 		"target":   func(r *secret.ResolveRequest) { r.Requirement.Target = "/run/paje/secrets/other" },
+		"binding revision": func(r *secret.ResolveRequest) {
+			r.Requirement.BindingRevision++
+		},
 		"optional": func(r *secret.ResolveRequest) { r.Requirement.Required = false },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -203,7 +206,7 @@ func resolveRequest(capability string, revision uint64, delivery, target string)
 		ProfileID: workerprofile.ProfileID{Name: "codex-go", Revision: 1},
 		Ref:       secret.BindingRef{Capability: capability, Revision: revision},
 		Requirement: workerprofile.SecretRequirement{
-			Capability: capability, Stage: workerprofile.StageAgent,
+			Capability: capability, BindingRevision: revision, Stage: workerprofile.StageAgent,
 			Delivery: delivery, Target: target, Required: true,
 		},
 	}

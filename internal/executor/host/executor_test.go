@@ -137,7 +137,7 @@ func TestHostRejectsOCISecretsAndProductionMode(t *testing.T) {
 	}
 	request = hostRequest(t)
 	request.Profile = ociProfile(t, []workerprofile.SecretRequirement{{
-		Capability: "workload.token", Stage: workerprofile.StageAgent,
+		Capability: "workload.token", BindingRevision: 1, Stage: workerprofile.StageAgent,
 		Delivery: workerprofile.DeliveryFile, Target: "/run/paje/secrets/token", Required: true,
 	}})
 	request.Secrets = []secret.Materialization{materialization}

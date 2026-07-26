@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,9 @@ import (
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	artifactmock "github.com/araihu/paje/internal/artifact/mock"
 	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	executormock "github.com/araihu/paje/internal/executor/mock"
+	"github.com/araihu/paje/internal/harness"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/policy"
 	"github.com/araihu/paje/internal/publisher"
@@ -24,9 +29,12 @@ import (
 	"github.com/araihu/paje/internal/run"
 	runmock "github.com/araihu/paje/internal/run/mock"
 	"github.com/araihu/paje/internal/runner"
+	"github.com/araihu/paje/internal/secret"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
+	workerprofilemock "github.com/araihu/paje/internal/workerprofile/mock"
 	"github.com/araihu/paje/internal/workspace"
 )
 
@@ -221,40 +229,117 @@ func TestResolveRejectsDirtyLocalSourceAndPersistsFailure(t *testing.T) {
 	}
 }
 
-func TestResolveValidatesCapabilitiesAndCleansRuntimeBeforeMemory(t *testing.T) {
+func TestResolvePersistsWorkerProfileAndBindingsBeforeMemoryWithoutLegacyCapabilityBuild(t *testing.T) {
 	fixture := newServiceFixture(t)
 	var events []string
 	fixture.env.events = &events
-	fixture.mem.onSearch = func() { events = append(events, "memory") }
+	fixture.mem.onSearch = func() {
+		events = append(events, "memory")
+		record, err := fixture.runs.Load(context.Background(), "run-123")
+		if err != nil {
+			t.Fatalf("Load() during memory lookup error = %v", err)
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"worker_profile", "secret_bindings"} {
+			if !bytes.Contains(encoded, []byte(`"`+field+`"`)) {
+				t.Fatalf("memory lookup observed unresolved record missing %q: %s", field, encoded)
+			}
+		}
+	}
 
-	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "capabilities")); err != nil {
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "resolved-profile")); err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
-	if got, want := strings.Join(events, ","), "build:agent,build:verification,cleanup,memory"; got != want {
+	if got, want := strings.Join(events, ","), "memory"; got != want {
 		t.Fatalf("event order = %q, want %q", got, want)
 	}
-	if fixture.env.cleanupCalls != 1 {
-		t.Fatalf("environment cleanup calls = %d, want 1", fixture.env.cleanupCalls)
+	if fixture.env.cleanupCalls != 0 {
+		t.Fatalf("legacy environment cleanup calls = %d, want 0", fixture.env.cleanupCalls)
+	}
+	if got := len(fixture.workerProfiles.Requests()); got != 1 {
+		t.Fatalf("worker profile registry requests = %d, want 1", got)
+	}
+	if got := len(fixture.secretBindings.Requests()); got != 1 {
+		t.Fatalf("secret binding registry requests = %d, want 1", got)
+	}
+	request := fixture.secretBindings.Requests()[0]
+	if request.ProfileID.Revision != 1 || request.Requirement.BindingRevision != 7 ||
+		request.Ref.Revision != 7 {
+		t.Fatalf("secret binding request = %#v, want profile revision 1 and binding revision 7", request)
+	}
+	resolved, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved.SecretBindings) != 1 || resolved.SecretBindings[0].Revision != 7 {
+		t.Fatalf("persisted secret bindings = %#v, want revision 7", resolved.SecretBindings)
+	}
+	if got := len(fixture.executor.Requests()); got != 0 {
+		t.Fatalf("executor requests during Resolve = %d, want 0", got)
+	}
+	if probe, agent, parse := fixture.harness.ExecutionCalls(); probe != 0 || agent != 0 || parse != 0 {
+		t.Fatalf("harness execution calls during Resolve = probe %d agent %d parse %d", probe, agent, parse)
 	}
 }
 
-func TestResolveCapabilityFailureCleansAndStopsBeforeMemory(t *testing.T) {
+func TestResolveReusesPersistedWorkerProfileAndBindingsAfterMemoryFailure(t *testing.T) {
+	fixture := newServiceFixture(t)
+	fixture.mem.err = errors.New("memory offline")
+	raw := validRawInput("Change docs", "resolved-profile-memory-retry")
+
+	first, err := fixture.service.Resolve(context.Background(), raw)
+	if err == nil || first.Status != run.StatusResolving || !first.Retryable {
+		t.Fatalf("Resolve(first) result=%#v error=%v", first, err)
+	}
+	persisted, loadErr := fixture.runs.Load(context.Background(), first.RunID)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if persisted.WorkerProfile == nil || len(persisted.SecretBindings) != 1 {
+		t.Fatalf("retryable memory failure lost resolved state: %#v", persisted)
+	}
+
+	fixture.workerProfiles.SetError(
+		persisted.WorkerProfile.Metadata,
+		errors.New("registry unavailable after durable resolution"),
+	)
+	fixture.secretBindings.err = errors.New("binding unavailable after durable resolution")
+	fixture.mem.err = nil
+	second, err := fixture.service.Resolve(context.Background(), raw)
+	if err != nil || second.Status != run.StatusExecuting {
+		t.Fatalf("Resolve(second) result=%#v error=%v", second, err)
+	}
+	if got := len(fixture.workerProfiles.Requests()); got != 1 {
+		t.Fatalf("worker profile registry requests = %d, want persisted resolution reuse", got)
+	}
+	if got := len(fixture.secretBindings.Requests()); got != 1 {
+		t.Fatalf("secret binding registry requests = %d, want persisted resolution reuse", got)
+	}
+	reloaded, loadErr := fixture.runs.Load(context.Background(), second.RunID)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if !reflect.DeepEqual(reloaded.WorkerProfile, persisted.WorkerProfile) ||
+		!reflect.DeepEqual(reloaded.SecretBindings, persisted.SecretBindings) {
+		t.Fatal("resolved worker state changed across memory retry")
+	}
+}
+
+func TestResolveBindingFailureStopsBeforeMemoryAndDoesNotLeakRegistryDiagnostic(t *testing.T) {
 	fixture := newServiceFixture(t)
 	var events []string
 	fixture.env.events = &events
 	fixture.mem.onSearch = func() { events = append(events, "memory") }
-	fixture.env.build = func(_ context.Context, request environment.Request) (environment.Result, error) {
-		if request.Stage == environment.StageVerification {
-			return environment.Result{}, errors.New("denied secret-value")
-		}
-		return environment.Result{Values: map[string]string{"PATH": "/bin", "CODEX_HOME": "/codex"}}, nil
-	}
+	fixture.secretBindings.err = fmt.Errorf("denied secret-value: %w", secret.ErrBindingUnauthorized)
 
 	result, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "capability-failure"))
 	if err == nil || result.FailureClass != run.FailurePolicy || result.Retryable {
 		t.Fatalf("Resolve() result=%#v error=%v", result, err)
 	}
-	if got, want := strings.Join(events, ","), "build:agent,build:verification,cleanup"; got != want {
+	if got, want := strings.Join(events, ","), ""; got != want {
 		t.Fatalf("event order = %q, want %q", got, want)
 	}
 	if fixture.mem.calls != 0 {
@@ -264,6 +349,25 @@ func TestResolveCapabilityFailureCleansAndStopsBeforeMemory(t *testing.T) {
 	encoded, _ := json.Marshal(record)
 	if strings.Contains(string(encoded), "secret-value") {
 		t.Fatalf("durable failure leaked capability error: %s", encoded)
+	}
+}
+
+func TestResolveInvalidCanonicalWorkerProfileResponseHasSafeCause(t *testing.T) {
+	fixture := newServiceFixture(t)
+	profile := resolvedWorkerProfile(t)
+	profile.Digest = ""
+	fixture.workerProfiles.Set(profile)
+
+	result, err := fixture.service.Resolve(
+		context.Background(),
+		validRawInput("Change docs", "invalid-profile-response"),
+	)
+	if err == nil || result.FailureClass != run.FailureInternal || result.Retryable {
+		t.Fatalf("Resolve() result=%#v error=%v", result, err)
+	}
+	cause := errors.Unwrap(err)
+	if cause == nil || cause.Error() != "worker profile registry response failed exact validation" {
+		t.Fatalf("Resolve() cause = %v, want safe exact-validation error", cause)
 	}
 }
 
@@ -461,7 +565,11 @@ func TestNewRejectsMissingDependenciesAndCopiesProfiles(t *testing.T) {
 				"generic": fixture.service.profiles["generic"],
 				"go":      fixture.service.profiles["go"],
 			},
-			Environments: fixture.service.environments, Agent: fixture.service.agent,
+			WorkerProfiles: fixture.service.workerProfiles,
+			SecretBindings: fixture.service.secretBindings,
+			Executors:      fixture.service.executors,
+			Harnesses:      fixture.service.harnesses,
+			Environments:   fixture.service.environments, Agent: fixture.service.agent,
 			Verifier: fixture.service.verifier, Capturer: fixture.service.capturer,
 			Policy: fixture.service.policy, Artifacts: fixture.service.artifacts,
 			Publisher: fixture.service.publisher, Clock: fixture.service.clock,
@@ -479,6 +587,10 @@ func TestNewRejectsMissingDependenciesAndCopiesProfiles(t *testing.T) {
 		{"workspaces", func(d *Dependencies) { d.Workspaces = nil }},
 		{"generic profile", func(d *Dependencies) { delete(d.Profiles, "generic") }},
 		{"go profile", func(d *Dependencies) { delete(d.Profiles, "go") }},
+		{"worker profiles", func(d *Dependencies) { d.WorkerProfiles = nil }},
+		{"secret bindings", func(d *Dependencies) { d.SecretBindings = nil }},
+		{"executors", func(d *Dependencies) { d.Executors = nil }},
+		{"harnesses", func(d *Dependencies) { d.Harnesses = nil }},
 		{"environments", func(d *Dependencies) { d.Environments = nil }},
 		{"agent", func(d *Dependencies) { d.Agent = nil }},
 		{"verifier", func(d *Dependencies) { d.Verifier = nil }},
@@ -541,6 +653,7 @@ func validRawInput(task, key string) json.RawMessage {
 		"repository_uri":   "https://example.test/repository.git",
 		"base_ref":         "refs/heads/main",
 		"tags":             map[string]string{"user_id": "guilhermecastro", "app_id": "araihu-paje"},
+		"worker_profile":   "codex-go@1",
 		"profile":          "generic",
 		"checks": []map[string]any{{
 			"name": "git status", "directory": ".", "executable": "git",
@@ -553,18 +666,22 @@ func validRawInput(task, key string) json.RawMessage {
 }
 
 type serviceFixture struct {
-	service    *Service
-	runs       *recordingRunStore
-	resolver   *recordingResolver
-	mem        *recordingMemory
-	profile    *fakeProfile
-	env        *fakeEnvironment
-	agent      *fakeAgent
-	verifier   *fakeVerifier
-	capturer   *fakeCapturer
-	policy     *fakePolicy
-	artifacts  *artifactmock.Store
-	workspaces *fakeWorkspaceManager
+	service        *Service
+	runs           *recordingRunStore
+	resolver       *recordingResolver
+	mem            *recordingMemory
+	profile        *fakeProfile
+	workerProfiles *workerprofilemock.Registry
+	secretBindings *recordingSecretRegistry
+	executor       *executormock.Executor
+	harness        *recordingHarness
+	env            *fakeEnvironment
+	agent          *fakeAgent
+	verifier       *fakeVerifier
+	capturer       *fakeCapturer
+	policy         *fakePolicy
+	artifacts      *artifactmock.Store
+	workspaces     *fakeWorkspaceManager
 }
 
 func newServiceFixture(t *testing.T) *serviceFixture {
@@ -574,6 +691,8 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		t.Fatal(err)
 	}
 	profile := &fakeProfile{name: "generic"}
+	workerProfiles, secretBindings, executorRegistry, harnessRegistry, targetExecutor, targetHarness :=
+		portableRuntimeDependencies(t)
 	fixture := &serviceFixture{
 		runs: &recordingRunStore{Store: runmock.NewStore()},
 		resolver: &recordingResolver{revision: repository.Revision{
@@ -581,32 +700,40 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 			Ref:           "refs/heads/main",
 			SHA:           "0123456789012345678901234567890123456789",
 		}},
-		mem:        &recordingMemory{},
-		profile:    profile,
-		env:        &fakeEnvironment{},
-		agent:      &fakeAgent{},
-		verifier:   &fakeVerifier{},
-		capturer:   &fakeCapturer{},
-		policy:     &fakePolicy{decision: policy.Decision{Allowed: true}},
-		artifacts:  artifactmock.NewStore(),
-		workspaces: &fakeWorkspaceManager{},
+		mem:            &recordingMemory{},
+		profile:        profile,
+		workerProfiles: workerProfiles,
+		secretBindings: secretBindings,
+		executor:       targetExecutor,
+		harness:        targetHarness,
+		env:            &fakeEnvironment{},
+		agent:          &fakeAgent{},
+		verifier:       &fakeVerifier{},
+		capturer:       &fakeCapturer{},
+		policy:         &fakePolicy{decision: policy.Decision{Allowed: true}},
+		artifacts:      artifactmock.NewStore(),
+		workspaces:     &fakeWorkspaceManager{},
 	}
 	fixture.service, err = New(Dependencies{
-		Templates:    registry,
-		Runs:         fixture.runs,
-		Memory:       fixture.mem,
-		Resolver:     fixture.resolver,
-		Workspaces:   fixture.workspaces,
-		Profiles:     map[string]repository.Profile{"generic": profile, "go": &fakeProfile{name: "go"}},
-		Environments: fixture.env,
-		Agent:        fixture.agent,
-		Verifier:     fixture.verifier,
-		Capturer:     fixture.capturer,
-		Policy:       fixture.policy,
-		Artifacts:    fixture.artifacts,
-		Publisher:    publishermock.NewPublisher(publisher.Result{}, nil),
-		Clock:        func() time.Time { return time.Unix(100, 0).UTC() },
-		NewID:        func() string { return "run-123" },
+		Templates:      registry,
+		Runs:           fixture.runs,
+		Memory:         fixture.mem,
+		Resolver:       fixture.resolver,
+		Workspaces:     fixture.workspaces,
+		Profiles:       map[string]repository.Profile{"generic": profile, "go": &fakeProfile{name: "go"}},
+		WorkerProfiles: workerProfiles,
+		SecretBindings: secretBindings,
+		Executors:      executorRegistry,
+		Harnesses:      harnessRegistry,
+		Environments:   fixture.env,
+		Agent:          fixture.agent,
+		Verifier:       fixture.verifier,
+		Capturer:       fixture.capturer,
+		Policy:         fixture.policy,
+		Artifacts:      fixture.artifacts,
+		Publisher:      publishermock.NewPublisher(publisher.Result{}, nil),
+		Clock:          func() time.Time { return time.Unix(100, 0).UTC() },
+		NewID:          func() string { return "run-123" },
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -699,6 +826,74 @@ func (m *recordingMemory) Search(_ context.Context, _ string, _ int, _ map[strin
 }
 
 func (m *recordingMemory) Save(context.Context, string, map[string]string) error { return nil }
+
+type recordingSecretRegistry struct {
+	mu       sync.Mutex
+	binding  secret.Binding
+	err      error
+	requests []secret.ResolveRequest
+}
+
+func (registry *recordingSecretRegistry) Resolve(
+	ctx context.Context,
+	request secret.ResolveRequest,
+) (secret.Binding, error) {
+	if err := ctx.Err(); err != nil {
+		return secret.Binding{}, err
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.requests = append(registry.requests, request)
+	if registry.err != nil {
+		return secret.Binding{}, registry.err
+	}
+	if !registry.binding.Authorizes(request) {
+		return secret.Binding{}, secret.ErrBindingUnauthorized
+	}
+	return registry.binding, nil
+}
+
+func (registry *recordingSecretRegistry) Requests() []secret.ResolveRequest {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	return append([]secret.ResolveRequest(nil), registry.requests...)
+}
+
+type recordingHarness struct {
+	mu         sync.Mutex
+	probeCalls int
+	agentCalls int
+	parseCalls int
+}
+
+func (*recordingHarness) ID() string      { return "codex" }
+func (*recordingHarness) Version() string { return "0.144.5" }
+func (adapter *recordingHarness) Probe() executor.Command {
+	adapter.mu.Lock()
+	adapter.probeCalls++
+	adapter.mu.Unlock()
+	return executor.Command{}
+}
+func (adapter *recordingHarness) AgentCommand(string) (executor.Command, error) {
+	adapter.mu.Lock()
+	adapter.agentCalls++
+	adapter.mu.Unlock()
+	return executor.Command{}, nil
+}
+func (adapter *recordingHarness) Parse(executor.Result) (string, error) {
+	adapter.mu.Lock()
+	adapter.parseCalls++
+	adapter.mu.Unlock()
+	return "", nil
+}
+func (*recordingHarness) AcceptsCapability(capability string) bool {
+	return capability == "harness.codex-auth"
+}
+func (adapter *recordingHarness) ExecutionCalls() (int, int, int) {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	return adapter.probeCalls, adapter.agentCalls, adapter.parseCalls
+}
 
 type fakeProfile struct {
 	name   string
@@ -818,6 +1013,72 @@ func cloneTestMemories(source []memory.Memory) []memory.Memory {
 		}
 	}
 	return cloned
+}
+
+func portableRuntimeDependencies(
+	t *testing.T,
+) (
+	*workerprofilemock.Registry,
+	*recordingSecretRegistry,
+	*executor.Registry,
+	*harness.Registry,
+	*executormock.Executor,
+	*recordingHarness,
+) {
+	t.Helper()
+	profile := resolvedWorkerProfile(t)
+	workerProfiles := workerprofilemock.NewRegistry(profile)
+	ref := secret.BindingRef{
+		Capability: profile.Secrets[0].Capability,
+		Revision:   profile.Secrets[0].BindingRevision,
+	}
+	binding, err := secret.NewBinding(ref, secret.Authorization{
+		ProfileID: profile.Metadata,
+		Stage:     profile.Secrets[0].Stage,
+		Delivery:  profile.Secrets[0].Delivery,
+		Target:    profile.Secrets[0].Target,
+	}, "filesystem", "/etc/paje/secrets/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretBindings := &recordingSecretRegistry{binding: binding}
+	targetExecutor := executormock.New()
+	executors, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeOCI,
+		Executor:    targetExecutor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetHarness := &recordingHarness{}
+	harnesses, err := harness.NewRegistry(targetHarness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return workerProfiles, secretBindings, executors, harnesses, targetExecutor, targetHarness
+}
+
+func resolvedWorkerProfile(t *testing.T) workerprofile.Snapshot {
+	t.Helper()
+	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
+		APIVersion: workerprofile.APIVersionV1Alpha1,
+		Kind:       workerprofile.KindWorkerProfile,
+		Metadata:   workerprofile.ProfileID{Name: "codex-go", Revision: 1},
+		Runtime: workerprofile.Runtime{
+			Kind: workerprofile.RuntimeOCI, Image: "example.test/worker@sha256:" + strings.Repeat("a", 64),
+			Platform: "linux/amd64", Network: workerprofile.NetworkNone, ReadOnlyRoot: true,
+		},
+		Resources: workerprofile.Resources{CPUMillis: 1000, MemoryBytes: 1 << 30, PIDs: 64},
+		Harness:   workerprofile.Harness{ID: "codex", Version: "0.144.5"},
+		Secrets: []workerprofile.SecretRequirement{{
+			Capability: "harness.codex-auth", BindingRevision: 7, Stage: workerprofile.StageAgent,
+			Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return profile
 }
 
 type mutableClock struct {

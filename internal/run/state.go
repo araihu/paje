@@ -2,12 +2,14 @@ package run
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
 
 	"github.com/araihu/paje/internal/artifact"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 func Validate(record Record) error {
@@ -56,6 +58,9 @@ func Validate(record Record) error {
 		return invalidRecord("artifact run ID differs from record")
 	}
 	if err := validateArtifactWriteLease(record); err != nil {
+		return err
+	}
+	if err := validateResolvedProfile(record); err != nil {
 		return err
 	}
 	if record.Approval != nil {
@@ -361,9 +366,23 @@ func UpsertStage(record Record, result StageResult) (Record, error) {
 }
 
 func validateMonotonicEvidence(current, next Record) error {
+	if current.WorkerProfile == nil && next.WorkerProfile != nil {
+		currentResolve, currentFound := latestStage(current.Stages, "resolve")
+		nextResolve, nextFound := latestStage(next.Stages, "resolve")
+		if current.Status != StatusResolving || !currentFound || !nextFound ||
+			currentResolve.Status != StageRunning || nextResolve.Status != StageRunning ||
+			currentResolve.Attempts != nextResolve.Attempts ||
+			!currentResolve.StartedAt.Equal(nextResolve.StartedAt) {
+			return invalidRecord("resolved worker profile attachment requires the active resolve attempt")
+		}
+	}
 	switch {
 	case current.BaseSHA != "" && next.BaseSHA != current.BaseSHA:
 		return invalidRecord("base SHA is write-once")
+	case current.WorkerProfile != nil &&
+		(!reflect.DeepEqual(current.WorkerProfile, next.WorkerProfile) ||
+			!reflect.DeepEqual(current.SecretBindings, next.SecretBindings)):
+		return invalidRecord("resolved worker profile and bindings are write-once")
 	case (current.BaseSHA != "" || current.MemorySnapshot != nil) &&
 		!reflect.DeepEqual(current.MemorySnapshot, next.MemorySnapshot):
 		return invalidRecord("memory snapshot is write-once")
@@ -562,6 +581,10 @@ func validateTerminalUpdate(current, next Record) error {
 		return invalidRecord("terminal status is immutable")
 	case current.BaseSHA != next.BaseSHA:
 		return invalidRecord("terminal base SHA is immutable")
+	case !reflect.DeepEqual(current.WorkerProfile, next.WorkerProfile):
+		return invalidRecord("terminal worker profile is immutable")
+	case !reflect.DeepEqual(current.SecretBindings, next.SecretBindings):
+		return invalidRecord("terminal secret bindings are immutable")
 	case !reflect.DeepEqual(current.MemorySnapshot, next.MemorySnapshot):
 		return invalidRecord("terminal memory snapshot is immutable")
 	case !reflect.DeepEqual(current.Artifact, next.Artifact):
@@ -735,4 +758,85 @@ func validStageStatus(status StageStatus) bool {
 
 func stageFinished(stage StageResult) bool {
 	return stage.Status != StageRunning && !stage.FinishedAt.IsZero()
+}
+
+func validateResolvedProfile(record Record) error {
+	inputProfile, inputHasProfile, err := inputWorkerProfileID(record.Input)
+	if err != nil {
+		return err
+	}
+	if record.WorkerProfile == nil {
+		if record.SecretBindings != nil {
+			return invalidRecord("secret bindings require a resolved worker profile")
+		}
+		if inputHasProfile && resolvedProfileRequired(record) {
+			return invalidRecord("resolved run status requires a worker profile snapshot")
+		}
+		return nil
+	}
+	if !inputHasProfile {
+		return invalidRecord("resolved worker profile lacks canonical input binding")
+	}
+	if record.Status == StatusPending {
+		return invalidRecord("pending run cannot contain resolved worker state")
+	}
+	canonical, err := workerprofile.Canonicalize(record.WorkerProfile.Clone())
+	if err != nil || !reflect.DeepEqual(canonical, *record.WorkerProfile) {
+		return invalidRecord("worker profile snapshot is not exact and canonical")
+	}
+	if canonical.Metadata != inputProfile {
+		return invalidRecord("worker profile snapshot identity differs from input")
+	}
+	if len(record.SecretBindings) != len(canonical.Secrets) {
+		return invalidRecord("secret bindings differ from declared capabilities")
+	}
+	seen := make(map[string]struct{}, len(record.SecretBindings))
+	for index, requirement := range canonical.Secrets {
+		binding := record.SecretBindings[index]
+		if binding.Capability != requirement.Capability ||
+			binding.Revision != requirement.BindingRevision {
+			return invalidRecord("secret binding differs from declared capability")
+		}
+		if _, duplicate := seen[binding.Capability]; duplicate {
+			return invalidRecord("duplicate secret capability binding")
+		}
+		seen[binding.Capability] = struct{}{}
+	}
+	return nil
+}
+
+func inputWorkerProfileID(input json.RawMessage) (workerprofile.ProfileID, bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(input, &fields); err != nil {
+		return workerprofile.ProfileID{}, false, invalidRecord("input must be a JSON object")
+	}
+	raw, exists := fields["worker_profile"]
+	if !exists {
+		return workerprofile.ProfileID{}, false, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return workerprofile.ProfileID{}, false, invalidRecord("worker profile input is invalid")
+	}
+	id, err := workerprofile.ParseProfileID(value)
+	if err != nil || id.String() != value {
+		return workerprofile.ProfileID{}, false, invalidRecord("worker profile input is not exact")
+	}
+	return id, true, nil
+}
+
+func resolvedProfileRequired(record Record) bool {
+	if record.BaseSHA != "" {
+		return true
+	}
+	switch record.Status {
+	case StatusExecuting, StatusAwaitingApproval, StatusPublishing, StatusSucceeded, StatusDeclined:
+		return true
+	}
+	for _, stage := range record.Stages {
+		if stage.Name == "resolve" && stage.Status == StageSucceeded {
+			return true
+		}
+	}
+	return false
 }

@@ -82,11 +82,15 @@ func TestServiceArtifactOnlyRealGitFlowReloadsFilesystemStores(t *testing.T) {
 		now = now.Add(time.Second)
 		return now
 	}
+	workerProfiles, secretBindings, executors, harnesses, _, _ :=
+		portableRuntimeDependencies(t)
 	dependencies := Dependencies{
 		Templates: registry, Runs: runs, Memory: outcomes, Resolver: manager,
 		Workspaces: manager, Profiles: map[string]repository.Profile{
 			"generic": profile, "go": &fakeProfile{name: "go"},
 		},
+		WorkerProfiles: workerProfiles, SecretBindings: secretBindings,
+		Executors: executors, Harnesses: harnesses,
 		Environments: envPolicy, Agent: agent, Verifier: verifier,
 		Capturer: capturer, Policy: changePolicy, Artifacts: artifacts,
 		Publisher: pub, Clock: clock, NewID: func() string { return "run-real" },

@@ -235,6 +235,7 @@ tools:
       output_contains: go1.26.1
 secrets:
   - capability: harness.codex-auth
+    binding_revision: 1
     stage: agent
     delivery: directory
     target: /run/paje/secrets/codex

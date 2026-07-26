@@ -606,11 +606,12 @@ func TestWorkerProfileAndSecretBindingExamples(t *testing.T) {
 		t.Fatalf("load example secret binding: %v", err)
 	}
 	requirement := workerprofile.SecretRequirement{
-		Capability: "harness.codex-auth",
-		Stage:      workerprofile.StageAgent,
-		Delivery:   workerprofile.DeliveryDirectory,
-		Target:     "/run/paje/secrets/codex",
-		Required:   true,
+		Capability:      "harness.codex-auth",
+		BindingRevision: 1,
+		Stage:           workerprofile.StageAgent,
+		Delivery:        workerprofile.DeliveryDirectory,
+		Target:          "/run/paje/secrets/codex",
+		Required:        true,
 	}
 	binding, err := bindings.Resolve(context.Background(), secret.ResolveRequest{
 		ProfileID: profile.Metadata,

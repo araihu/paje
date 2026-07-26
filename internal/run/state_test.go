@@ -1,6 +1,8 @@
 package run
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -12,7 +14,9 @@ import (
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/publisher"
+	"github.com/araihu/paje/internal/secret"
 	"github.com/araihu/paje/internal/template"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 func TestTransitionAcceptsLegalStateChanges(t *testing.T) {
@@ -201,6 +205,159 @@ func TestPrepareSavePreservesWriteOnceEvidenceAndTerminalRecords(t *testing.T) {
 	next.Stages = append(next.Stages, StageResult{Name: "late", Status: StageRunning, StartedAt: now, Attempts: 1})
 	if _, err := PrepareSave(terminal, next); err == nil {
 		t.Fatal("PrepareSave() accepted post-terminal mutation")
+	}
+}
+
+func TestResolvedProfileAndBindingsAreWriteOnce(t *testing.T) {
+	t.Parallel()
+	current := resolvedProfileRecord(t)
+
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "profile content", mutate: func(fields map[string]any) {
+			fields["worker_profile"].(map[string]any)["digest"] = strings.Repeat("f", 64)
+		}},
+		{name: "binding revision", mutate: func(fields map[string]any) {
+			fields["secret_bindings"].([]any)[0].(map[string]any)["revision"] = float64(2)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			next := mutateRecordJSON(t, current, test.mutate)
+			if _, err := PrepareSave(current, next); err == nil {
+				t.Fatal("PrepareSave() accepted rewritten resolved state")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsResolvedProfileAndBindingsOnPending(t *testing.T) {
+	t.Parallel()
+	record := resolvedProfileRecord(t)
+	record.Status = StatusPending
+
+	if err := Validate(record); err == nil {
+		t.Fatal("Validate() accepted resolved worker state on pending run")
+	}
+}
+
+func TestPrepareSaveRequiresActiveResolveAttemptForFirstResolvedProfileAttachment(t *testing.T) {
+	t.Parallel()
+	resolved := resolvedProfileRecord(t)
+	unresolved := CloneRecord(resolved)
+	unresolved.WorkerProfile = nil
+	unresolved.SecretBindings = nil
+
+	t.Run("missing attempt", func(t *testing.T) {
+		if _, err := PrepareSave(unresolved, resolved); err == nil {
+			t.Fatal("PrepareSave() attached resolved worker state without resolve attempt")
+		}
+	})
+
+	failure := Failure{
+		Stage: "resolve", Class: FailureInternal, Retryable: true,
+		Diagnostic: "worker lost", CauseCode: "worker_lost",
+	}
+	finished := CloneRecord(unresolved)
+	finished.Stages = []StageResult{{
+		Name: "resolve", Status: StageFailed,
+		StartedAt: finished.UpdatedAt, FinishedAt: finished.UpdatedAt.Add(time.Second),
+		Attempts: 1, Failure: &failure,
+	}}
+	finished.UpdatedAt = finished.UpdatedAt.Add(time.Second)
+	finishedNext := CloneRecord(resolved)
+	finishedNext.Stages = CloneRecord(finished).Stages
+	finishedNext.UpdatedAt = finished.UpdatedAt
+	t.Run("finished attempt", func(t *testing.T) {
+		if _, err := PrepareSave(finished, finishedNext); err == nil {
+			t.Fatal("PrepareSave() attached resolved worker state after resolve attempt finished")
+		}
+	})
+
+	active := CloneRecord(unresolved)
+	active.Stages = []StageResult{{
+		Name: "resolve", Status: StageRunning,
+		StartedAt: active.UpdatedAt, Attempts: 1,
+	}}
+	activeNext := CloneRecord(resolved)
+	activeNext.Stages = append(CloneRecord(active).Stages, StageResult{
+		Name: "resolve", Status: StageRunning,
+		StartedAt: active.UpdatedAt.Add(time.Second), Attempts: 2,
+	})
+	activeNext.UpdatedAt = active.UpdatedAt.Add(time.Second)
+	t.Run("different next attempt", func(t *testing.T) {
+		if _, err := PrepareSave(active, activeNext); err == nil {
+			t.Fatal("PrepareSave() attached resolved worker state to a different resolve attempt")
+		}
+	})
+
+	matching := CloneRecord(resolved)
+	matching.Stages = CloneRecord(active).Stages
+	if _, err := PrepareSave(active, matching); err != nil {
+		t.Fatalf("PrepareSave() rejected attachment by active resolve attempt: %v", err)
+	}
+}
+
+func TestCloneRecordDeepClonesResolvedWorkerProfileAndBindings(t *testing.T) {
+	t.Parallel()
+	record := resolvedProfileRecord(t)
+	cloned := CloneRecord(record)
+
+	cloned.WorkerProfile.Secrets[0].Target = "/run/paje/secrets/other"
+	cloned.SecretBindings[0].Revision = 2
+
+	if got := record.WorkerProfile.Secrets[0].Target; got != "/run/paje/secrets/codex" {
+		t.Fatalf("source worker profile target = %q after clone mutation", got)
+	}
+	if got := record.SecretBindings[0].Revision; got != 7 {
+		t.Fatalf("source binding revision = %d after clone mutation", got)
+	}
+}
+
+func TestValidateResolvedProfileAndBindingBindsCanonicalInput(t *testing.T) {
+	t.Parallel()
+	valid := resolvedProfileRecord(t)
+	encoded, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"worker_profile", "secret_bindings"} {
+		if !strings.Contains(string(encoded), `"`+field+`"`) {
+			t.Fatalf("resolved record omitted %q: %s", field, encoded)
+		}
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "snapshot ID differs from input", mutate: func(fields map[string]any) {
+			fields["worker_profile"].(map[string]any)["metadata"].(map[string]any)["name"] = "other"
+		}},
+		{name: "snapshot digest differs from content", mutate: func(fields map[string]any) {
+			fields["worker_profile"].(map[string]any)["digest"] = strings.Repeat("f", 64)
+		}},
+		{name: "binding missing", mutate: func(fields map[string]any) {
+			fields["secret_bindings"] = []any{}
+		}},
+		{name: "binding capability differs", mutate: func(fields map[string]any) {
+			fields["secret_bindings"].([]any)[0].(map[string]any)["capability"] = "workload.other"
+		}},
+		{name: "binding revision differs", mutate: func(fields map[string]any) {
+			fields["secret_bindings"].([]any)[0].(map[string]any)["revision"] = float64(8)
+		}},
+		{name: "binding duplicated", mutate: func(fields map[string]any) {
+			binding := fields["secret_bindings"].([]any)[0]
+			fields["secret_bindings"] = []any{binding, binding}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := mutateRecordJSON(t, valid, test.mutate)
+			if err := Validate(record); err == nil {
+				t.Fatal("Validate() accepted broken resolved binding")
+			}
+		})
 	}
 }
 
@@ -775,4 +932,80 @@ func withFinalize(record Record) Record {
 func withOutcomeSaved(record Record) Record {
 	record.OutcomeMemorySaved = true
 	return record
+}
+
+func resolvedProfileRecord(t *testing.T) Record {
+	t.Helper()
+	record := validRecord(StatusResolving)
+	input, err := CanonicalInput(json.RawMessage(`{
+		"task_description":"change",
+		"repository_uri":"https://example.test/repo.git",
+		"base_ref":"main",
+		"tags":{"app_id":"araihu-paje","user_id":"guilhermecastro"},
+		"worker_profile":"codex-go@1",
+		"profile":"go",
+		"publication":{"mode":"pull_request","provider":"github","target_branch":"main"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Input = input
+	sum := sha256.Sum256(input)
+	record.InputHash = hex.EncodeToString(sum[:])
+
+	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
+		APIVersion: workerprofile.APIVersionV1Alpha1,
+		Kind:       workerprofile.KindWorkerProfile,
+		Metadata:   workerprofile.ProfileID{Name: "codex-go", Revision: 1},
+		Runtime: workerprofile.Runtime{
+			Kind: workerprofile.RuntimeOCI, Image: "example.test/worker@sha256:" + strings.Repeat("a", 64),
+			Platform: "linux/amd64", Network: workerprofile.NetworkNone, ReadOnlyRoot: true,
+		},
+		Resources: workerprofile.Resources{CPUMillis: 1000, MemoryBytes: 1 << 30, PIDs: 64},
+		Harness:   workerprofile.Harness{ID: "codex", Version: "0.144.5"},
+		Secrets: []workerprofile.SecretRequirement{{
+			Capability: "harness.codex-auth", BindingRevision: 7, Stage: workerprofile.StageAgent,
+			Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := mutateRecordJSON(t, record, func(fields map[string]any) {
+		fields["worker_profile"] = profile
+		fields["secret_bindings"] = []secret.BindingRef{{
+			Capability: "harness.codex-auth", Revision: 7,
+		}}
+	})
+	encoded, err := json.Marshal(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"worker_profile"`) ||
+		!strings.Contains(string(encoded), `"secret_bindings"`) {
+		t.Fatalf("run.Record did not retain resolved state: %s", encoded)
+	}
+	return resolved
+}
+
+func mutateRecordJSON(t *testing.T, record Record, mutate func(map[string]any)) Record {
+	t.Helper()
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	mutate(fields)
+	encoded, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Record
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }

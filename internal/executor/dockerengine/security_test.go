@@ -306,15 +306,15 @@ func secretDockerRequest(t *testing.T) executor.Request {
 	t.Helper()
 	requirements := []workerprofile.SecretRequirement{
 		{
-			Capability: "workload.file", Stage: workerprofile.StageAgent,
+			Capability: "workload.file", BindingRevision: 1, Stage: workerprofile.StageAgent,
 			Delivery: workerprofile.DeliveryFile, Target: "/run/paje/secrets/token", Required: true,
 		},
 		{
-			Capability: "workload.directory", Stage: workerprofile.StageAgent,
+			Capability: "workload.directory", BindingRevision: 2, Stage: workerprofile.StageAgent,
 			Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
 		},
 		{
-			Capability: "workload.environment", Stage: workerprofile.StageAgent,
+			Capability: "workload.environment", BindingRevision: 3, Stage: workerprofile.StageAgent,
 			Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN", Required: true,
 		},
 	}

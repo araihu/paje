@@ -14,15 +14,19 @@ import (
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/harness"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/policy"
 	"github.com/araihu/paje/internal/publisher"
 	"github.com/araihu/paje/internal/repository"
 	"github.com/araihu/paje/internal/run"
 	"github.com/araihu/paje/internal/runner"
+	"github.com/araihu/paje/internal/secret"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
 	"github.com/araihu/paje/internal/workspace"
 )
 
@@ -46,21 +50,25 @@ var ErrRunBinding = errors.New("durable run binding mismatch")
 // Dependencies is the complete provider-neutral port bundle used by the
 // code-change service.
 type Dependencies struct {
-	Templates    *template.Registry
-	Runs         run.Store
-	Memory       memory.Store
-	Resolver     repository.Resolver
-	Workspaces   workspace.Manager
-	Profiles     map[string]repository.Profile
-	Environments environment.Builder
-	Agent        runner.Runner
-	Verifier     verification.Runner
-	Capturer     gitcapture.Capturer
-	Policy       policy.Evaluator
-	Artifacts    artifact.Store
-	Publisher    publisher.Publisher
-	Clock        func() time.Time
-	NewID        func() string
+	Templates      *template.Registry
+	Runs           run.Store
+	Memory         memory.Store
+	Resolver       repository.Resolver
+	Workspaces     workspace.Manager
+	Profiles       map[string]repository.Profile
+	WorkerProfiles workerprofile.Registry
+	SecretBindings secret.Registry
+	Executors      *executor.Registry
+	Harnesses      *harness.Registry
+	Environments   environment.Builder
+	Agent          runner.Runner
+	Verifier       verification.Runner
+	Capturer       gitcapture.Capturer
+	Policy         policy.Evaluator
+	Artifacts      artifact.Store
+	Publisher      publisher.Publisher
+	Clock          func() time.Time
+	NewID          func() string
 }
 
 // PhaseResult contains only durable values safe to pass between adapters.
@@ -80,6 +88,10 @@ type Service struct {
 	resolver            repository.Resolver
 	workspaces          workspace.Manager
 	profiles            map[string]repository.Profile
+	workerProfiles      workerprofile.Registry
+	secretBindings      secret.Registry
+	executors           *executor.Registry
+	harnesses           *harness.Registry
 	environments        environment.Builder
 	agent               runner.Runner
 	verifier            verification.Runner
@@ -107,6 +119,10 @@ func New(dependencies Dependencies) (*Service, error) {
 		{"memory store", dependencies.Memory},
 		{"repository resolver", dependencies.Resolver},
 		{"workspace manager", dependencies.Workspaces},
+		{"worker profile registry", dependencies.WorkerProfiles},
+		{"secret binding registry", dependencies.SecretBindings},
+		{"executor registry", dependencies.Executors},
+		{"harness registry", dependencies.Harnesses},
 		{"environment builder", dependencies.Environments},
 		{"agent runner", dependencies.Agent},
 		{"verification runner", dependencies.Verifier},
@@ -150,6 +166,9 @@ func New(dependencies Dependencies) (*Service, error) {
 		templates: dependencies.Templates, runs: dependencies.Runs,
 		memory: dependencies.Memory, resolver: dependencies.Resolver,
 		workspaces: dependencies.Workspaces, profiles: profiles,
+		workerProfiles: dependencies.WorkerProfiles,
+		secretBindings: dependencies.SecretBindings,
+		executors:      dependencies.Executors, harnesses: dependencies.Harnesses,
 		environments: dependencies.Environments, agent: dependencies.Agent,
 		verifier: dependencies.Verifier, capturer: dependencies.Capturer,
 		policy: dependencies.Policy, artifacts: dependencies.Artifacts,
@@ -301,6 +320,28 @@ func validateRunBinding(record run.Record) (templatecodechange.Input, error) {
 		canonical, err := canonicalGitHubRepository(input.RepositoryURI)
 		if err != nil || canonical != input.RepositoryURI {
 			return templatecodechange.Input{}, fmt.Errorf("%w: publication repository", ErrRunBinding)
+		}
+	}
+	profileID, err := workerprofile.ParseProfileID(input.WorkerProfile)
+	if err != nil {
+		return templatecodechange.Input{}, fmt.Errorf("%w: worker profile input", ErrRunBinding)
+	}
+	if record.WorkerProfile == nil {
+		if record.SecretBindings != nil || record.BaseSHA != "" {
+			return templatecodechange.Input{}, fmt.Errorf("%w: unresolved worker profile", ErrRunBinding)
+		}
+		return input, nil
+	}
+	profile, err := workerprofile.Canonicalize(record.WorkerProfile.Clone())
+	if err != nil || !reflect.DeepEqual(profile, *record.WorkerProfile) ||
+		profile.Metadata != profileID || len(profile.Secrets) != len(record.SecretBindings) {
+		return templatecodechange.Input{}, fmt.Errorf("%w: resolved worker profile", ErrRunBinding)
+	}
+	for index, requirement := range profile.Secrets {
+		binding := record.SecretBindings[index]
+		if binding.Capability != requirement.Capability ||
+			binding.Revision != requirement.BindingRevision {
+			return templatecodechange.Input{}, fmt.Errorf("%w: resolved secret binding", ErrRunBinding)
 		}
 	}
 	return input, nil

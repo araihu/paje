@@ -7,14 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/araihu/paje/internal/environment"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/run"
+	"github.com/araihu/paje/internal/secret"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 var immutableRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -162,9 +164,18 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 		return s.finishFailure(ctx, runID, failure, errors.New("repository resolver returned an invalid revision"), attempt)
 	}
 
-	capabilityEvidence, capabilityFailure, capabilityErr := s.validateResolveCapabilities(ctx, runID, attempt, input)
-	if capabilityFailure != nil {
-		return s.finishFailure(ctx, runID, *capabilityFailure, capabilityErr, attempt)
+	profile, bindings, profileFailure, profileErr := s.selectResolvedWorker(ctx, record, input)
+	if profileFailure != nil {
+		return s.finishFailure(ctx, runID, *profileFailure, profileErr, attempt)
+	}
+	if record.WorkerProfile == nil {
+		record, err = s.persistResolvedWorker(ctx, runID, attempt, profile, bindings)
+		if err != nil {
+			return phaseResult(record), err
+		}
+		if record.WorkerProfile == nil {
+			return phaseInProgress(record)
+		}
 	}
 
 	query := input.MemoryQuery
@@ -203,10 +214,10 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 			FinishedAt: s.clock(), Attempts: stageAttempt(current, "resolve"),
 			Evidence: map[string]string{
 				"base_sha": revision.SHA, "memory_count": fmt.Sprintf("%d", len(memories)),
+				"worker_profile":        record.WorkerProfile.Metadata.String(),
+				"worker_profile_digest": record.WorkerProfile.Digest,
+				"secret_binding_count":  fmt.Sprintf("%d", len(record.SecretBindings)),
 			},
-		}
-		for key, value := range capabilityEvidence {
-			finished.Evidence[key] = value
 		}
 		next, err := run.UpsertStage(next, finished)
 		if err != nil {
@@ -224,54 +235,140 @@ func (s *Service) resolveReserved(ctx context.Context, runID string, input templ
 	return phaseResult(record), nil
 }
 
-func (s *Service) validateResolveCapabilities(
+func (s *Service) selectResolvedWorker(
+	ctx context.Context,
+	record run.Record,
+	input templatecodechange.Input,
+) (workerprofile.Snapshot, []secret.BindingRef, *run.Failure, error) {
+	if record.WorkerProfile != nil {
+		return record.WorkerProfile.Clone(),
+			append([]secret.BindingRef(nil), record.SecretBindings...), nil, nil
+	}
+
+	profileID, err := workerprofile.ParseProfileID(input.WorkerProfile)
+	if err != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInput, Retryable: false,
+			Diagnostic: "worker profile reference is invalid", CauseCode: "invalid_worker_profile",
+		}
+		return workerprofile.Snapshot{}, nil, &failure, err
+	}
+	profile, err := s.workerProfiles.Resolve(ctx, profileID)
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		failure := canceledFailure("resolve")
+		return workerprofile.Snapshot{}, nil, &failure, errors.Join(err, ctx.Err())
+	}
+	if err != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureEnvironment, Retryable: true,
+			Diagnostic: "worker profile registry is temporarily unavailable",
+			CauseCode:  "worker_profile_unavailable",
+		}
+		if errors.Is(err, workerprofile.ErrProfileNotFound) {
+			failure.Class = run.FailureInput
+			failure.Retryable = false
+			failure.Diagnostic = "worker profile does not exist"
+			failure.CauseCode = "worker_profile_not_found"
+		}
+		return workerprofile.Snapshot{}, nil, &failure, err
+	}
+	canonical, err := workerprofile.Canonicalize(profile)
+	if err != nil || profile.Digest == "" || profile.Metadata != profileID ||
+		!reflect.DeepEqual(canonical, profile) {
+		cause := err
+		if cause == nil {
+			cause = errors.New("worker profile registry response failed exact validation")
+		}
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInternal, Retryable: false,
+			Diagnostic: "worker profile registry returned an invalid snapshot",
+			CauseCode:  "invalid_worker_profile_snapshot",
+		}
+		return workerprofile.Snapshot{}, nil, &failure, cause
+	}
+	if _, err := s.executors.Resolve(profile); err != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInput, Retryable: false,
+			Diagnostic: "worker profile runtime is unsupported",
+			CauseCode:  "unsupported_worker_profile_runtime",
+		}
+		return workerprofile.Snapshot{}, nil, &failure, err
+	}
+	if _, err := s.harnesses.Resolve(profile); err != nil {
+		failure := run.Failure{
+			Stage: "resolve", Class: run.FailureInput, Retryable: false,
+			Diagnostic: "worker profile harness is unsupported",
+			CauseCode:  "unsupported_worker_profile_harness",
+		}
+		return workerprofile.Snapshot{}, nil, &failure, err
+	}
+
+	var bindings []secret.BindingRef
+	if len(profile.Secrets) != 0 {
+		bindings = make([]secret.BindingRef, len(profile.Secrets))
+	}
+	for index, requirement := range profile.Secrets {
+		ref := secret.BindingRef{
+			Capability: requirement.Capability,
+			Revision:   requirement.BindingRevision,
+		}
+		request := secret.ResolveRequest{
+			ProfileID: profile.Metadata, Ref: ref, Requirement: requirement,
+		}
+		binding, err := s.secretBindings.Resolve(ctx, request)
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			failure := canceledFailure("resolve")
+			return workerprofile.Snapshot{}, nil, &failure, errors.Join(err, ctx.Err())
+		}
+		if err != nil {
+			failure := run.Failure{
+				Stage: "resolve", Class: run.FailureEnvironment, Retryable: true,
+				Diagnostic: "secret binding registry is temporarily unavailable",
+				CauseCode:  "secret_binding_unavailable",
+			}
+			if errors.Is(err, secret.ErrBindingNotFound) ||
+				errors.Is(err, secret.ErrBindingUnauthorized) {
+				failure.Class = run.FailurePolicy
+				failure.Retryable = false
+				failure.Diagnostic = "secret capability binding is not authorized"
+				failure.CauseCode = "secret_binding_unauthorized"
+			}
+			return workerprofile.Snapshot{}, nil, &failure, err
+		}
+		if binding.Ref() != ref || !binding.Authorizes(request) {
+			failure := run.Failure{
+				Stage: "resolve", Class: run.FailureInternal, Retryable: false,
+				Diagnostic: "secret binding registry returned an invalid authorization",
+				CauseCode:  "invalid_secret_binding",
+			}
+			return workerprofile.Snapshot{}, nil, &failure, errors.New("secret binding response differs from request")
+		}
+		bindings[index] = ref
+	}
+	return profile.Clone(), bindings, nil, nil
+}
+
+func (s *Service) persistResolvedWorker(
 	ctx context.Context,
 	runID string,
 	attempt int,
-	input templatecodechange.Input,
-) (map[string]string, *run.Failure, error) {
-	evidence := make(map[string]string)
-	var primary error
-	runtimeID := resolveCapabilityRuntimeID(runID, attempt)
-	for _, stage := range []environment.Stage{environment.StageAgent, environment.StageVerification} {
-		result, err := s.environments.Build(ctx, environment.Request{
-			RunID: runtimeID, Stage: stage, RequestedKeys: append([]string(nil), input.EnvironmentKeys...),
-		})
-		if err != nil {
-			primary = err
-			break
+	profile workerprofile.Snapshot,
+	bindings []secret.BindingRef,
+) (run.Record, error) {
+	return s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
+		if current.WorkerProfile != nil || current.Terminal() {
+			return current, false, nil
 		}
-		evidence["capability_"+string(stage)+"_keys"] = encodeStrings(result.Keys)
-	}
-
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
-	cleanupErr := s.environments.Cleanup(cleanupCtx, runtimeID)
-	cancel()
-	if ctx.Err() != nil || errors.Is(primary, context.Canceled) {
-		failure := canceledFailure("resolve")
-		return nil, &failure, errors.Join(primary, cleanupErr, ctx.Err())
-	}
-	if primary != nil {
-		failure := environmentPolicyFailure(ctx, "resolve")
-		if cleanupErr != nil {
-			failure.Retryable = false
-			failure.Diagnostic = run.SafeDiagnostic(failure.Diagnostic + "; capability cleanup failed")
+		if !runningStageAttempt(current, "resolve", attempt) {
+			return current, false, nil
 		}
-		return nil, &failure, errors.Join(primary, cleanupErr)
-	}
-	if cleanupErr != nil {
-		failure := run.Failure{
-			Stage: "resolve", Class: run.FailureCleanup, Retryable: false,
-			Diagnostic: "capability validation cleanup failed", CauseCode: "cleanup_failed",
-		}
-		return nil, &failure, cleanupErr
-	}
-	return evidence, nil, nil
-}
-
-func resolveCapabilityRuntimeID(runID string, attempt int) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", runID, attempt)))
-	return "resolve-" + hex.EncodeToString(sum[:16])
+		next := run.CloneRecord(current)
+		snapshot := profile.Clone()
+		next.WorkerProfile = &snapshot
+		next.SecretBindings = append([]secret.BindingRef(nil), bindings...)
+		next.UpdatedAt = s.clock()
+		return next, true, nil
+	})
 }
 
 func (s *Service) beginStage(ctx context.Context, runID, name string, status run.Status) (run.Record, bool, error) {

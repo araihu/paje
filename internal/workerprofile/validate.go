@@ -256,6 +256,9 @@ func validateSecrets(snapshot *Snapshot) error {
 			return errors.New("duplicate secret capability")
 		}
 		capabilities[requirement.Capability] = struct{}{}
+		if requirement.BindingRevision == 0 {
+			return errors.New("secret binding revision must be positive")
+		}
 		if requirement.Stage != StageAgent || !requirement.Required {
 			return errors.New("secret requirements must be required and agent-only")
 		}
