@@ -50,7 +50,7 @@ func buildArchive(request executor.Request) (_ *privateArchive, returnedErr erro
 	document := sandboxinit.Document{
 		WorkspaceRoot: executor.SandboxWorkspaceRoot,
 		Command:       request.Command.Clone(),
-		Environment:   cloneStrings(request.Environment),
+		Environment:   cloneStringMap(request.Environment),
 	}
 	if len(request.Secrets) > sandboxinit.MaxBootstrapEntries-1 {
 		return nil, errors.New("private Docker archive has too many materializations")
@@ -206,6 +206,14 @@ func buildArchive(request executor.Request) (_ *privateArchive, returnedErr erro
 		return nil, errors.New("finish private Docker archive")
 	}
 	return &privateArchive{bytes: buffer.Take()}, nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 type hardCapBuffer struct {
