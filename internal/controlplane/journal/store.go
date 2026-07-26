@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,10 +24,22 @@ type Store interface {
 	ActiveRuns(context.Context, string, int) ([]string, string, error)
 }
 
+type AuthoritativeStore interface {
+	Store
+	Commit(context.Context, CommitRequest) (CommitReceipt, error)
+	Payload(context.Context, string) ([]byte, error)
+}
+
 type memoryCheckpoint struct {
 	bytes  []byte
 	run    RunCursor
 	global GlobalCursor
+}
+
+type memoryCommit struct {
+	receipt        CommitReceipt
+	requestPayload []byte
+	outcomePayload []byte
 }
 
 // MemoryStore is the reference single-replica journal implementation. It is
@@ -42,9 +55,13 @@ type MemoryStore struct {
 	runEvents      map[string][]Event
 	checkpoints    map[string]memoryCheckpoint
 	active         map[string]bool
+	commits        map[string]memoryCommit
+	commitKeys     map[string]string
+	payloads       map[string][]byte
 }
 
 var _ Store = (*MemoryStore)(nil)
+var _ AuthoritativeStore = (*MemoryStore)(nil)
 
 func NewMemoryStore(installationID string) (*MemoryStore, error) {
 	if strings.TrimSpace(installationID) == "" {
@@ -59,6 +76,9 @@ func NewMemoryStore(installationID string) (*MemoryStore, error) {
 		runEvents:      make(map[string][]Event),
 		checkpoints:    make(map[string]memoryCheckpoint),
 		active:         make(map[string]bool),
+		commits:        make(map[string]memoryCommit),
+		commitKeys:     make(map[string]string),
+		payloads:       make(map[string][]byte),
 	}, nil
 }
 
@@ -148,6 +168,180 @@ func (s *MemoryStore) Reserve(ctx context.Context, action Action) (Action, bool,
 		return Action{}, false, err
 	}
 	return s.reserveLocked(action)
+}
+
+func (s *MemoryStore) Commit(ctx context.Context, request CommitRequest) (CommitReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return CommitReceipt{}, err
+	}
+	if err := ValidateAction(request.Action); err != nil {
+		return CommitReceipt{}, err
+	}
+	canonicalOutcome, err := canonicalEvent(request.Outcome)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
+	request.Outcome = canonicalOutcome
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return CommitReceipt{}, err
+	}
+	if existing, found, err := s.exactCommitLocked(request); found || err != nil {
+		if err != nil {
+			return CommitReceipt{}, err
+		}
+		receipt := existing.receipt
+		receipt.Created = false
+		return receipt, nil
+	}
+	if existing, ok := s.actions[request.Action.ID]; ok && existing != request.Action {
+		return CommitReceipt{}, ErrConflict
+	} else if ok {
+		return CommitReceipt{}, ErrConflict
+	}
+	if existing, ok := s.idempotency[request.Action.IdempotencyKey]; ok && existing != request.Action {
+		return CommitReceipt{}, ErrConflict
+	} else if ok {
+		return CommitReceipt{}, ErrConflict
+	}
+	if err := ValidateCommitRequest(request); err != nil {
+		return CommitReceipt{}, err
+	}
+	currentRunSequence := uint64(len(s.runEvents[request.Action.ControlRunID]))
+	if request.ExpectedRun.InstallationID != s.installationID ||
+		request.ExpectedGlobal.InstallationID != s.installationID ||
+		request.ExpectedRun.RunSequence != currentRunSequence ||
+		request.ExpectedGlobal.JournalPosition != JournalPosition(len(s.events)) {
+		return CommitReceipt{}, ErrConflict
+	}
+	if currentRunSequence > ^uint64(0)-2 || uint64(len(s.events)) > ^uint64(0)-2 {
+		return CommitReceipt{}, ErrConflict
+	}
+	actionDigest, err := Digest(request.Action)
+	if err != nil {
+		return CommitReceipt{}, err
+	}
+	reservation := Event{
+		ID:              stableID("reservation", request.Action.ControlRunID, request.Action.ID),
+		ControlRunID:    request.Action.ControlRunID,
+		ActionID:        request.Action.ID,
+		Kind:            EventActionReserved,
+		PayloadDigest:   actionDigest,
+		OccurredAt:      time.Unix(0, 0).UTC(),
+		RunSequence:     currentRunSequence + 1,
+		JournalPosition: JournalPosition(len(s.events) + 1),
+	}
+	outcome := request.Outcome
+	outcome.RunSequence = currentRunSequence + 2
+	outcome.JournalPosition = JournalPosition(len(s.events) + 2)
+	if err := ValidateEvent(reservation, true); err != nil {
+		return CommitReceipt{}, err
+	}
+	if err := ValidateEvent(outcome, true); err != nil {
+		return CommitReceipt{}, err
+	}
+	if reservation.ID == outcome.ID {
+		return CommitReceipt{}, ErrConflict
+	}
+	for _, event := range []Event{reservation, outcome} {
+		if _, exists := s.eventByID[event.ID]; exists {
+			return CommitReceipt{}, ErrConflict
+		}
+	}
+	if err := ValidateOutcomeTransition(s.events, request.Outcome); err != nil {
+		return CommitReceipt{}, err
+	}
+	for digest, payload := range map[string][]byte{
+		request.Action.CanonicalRequestDigest: request.RequestPayload,
+		request.Outcome.PayloadDigest:         request.OutcomePayload,
+	} {
+		if existing, ok := s.payloads[digest]; ok && !bytes.Equal(existing, payload) {
+			return CommitReceipt{}, ErrConflict
+		}
+	}
+	receipt := CommitReceipt{
+		Action: request.Action, Reservation: reservation, Outcome: outcome, Created: true,
+	}
+	committed := memoryCommit{
+		receipt:        receipt,
+		requestPayload: append([]byte(nil), request.RequestPayload...),
+		outcomePayload: append([]byte(nil), request.OutcomePayload...),
+	}
+	s.actions[request.Action.ID] = request.Action
+	s.actionRuns[request.Action.ID] = request.Action.ControlRunID
+	s.idempotency[request.Action.IdempotencyKey] = request.Action
+	s.events = append(s.events, reservation, outcome)
+	s.runEvents[request.Action.ControlRunID] = append(
+		s.runEvents[request.Action.ControlRunID], reservation, outcome,
+	)
+	s.eventByID[reservation.ID] = reservation
+	s.eventByID[outcome.ID] = outcome
+	s.active[request.Action.ControlRunID] = true
+	s.commits[request.Action.ID] = committed
+	s.commitKeys[request.Action.IdempotencyKey] = request.Action.ID
+	s.payloads[request.Action.CanonicalRequestDigest] = append([]byte(nil), request.RequestPayload...)
+	s.payloads[request.Outcome.PayloadDigest] = append([]byte(nil), request.OutcomePayload...)
+	return receipt, nil
+}
+
+func canonicalEvent(event Event) (Event, error) {
+	encoded, err := CanonicalJSON(event)
+	if err != nil {
+		return Event{}, err
+	}
+	var canonical Event
+	if err := DecodeStrict(encoded, &canonical); err != nil {
+		return Event{}, err
+	}
+	return canonical, nil
+}
+
+func (s *MemoryStore) Payload(ctx context.Context, digest string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !ValidDigest(digest) {
+		return nil, ErrInvalidRecord
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload, ok := s.payloads[digest]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]byte(nil), payload...), nil
+}
+
+func (s *MemoryStore) exactCommitLocked(
+	request CommitRequest,
+) (memoryCommit, bool, error) {
+	actionID := request.Action.ID
+	byID, idExists := s.commits[actionID]
+	keyActionID, keyExists := s.commitKeys[request.Action.IdempotencyKey]
+	if keyExists && (!idExists || keyActionID != actionID) {
+		return memoryCommit{}, true, ErrConflict
+	}
+	if !idExists {
+		return memoryCommit{}, false, nil
+	}
+	if err := ValidateCommitRequest(request); err != nil ||
+		byID.receipt.Action != request.Action ||
+		!bytes.Equal(byID.requestPayload, request.RequestPayload) ||
+		!bytes.Equal(byID.outcomePayload, request.OutcomePayload) {
+		return memoryCommit{}, true, ErrConflict
+	}
+	wantOutcome := byID.receipt.Outcome
+	wantOutcome.RunSequence = 0
+	wantOutcome.JournalPosition = 0
+	if wantOutcome != request.Outcome {
+		return memoryCommit{}, true, ErrConflict
+	}
+	if request.ExpectedRun.InstallationID != s.installationID ||
+		request.ExpectedGlobal.InstallationID != s.installationID {
+		return memoryCommit{}, true, ErrConflict
+	}
+	return byID, true, nil
 }
 
 func (s *MemoryStore) reserveLocked(action Action) (Action, bool, error) {

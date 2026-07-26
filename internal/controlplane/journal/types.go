@@ -16,6 +16,8 @@ import (
 
 const SchemaVersion uint32 = 1
 
+const MaxPayloadBytes = 1 << 20
+
 var (
 	ErrConflict      = errors.New("control journal conflict")
 	ErrInvalidRecord = errors.New("invalid control journal record")
@@ -110,6 +112,25 @@ type Event struct {
 	OccurredAt      time.Time       `json:"occurred_at"`
 }
 
+// CommitRequest is the authoritative transaction boundary used by semantic
+// control-plane services. The payloads are exact canonical JSON bytes whose
+// digests are bound by Action and Outcome.
+type CommitRequest struct {
+	Action         Action       `json:"action"`
+	ExpectedRun    RunCursor    `json:"expected_run"`
+	ExpectedGlobal GlobalCursor `json:"expected_global"`
+	RequestPayload []byte       `json:"request_payload"`
+	Outcome        Event        `json:"outcome"`
+	OutcomePayload []byte       `json:"outcome_payload"`
+}
+
+type CommitReceipt struct {
+	Action      Action `json:"action"`
+	Reservation Event  `json:"reservation"`
+	Outcome     Event  `json:"outcome"`
+	Created     bool   `json:"created"`
+}
+
 func NewRunCursor(installationID, controlRunID string) RunCursor {
 	return RunCursor{
 		InstallationID: installationID,
@@ -129,6 +150,11 @@ func ValidateAction(action Action) error {
 		strings.TrimSpace(action.IdempotencyKey) == "" {
 		return fmt.Errorf("%w: action identity, scope, revision, digest, and key are required", ErrInvalidRecord)
 	}
+	if len(action.ID) > 128 || len(action.ControlRunID) > 128 || len(action.TaskID) > 128 ||
+		len(action.AttemptID) > 128 || len(action.IdempotencyKey) > 256 ||
+		len(action.AuthorityReceiptID) > 128 {
+		return fmt.Errorf("%w: action fields exceed their bounds", ErrInvalidRecord)
+	}
 	if action.AttemptID != "" && action.TaskID == "" {
 		return fmt.Errorf("%w: attempt-scoped action requires a task", ErrInvalidRecord)
 	}
@@ -140,6 +166,10 @@ func ValidateEvent(event Event, assigned bool) error {
 		!validEventKind(event.Kind) || !ValidDigest(event.PayloadDigest) ||
 		event.OccurredAt.IsZero() {
 		return fmt.Errorf("%w: event identity, scope, kind, digest, and time are required", ErrInvalidRecord)
+	}
+	if len(event.ID) > 128 || len(event.ControlRunID) > 128 || len(event.ActionID) > 128 ||
+		len(event.ProviderReceipt) > 1024 {
+		return fmt.Errorf("%w: event fields exceed their bounds", ErrInvalidRecord)
 	}
 	if assigned {
 		if event.RunSequence == 0 || event.JournalPosition == 0 {
@@ -153,6 +183,73 @@ func ValidateEvent(event Event, assigned bool) error {
 	}
 	if event.Kind == EventActionReserved && strings.TrimSpace(event.ActionID) == "" {
 		return fmt.Errorf("%w: reservation event has no action", ErrInvalidRecord)
+	}
+	return nil
+}
+
+// ValidateCommitRequest validates every caller-controlled byte before a store
+// acquires durable state. Store implementations additionally compare the
+// cursors with their immutable installation and current heads.
+func ValidateCommitRequest(request CommitRequest) error {
+	if err := ValidateAction(request.Action); err != nil {
+		return err
+	}
+	if strings.TrimSpace(request.ExpectedRun.InstallationID) == "" ||
+		len(request.ExpectedRun.InstallationID) > 128 ||
+		len(request.ExpectedGlobal.InstallationID) > 128 ||
+		request.ExpectedRun.InstallationID != request.ExpectedGlobal.InstallationID ||
+		request.ExpectedRun.ControlRunID != request.Action.ControlRunID ||
+		request.ExpectedRun.SchemaVersion != SchemaVersion ||
+		request.ExpectedGlobal.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("%w: commit cursors do not bind one installation and run", ErrInvalidRecord)
+	}
+	if request.Outcome.ControlRunID != request.Action.ControlRunID ||
+		request.Outcome.ActionID != request.Action.ID {
+		return fmt.Errorf("%w: commit outcome is not bound to its action", ErrInvalidRecord)
+	}
+	if err := ValidateEvent(request.Outcome, false); err != nil {
+		return err
+	}
+	switch request.Outcome.Kind {
+	case EventActionResult, EventActionNotPerformed, EventActionAmbiguous:
+	default:
+		return fmt.Errorf("%w: commit requires an initial terminal outcome", ErrInvalidRecord)
+	}
+	if err := ValidatePayload(request.RequestPayload, request.Action.CanonicalRequestDigest); err != nil {
+		return err
+	}
+	if err := ValidatePayload(request.OutcomePayload, request.Outcome.PayloadDigest); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidatePayload requires one bounded canonical JSON value terminated by the
+// newline emitted by CanonicalJSON and bound to the supplied SHA-256 digest.
+func ValidatePayload(encoded []byte, wantDigest string) error {
+	if len(encoded) == 0 || len(encoded) > MaxPayloadBytes || !ValidDigest(wantDigest) {
+		return fmt.Errorf("%w: payload size or digest is invalid", ErrInvalidRecord)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("%w: decode payload JSON: %v", ErrInvalidRecord, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing payload JSON", ErrInvalidRecord)
+	}
+	canonical, err := CanonicalJSON(value)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(encoded, canonical) {
+		return fmt.Errorf("%w: payload is not canonical JSON", ErrInvalidRecord)
+	}
+	sum := sha256.Sum256(encoded)
+	if "sha256:"+hex.EncodeToString(sum[:]) != wantDigest {
+		return fmt.Errorf("%w: payload digest mismatch", ErrInvalidRecord)
 	}
 	return nil
 }

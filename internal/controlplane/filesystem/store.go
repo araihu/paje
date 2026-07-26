@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,10 @@ type Store struct {
 	journalRoot     string
 	journalEvents   string
 	journalPayloads string
+	journalCommits  string
+	commitStaging   string
+	commitsIdentity os.FileInfo
+	stagingIdentity os.FileInfo
 	runs            string
 	active          string
 	installationID  string
@@ -46,22 +51,26 @@ type Store struct {
 type DurableBoundary string
 
 const (
-	BoundaryTransactionCommitted DurableBoundary = "transaction_committed"
-	BoundaryEventRootCommitted   DurableBoundary = "event_root_committed"
-	BoundaryEventCommitted       DurableBoundary = "event_committed"
-	BoundarySnapshotCommitted    DurableBoundary = "snapshot_committed"
-	BoundaryTransactionCleared   DurableBoundary = "transaction_cleared"
-	BoundaryBeforeReservation    DurableBoundary = "before_reservation"
-	BoundaryReservationPersisted DurableBoundary = "reservation_persisted"
-	BoundaryAfterReservation     DurableBoundary = "after_reservation"
-	BoundaryGlobalPosition       DurableBoundary = "global_position_selected"
-	BoundaryCanonicalVisible     DurableBoundary = "canonical_event_visible"
-	BoundaryRunIndexRepaired     DurableBoundary = "run_index_repaired"
-	BoundaryResultAppended       DurableBoundary = "result_appended"
-	BoundaryProjectionRebuilt    DurableBoundary = "projection_rebuilt"
-	BoundaryCheckpointWritten    DurableBoundary = "checkpoint_written"
-	BoundaryActiveIndexUpdated   DurableBoundary = "active_index_updated"
-	BoundaryResponse             DurableBoundary = "response"
+	BoundaryTransactionCommitted        DurableBoundary = "transaction_committed"
+	BoundaryEventRootCommitted          DurableBoundary = "event_root_committed"
+	BoundaryEventCommitted              DurableBoundary = "event_committed"
+	BoundarySnapshotCommitted           DurableBoundary = "snapshot_committed"
+	BoundaryTransactionCleared          DurableBoundary = "transaction_cleared"
+	BoundaryBeforeReservation           DurableBoundary = "before_reservation"
+	BoundaryReservationPersisted        DurableBoundary = "reservation_persisted"
+	BoundaryAfterReservation            DurableBoundary = "after_reservation"
+	BoundaryGlobalPosition              DurableBoundary = "global_position_selected"
+	BoundaryCanonicalVisible            DurableBoundary = "canonical_event_visible"
+	BoundaryRunIndexRepaired            DurableBoundary = "run_index_repaired"
+	BoundaryResultAppended              DurableBoundary = "result_appended"
+	BoundaryProjectionRebuilt           DurableBoundary = "projection_rebuilt"
+	BoundaryCheckpointWritten           DurableBoundary = "checkpoint_written"
+	BoundaryActiveIndexUpdated          DurableBoundary = "active_index_updated"
+	BoundaryResponse                    DurableBoundary = "response"
+	BoundaryBeforeAuthoritativeCommit   DurableBoundary = "before_authoritative_commit"
+	BoundaryAuthoritativeCommitPrepared DurableBoundary = "authoritative_commit_prepared"
+	BoundaryAuthoritativeCommitVisible  DurableBoundary = "authoritative_commit_visible"
+	BoundaryAuthoritativeCommitResponse DurableBoundary = "authoritative_commit_response"
 )
 
 type Option func(*Store)
@@ -74,6 +83,8 @@ const transactionSchemaVersion = "paje.controlplane.filesystem-transaction/v1"
 const manifestSchemaVersion = "paje.controlplane.journal-manifest/v1"
 const migrationSchemaVersion = "paje.controlplane.journal-migration/v1"
 const checkpointSchemaVersion = "paje.controlplane.journal-checkpoint/v1"
+const authoritativeCommitSchemaVersion = "paje.controlplane.authoritative-commit/v1"
+const maxAuthoritativeCommitRecordBytes = 2*(4*((journal.MaxPayloadBytes+2)/3)) + (64 << 10)
 
 type manifest struct {
 	ManifestSchema string `json:"manifest_schema"`
@@ -111,6 +122,15 @@ type activeRun struct {
 	JournalPosition journal.JournalPosition `json:"journal_position"`
 }
 
+type authoritativeCommit struct {
+	SchemaVersion  string         `json:"schema_version"`
+	Action         journal.Action `json:"action"`
+	Reservation    journal.Event  `json:"reservation"`
+	Outcome        journal.Event  `json:"outcome"`
+	RequestPayload []byte         `json:"request_payload"`
+	OutcomePayload []byte         `json:"outcome_payload"`
+}
+
 type transaction struct {
 	SchemaVersion   string                `json:"schema_version"`
 	ControlRunID    string                `json:"control_run_id"`
@@ -123,6 +143,7 @@ type transaction struct {
 }
 
 var _ controlplane.Store = (*Store)(nil)
+var _ journal.AuthoritativeStore = (*Store)(nil)
 
 func New(root string) (*Store, error) {
 	return NewWithOptions(root)
@@ -154,10 +175,13 @@ func NewWithOptions(root string, options ...Option) (*Store, error) {
 	journalRoot := filepath.Join(canonical, "journal")
 	journalEvents := filepath.Join(journalRoot, "events")
 	journalPayloads := filepath.Join(journalRoot, "payloads")
+	journalCommits := filepath.Join(journalRoot, "commits")
+	commitStaging := filepath.Join(journalRoot, "commit-staging")
 	runs := filepath.Join(canonical, "runs")
 	active := filepath.Join(canonical, "active")
 	for _, directory := range []string{
-		records, events, transactions, journalRoot, journalEvents, journalPayloads, runs, active,
+		records, events, transactions, journalRoot, journalEvents, journalPayloads,
+		journalCommits, commitStaging, runs, active,
 	} {
 		if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("create control-plane store directory: %w", err)
@@ -167,11 +191,21 @@ func NewWithOptions(root string, options ...Option) (*Store, error) {
 			return nil, fmt.Errorf("%w: store directory is unsafe", controlplane.ErrCorruptStore)
 		}
 	}
+	commitsIdentity, err := os.Lstat(journalCommits)
+	if err != nil {
+		return nil, fmt.Errorf("inspect authoritative commits identity: %w", err)
+	}
+	stagingIdentity, err := os.Lstat(commitStaging)
+	if err != nil {
+		return nil, fmt.Errorf("inspect authoritative commit staging identity: %w", err)
+	}
 	lockValue, _ := rootLocks.LoadOrStore(canonical, &sync.Mutex{})
 	store := &Store{
 		root: canonical, records: records, events: events, transactions: transactions,
 		journalRoot: journalRoot, journalEvents: journalEvents,
-		journalPayloads: journalPayloads, runs: runs, active: active,
+		journalPayloads: journalPayloads, journalCommits: journalCommits,
+		commitStaging: commitStaging, commitsIdentity: commitsIdentity,
+		stagingIdentity: stagingIdentity, runs: runs, active: active,
 		lock: lockValue.(*sync.Mutex), cursorIndex: make(map[string]uint64),
 	}
 	for _, option := range options {
@@ -182,6 +216,9 @@ func NewWithOptions(root string, options ...Option) (*Store, error) {
 	store.lock.Lock()
 	defer store.lock.Unlock()
 	if err := store.ensureManifestLocked(); err != nil {
+		return nil, err
+	}
+	if err := store.recoverCommitStagingLocked(); err != nil {
 		return nil, err
 	}
 	if err := store.auditJournalLocked(); err != nil {
@@ -668,6 +705,108 @@ func (s *Store) afterBoundary(boundary DurableBoundary) error {
 	return s.fault(boundary)
 }
 
+func (s *Store) ensureCommitsIdentityLocked() error {
+	return requireSameAuthoritativeDirectory(
+		s.journalCommits, s.commitsIdentity, "authoritative commits directory changed after construction",
+	)
+}
+
+func (s *Store) ensureStagingIdentityLocked() error {
+	return requireSameAuthoritativeDirectory(
+		s.commitStaging, s.stagingIdentity, "authoritative commit staging directory changed after construction",
+	)
+}
+
+func requireSameAuthoritativeDirectory(path string, expected os.FileInfo, message string) error {
+	current, err := os.Lstat(path)
+	if err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 ||
+		current.Mode().Perm()&0o077 != 0 || !os.SameFile(expected, current) {
+		return fmt.Errorf("%w: %s", controlplane.ErrCorruptStore, message)
+	}
+	return nil
+}
+
+func (s *Store) stageAuthoritativeCommitLocked(
+	ctx context.Context,
+	commit authoritativeCommit,
+) (stagedPath string, returnErr error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := s.ensureStagingIdentityLocked(); err != nil {
+		return "", err
+	}
+	encoded, err := journal.CanonicalJSON(commit)
+	if err != nil {
+		return "", err
+	}
+	if len(encoded) > maxAuthoritativeCommitRecordBytes {
+		return "", journal.ErrInvalidRecord
+	}
+	temporary, err := os.CreateTemp(
+		s.commitStaging,
+		".commit-"+strings.TrimSuffix(authoritativeCommitFilename(commit.Action.ID), ".json")+"-*.tmp",
+	)
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	open := true
+	defer func() {
+		if open {
+			_ = temporary.Close()
+		}
+		if returnErr != nil {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return "", err
+	}
+	if _, err := temporary.Write(encoded); err != nil {
+		return "", err
+	}
+	if err := temporary.Sync(); err != nil {
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	open = false
+	if err := syncDirectory(s.commitStaging); err != nil {
+		return "", err
+	}
+	return temporaryPath, nil
+}
+
+func (s *Store) recoverCommitStagingLocked() error {
+	if err := s.ensureStagingIdentityLocked(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(s.commitStaging)
+	if err != nil {
+		return fmt.Errorf("%w: read authoritative commit staging: %v", controlplane.ErrCorruptStore, err)
+	}
+	removed := false
+	for _, entry := range entries {
+		info, infoErr := entry.Info()
+		if infoErr != nil || entry.IsDir() || !info.Mode().IsRegular() ||
+			info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 ||
+			!validAuthoritativeCommitStagingFilename(entry.Name()) ||
+			info.Size() > int64(maxAuthoritativeCommitRecordBytes) {
+			return fmt.Errorf("%w: unsafe authoritative commit staging entry %q", controlplane.ErrCorruptStore, entry.Name())
+		}
+		if err := os.Remove(filepath.Join(s.commitStaging, entry.Name())); err != nil {
+			return fmt.Errorf("%w: remove incomplete authoritative commit: %v", controlplane.ErrCorruptStore, err)
+		}
+		removed = true
+	}
+	if removed {
+		return syncDirectory(s.commitStaging)
+	}
+	return nil
+}
+
 func (s *Store) auditLocked() error {
 	rootEntries, err := os.ReadDir(s.root)
 	if err != nil {
@@ -976,6 +1115,189 @@ func (s *Store) Reserve(
 		return journal.Action{}, false, err
 	}
 	return action, created, nil
+}
+
+func (s *Store) Commit(
+	ctx context.Context,
+	request journal.CommitRequest,
+) (journal.CommitReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := journal.ValidateAction(request.Action); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	canonicalOutcome, err := canonicalJournalEvent(request.Outcome)
+	if err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	request.Outcome = canonicalOutcome
+	if !validID(request.Action.ID) || !validID(request.Action.ControlRunID) ||
+		!validID(request.Outcome.ID) {
+		return journal.CommitReceipt{}, journal.ErrInvalidRecord
+	}
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.recoverCommitStagingLocked(); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	commits, events, actions, err := s.readAuthoritativeStateLocked()
+	if err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if existing, found, exactErr := s.exactAuthoritativeCommitLocked(commits, request); found || exactErr != nil {
+		if exactErr != nil {
+			return journal.CommitReceipt{}, exactErr
+		}
+		return journal.CommitReceipt{
+			Action: existing.Action, Reservation: existing.Reservation,
+			Outcome: existing.Outcome, Created: false,
+		}, nil
+	}
+	if err := journal.ValidateCommitRequest(request); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if _, exists, conflictErr := exactReservation(actions, request.Action); conflictErr != nil || exists {
+		if conflictErr != nil {
+			return journal.CommitReceipt{}, conflictErr
+		}
+		return journal.CommitReceipt{}, journal.ErrConflict
+	}
+	currentRunSequence := runHead(events, request.Action.ControlRunID)
+	if request.ExpectedRun.InstallationID != s.installationID ||
+		request.ExpectedGlobal.InstallationID != s.installationID ||
+		request.ExpectedRun.RunSequence != currentRunSequence ||
+		request.ExpectedGlobal.JournalPosition != journal.JournalPosition(len(events)) {
+		return journal.CommitReceipt{}, journal.ErrConflict
+	}
+	if currentRunSequence > ^uint64(0)-2 || uint64(len(events)) > ^uint64(0)-2 {
+		return journal.CommitReceipt{}, journal.ErrConflict
+	}
+	actionDigest, err := journal.Digest(request.Action)
+	if err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	reservation := journal.Event{
+		ID:           stableJournalID("reservation", request.Action.ControlRunID, request.Action.ID),
+		ControlRunID: request.Action.ControlRunID, ActionID: request.Action.ID,
+		Kind: journal.EventActionReserved, PayloadDigest: actionDigest,
+		OccurredAt: time.Unix(0, 0).UTC(), RunSequence: currentRunSequence + 1,
+		JournalPosition: journal.JournalPosition(len(events) + 1),
+	}
+	outcome := request.Outcome
+	outcome.RunSequence = currentRunSequence + 2
+	outcome.JournalPosition = journal.JournalPosition(len(events) + 2)
+	if err := journal.ValidateEvent(reservation, true); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := journal.ValidateEvent(outcome, true); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if reservation.ID == outcome.ID {
+		return journal.CommitReceipt{}, journal.ErrConflict
+	}
+	for _, existing := range events {
+		if existing.ID == reservation.ID || existing.ID == outcome.ID {
+			return journal.CommitReceipt{}, journal.ErrConflict
+		}
+	}
+	record := authoritativeCommit{
+		SchemaVersion: authoritativeCommitSchemaVersion,
+		Action:        request.Action, Reservation: reservation, Outcome: outcome,
+		RequestPayload: append([]byte(nil), request.RequestPayload...),
+		OutcomePayload: append([]byte(nil), request.OutcomePayload...),
+	}
+	if err := validateAuthoritativeCommit(record); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.afterBoundary(BoundaryBeforeAuthoritativeCommit); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.ensureCommitsIdentityLocked(); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	staged, err := s.stageAuthoritativeCommitLocked(ctx, record)
+	if err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.afterBoundary(BoundaryAuthoritativeCommitPrepared); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.ensureStagingIdentityLocked(); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.ensureCommitsIdentityLocked(); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	target := filepath.Join(s.journalCommits, authoritativeCommitFilename(request.Action.ID))
+	if _, err := os.Lstat(target); err == nil {
+		_ = os.Remove(staged)
+		return journal.CommitReceipt{}, journal.ErrConflict
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(staged)
+		return journal.CommitReceipt{}, err
+	}
+	if err := os.Rename(staged, target); err != nil {
+		_ = os.Remove(staged)
+		return journal.CommitReceipt{}, err
+	}
+	if err := syncDirectory(s.journalCommits); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := syncDirectory(s.commitStaging); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.afterBoundary(BoundaryAuthoritativeCommitVisible); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	if err := s.afterBoundary(BoundaryAuthoritativeCommitResponse); err != nil {
+		return journal.CommitReceipt{}, err
+	}
+	return journal.CommitReceipt{
+		Action: request.Action, Reservation: reservation, Outcome: outcome, Created: true,
+	}, nil
+}
+
+func (s *Store) Payload(ctx context.Context, digest string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !journal.ValidDigest(digest) {
+		return nil, journal.ErrInvalidRecord
+	}
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	commits, _, _, err := s.readAuthoritativeStateLocked()
+	if err != nil {
+		return nil, err
+	}
+	if encoded, err := s.readPayloadLocked(digest); err == nil {
+		return append([]byte(nil), encoded...), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	var found []byte
+	for _, commit := range commits {
+		for payloadDigest, payload := range map[string][]byte{
+			commit.Action.CanonicalRequestDigest: commit.RequestPayload,
+			commit.Outcome.PayloadDigest:         commit.OutcomePayload,
+		} {
+			if payloadDigest != digest {
+				continue
+			}
+			if found != nil && !bytes.Equal(found, payload) {
+				return nil, fmt.Errorf("%w: authoritative payload digest collision", controlplane.ErrCorruptStore)
+			}
+			found = append([]byte(nil), payload...)
+		}
+	}
+	if found == nil {
+		return nil, journal.ErrNotFound
+	}
+	return found, nil
 }
 
 func (s *Store) Reservation(
@@ -1373,6 +1695,187 @@ func (s *Store) ensureManifestLocked() error {
 	return nil
 }
 
+func (s *Store) readAuthoritativeCommitsLocked() ([]authoritativeCommit, error) {
+	if err := s.ensureCommitsIdentityLocked(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.journalCommits)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read authoritative commits: %v", controlplane.ErrCorruptStore, err)
+	}
+	commits := make([]authoritativeCommit, 0, len(entries))
+	actionIDs := make(map[string]bool, len(entries))
+	keys := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		info, infoErr := entry.Info()
+		path := filepath.Join(s.journalCommits, entry.Name())
+		if infoErr != nil || entry.IsDir() || !info.Mode().IsRegular() ||
+			info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 ||
+			info.Size() > int64(maxAuthoritativeCommitRecordBytes) {
+			return nil, fmt.Errorf("%w: unsafe authoritative commit entry %q", controlplane.ErrCorruptStore, entry.Name())
+		}
+		var commit authoritativeCommit
+		if err := readCanonicalJSON(path, &commit); err != nil ||
+			entry.Name() != authoritativeCommitFilename(commit.Action.ID) ||
+			validateAuthoritativeCommit(commit) != nil {
+			return nil, fmt.Errorf("%w: invalid authoritative commit %q", controlplane.ErrCorruptStore, entry.Name())
+		}
+		if actionIDs[commit.Action.ID] || keys[commit.Action.IdempotencyKey] {
+			return nil, fmt.Errorf("%w: duplicate authoritative commit identity", controlplane.ErrCorruptStore)
+		}
+		actionIDs[commit.Action.ID] = true
+		keys[commit.Action.IdempotencyKey] = true
+		commits = append(commits, commit)
+	}
+	sort.Slice(commits, func(i, j int) bool {
+		return commits[i].Reservation.JournalPosition < commits[j].Reservation.JournalPosition
+	})
+	return commits, nil
+}
+
+func (s *Store) readAuthoritativeStateLocked() (
+	[]authoritativeCommit,
+	[]journal.Event,
+	[]journal.Action,
+	error,
+) {
+	commits, err := s.readAuthoritativeCommitsLocked()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	events, err := s.readJournalEventsWithCommitsLocked(commits)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	actions, err := s.readJournalActionsWithCommitsLocked(commits)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := validateJournalActionBindings(events, actions); err != nil {
+		return nil, nil, nil, fmt.Errorf(
+			"%w: invalid authoritative journal action bindings: %v", controlplane.ErrCorruptStore, err,
+		)
+	}
+	if err := validateAuthoritativeCommitMembership(commits, events, actions); err != nil {
+		return nil, nil, nil, fmt.Errorf(
+			"%w: invalid authoritative commit membership: %v", controlplane.ErrCorruptStore, err,
+		)
+	}
+	return commits, events, actions, nil
+}
+
+func validateAuthoritativeCommitMembership(
+	commits []authoritativeCommit,
+	events []journal.Event,
+	actions []journal.Action,
+) error {
+	for _, commit := range commits {
+		actionCount := 0
+		reservationCount := 0
+		outcomeCount := 0
+		for _, action := range actions {
+			if action == commit.Action {
+				actionCount++
+			}
+		}
+		for _, event := range events {
+			if event == commit.Reservation {
+				reservationCount++
+			}
+			if event == commit.Outcome {
+				outcomeCount++
+			}
+		}
+		if actionCount != 1 || reservationCount != 1 || outcomeCount != 1 {
+			return journal.ErrConflict
+		}
+	}
+	return nil
+}
+
+func (s *Store) exactAuthoritativeCommitLocked(
+	commits []authoritativeCommit,
+	request journal.CommitRequest,
+) (authoritativeCommit, bool, error) {
+	var matched *authoritativeCommit
+	for index := range commits {
+		commit := &commits[index]
+		if commit.Action.ID != request.Action.ID &&
+			commit.Action.IdempotencyKey != request.Action.IdempotencyKey {
+			continue
+		}
+		if matched != nil || commit.Action.ID != request.Action.ID ||
+			commit.Action.IdempotencyKey != request.Action.IdempotencyKey {
+			return authoritativeCommit{}, true, journal.ErrConflict
+		}
+		matched = commit
+	}
+	if matched == nil {
+		return authoritativeCommit{}, false, nil
+	}
+	if err := journal.ValidateCommitRequest(request); err != nil ||
+		matched.Action != request.Action ||
+		!bytes.Equal(matched.RequestPayload, request.RequestPayload) ||
+		!bytes.Equal(matched.OutcomePayload, request.OutcomePayload) ||
+		request.ExpectedRun.InstallationID != s.installationID ||
+		request.ExpectedGlobal.InstallationID != s.installationID {
+		return authoritativeCommit{}, true, journal.ErrConflict
+	}
+	wantOutcome := matched.Outcome
+	wantOutcome.RunSequence = 0
+	wantOutcome.JournalPosition = 0
+	if wantOutcome != request.Outcome {
+		return authoritativeCommit{}, true, journal.ErrConflict
+	}
+	return *matched, true, nil
+}
+
+func validateAuthoritativeCommit(commit authoritativeCommit) error {
+	if commit.SchemaVersion != authoritativeCommitSchemaVersion {
+		return journal.ErrInvalidRecord
+	}
+	if err := journal.ValidateAction(commit.Action); err != nil {
+		return err
+	}
+	if err := journal.ValidateEvent(commit.Reservation, true); err != nil {
+		return err
+	}
+	if err := journal.ValidateEvent(commit.Outcome, true); err != nil {
+		return err
+	}
+	if err := journal.ValidatePayload(commit.RequestPayload, commit.Action.CanonicalRequestDigest); err != nil {
+		return err
+	}
+	if err := journal.ValidatePayload(commit.OutcomePayload, commit.Outcome.PayloadDigest); err != nil {
+		return err
+	}
+	actionDigest, err := journal.Digest(commit.Action)
+	if err != nil {
+		return err
+	}
+	wantReservation := journal.Event{
+		ID:           stableJournalID("reservation", commit.Action.ControlRunID, commit.Action.ID),
+		ControlRunID: commit.Action.ControlRunID, RunSequence: commit.Reservation.RunSequence,
+		JournalPosition: commit.Reservation.JournalPosition, ActionID: commit.Action.ID,
+		Kind: journal.EventActionReserved, PayloadDigest: actionDigest,
+		OccurredAt: time.Unix(0, 0).UTC(),
+	}
+	if commit.Reservation != wantReservation ||
+		commit.Outcome.ControlRunID != commit.Action.ControlRunID ||
+		commit.Outcome.ActionID != commit.Action.ID ||
+		commit.Outcome.RunSequence != commit.Reservation.RunSequence+1 ||
+		commit.Outcome.JournalPosition != commit.Reservation.JournalPosition+1 ||
+		commit.Outcome.ID == commit.Reservation.ID {
+		return journal.ErrInvalidRecord
+	}
+	switch commit.Outcome.Kind {
+	case journal.EventActionResult, journal.EventActionNotPerformed, journal.EventActionAmbiguous:
+	default:
+		return journal.ErrInvalidRecord
+	}
+	return nil
+}
+
 func (s *Store) auditJournalLocked() error {
 	entries, err := os.ReadDir(s.journalRoot)
 	if err != nil {
@@ -1380,21 +1883,17 @@ func (s *Store) auditJournalLocked() error {
 	}
 	for _, entry := range entries {
 		switch entry.Name() {
-		case "manifest.json", "migration.json", "events", "payloads":
+		case "manifest.json", "migration.json", "events", "payloads", "commits", "commit-staging":
 		default:
 			return fmt.Errorf("%w: unexpected journal entry %q", controlplane.ErrCorruptStore, entry.Name())
 		}
 	}
-	events, err := s.readJournalEventsLocked()
+	_, events, actions, err := s.readAuthoritativeStateLocked()
 	if err != nil {
 		return err
 	}
 	if _, err := projection.RebuildInstallation(events); err != nil {
 		return fmt.Errorf("%w: invalid authoritative feed: %v", controlplane.ErrCorruptStore, err)
-	}
-	actions, err := s.readJournalActionsLocked()
-	if err != nil {
-		return err
 	}
 	if err := validateJournalActionBindings(events, actions); err != nil {
 		return fmt.Errorf("%w: %v", controlplane.ErrCorruptStore, err)
@@ -1417,22 +1916,60 @@ func (s *Store) auditJournalLocked() error {
 }
 
 func (s *Store) readJournalEventsLocked() ([]journal.Event, error) {
+	commits, err := s.readAuthoritativeCommitsLocked()
+	if err != nil {
+		return nil, err
+	}
+	return s.readJournalEventsWithCommitsLocked(commits)
+}
+
+func (s *Store) readJournalEventsWithCommitsLocked(
+	commits []authoritativeCommit,
+) ([]journal.Event, error) {
 	entries, err := os.ReadDir(s.journalEvents)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read journal events: %v", controlplane.ErrCorruptStore, err)
 	}
-	events := make([]journal.Event, 0, len(entries))
-	for index, entry := range entries {
-		want := journalEventFilename(journal.JournalPosition(index + 1))
+	byPosition := make(map[journal.JournalPosition]journal.Event, len(entries))
+	add := func(event journal.Event) error {
+		if existing, duplicate := byPosition[event.JournalPosition]; duplicate {
+			if existing != event {
+				return fmt.Errorf("%w: duplicate journal position %d", controlplane.ErrCorruptStore, event.JournalPosition)
+			}
+			return fmt.Errorf("%w: duplicate authoritative journal event", controlplane.ErrCorruptStore)
+		}
+		byPosition[event.JournalPosition] = event
+		return nil
+	}
+	for _, entry := range entries {
 		path := filepath.Join(s.journalEvents, entry.Name())
-		if entry.Name() != want {
-			return nil, fmt.Errorf("%w: noncontiguous journal event %q", controlplane.ErrCorruptStore, entry.Name())
+		position, parseErr := strconv.ParseUint(strings.TrimSuffix(entry.Name(), ".json"), 10, 64)
+		if parseErr != nil || entry.Name() != journalEventFilename(journal.JournalPosition(position)) || position == 0 {
+			return nil, fmt.Errorf("%w: invalid journal event filename %q", controlplane.ErrCorruptStore, entry.Name())
 		}
 		var event journal.Event
 		if err := readCanonicalJSON(path, &event); err != nil ||
 			journal.ValidateEvent(event, true) != nil ||
-			event.JournalPosition != journal.JournalPosition(index+1) {
+			event.JournalPosition != journal.JournalPosition(position) {
 			return nil, fmt.Errorf("%w: invalid journal event %q", controlplane.ErrCorruptStore, entry.Name())
+		}
+		if err := add(event); err != nil {
+			return nil, err
+		}
+	}
+	for _, commit := range commits {
+		if err := add(commit.Reservation); err != nil {
+			return nil, err
+		}
+		if err := add(commit.Outcome); err != nil {
+			return nil, err
+		}
+	}
+	events := make([]journal.Event, 0, len(byPosition))
+	for position := 1; position <= len(byPosition); position++ {
+		event, ok := byPosition[journal.JournalPosition(position)]
+		if !ok {
+			return nil, fmt.Errorf("%w: noncontiguous journal position %d", controlplane.ErrCorruptStore, position)
 		}
 		events = append(events, event)
 	}
@@ -1443,6 +1980,16 @@ func (s *Store) readJournalEventsLocked() ([]journal.Event, error) {
 }
 
 func (s *Store) readJournalActionsLocked() ([]journal.Action, error) {
+	commits, err := s.readAuthoritativeCommitsLocked()
+	if err != nil {
+		return nil, err
+	}
+	return s.readJournalActionsWithCommitsLocked(commits)
+}
+
+func (s *Store) readJournalActionsWithCommitsLocked(
+	commits []authoritativeCommit,
+) ([]journal.Action, error) {
 	runEntries, err := os.ReadDir(s.runs)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read journal runs: %v", controlplane.ErrCorruptStore, err)
@@ -1474,6 +2021,9 @@ func (s *Store) readJournalActionsLocked() ([]journal.Action, error) {
 			}
 			actions = append(actions, action)
 		}
+	}
+	for _, commit := range commits {
+		actions = append(actions, commit.Action)
 	}
 	sort.Slice(actions, func(i, j int) bool {
 		if actions[i].ControlRunID == actions[j].ControlRunID {
@@ -1641,11 +2191,16 @@ func (s *Store) preflightTransactionOutcomeLocked(tx transaction) error {
 
 func validateJournalActionBindings(events []journal.Event, actions []journal.Action) error {
 	byID := make(map[string]journal.Action, len(actions))
+	byKey := make(map[string]string, len(actions))
 	for _, action := range actions {
-		if existing, duplicate := byID[action.ID]; duplicate && existing.ControlRunID != action.ControlRunID {
+		if _, duplicate := byID[action.ID]; duplicate {
+			return journal.ErrConflict
+		}
+		if existingID, duplicate := byKey[action.IdempotencyKey]; duplicate && existingID != action.ID {
 			return journal.ErrConflict
 		}
 		byID[action.ID] = action
+		byKey[action.IdempotencyKey] = action.ID
 	}
 	reservations := make(map[string]bool, len(actions))
 	prior := make([]journal.Event, 0, len(events))
@@ -2394,6 +2949,49 @@ func runDirectoryName(controlRunID string) string {
 func stableJournalID(prefix string, values ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(append([]string{prefix}, values...), "\x00")))
 	return prefix + "_" + hex.EncodeToString(sum[:16])
+}
+
+func authoritativeCommitFilename(actionID string) string {
+	sum := sha256.Sum256([]byte(actionID))
+	return hex.EncodeToString(sum[:]) + ".json"
+}
+
+func canonicalJournalEvent(event journal.Event) (journal.Event, error) {
+	encoded, err := journal.CanonicalJSON(event)
+	if err != nil {
+		return journal.Event{}, err
+	}
+	var canonical journal.Event
+	if err := journal.DecodeStrict(encoded, &canonical); err != nil {
+		return journal.Event{}, err
+	}
+	return canonical, nil
+}
+
+func validAuthoritativeCommitStagingFilename(name string) bool {
+	const prefix = ".commit-"
+	const suffix = ".tmp"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	stem := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	separator := strings.LastIndexByte(stem, '-')
+	if separator != sha256.Size*2 || len(stem)-separator-1 < 1 || len(stem)-separator-1 > 10 {
+		return false
+	}
+	for _, character := range stem[:separator] {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	for _, character := range stem[separator+1:] {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func journalEventFilename(position journal.JournalPosition) string {

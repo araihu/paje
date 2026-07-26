@@ -32,6 +32,7 @@ type Store struct {
 }
 
 var _ controlplane.Store = (*Store)(nil)
+var _ journal.AuthoritativeStore = (*Store)(nil)
 var installationCounter atomic.Uint64
 
 func NewStore(config ...Config) *Store {
@@ -63,6 +64,21 @@ func (s *Store) Reserve(ctx context.Context, action journal.Action) (journal.Act
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.journal.Reserve(ctx, action)
+}
+
+func (s *Store) Commit(
+	ctx context.Context,
+	request journal.CommitRequest,
+) (journal.CommitReceipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.journal.Commit(ctx, request)
+}
+
+func (s *Store) Payload(ctx context.Context, digest string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.journal.Payload(ctx, digest)
 }
 
 func (s *Store) Reservation(

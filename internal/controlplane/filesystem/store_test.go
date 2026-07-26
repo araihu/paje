@@ -1,6 +1,7 @@
 package filesystem_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1947,6 +1949,686 @@ func assertTerminalFactsHaveSingleReservedOutcome(
 		if outcomes[actionID] != 1 {
 			t.Fatalf("terminal action %q has %d J03 outcomes, want exactly 1", actionID, outcomes[actionID])
 		}
+	}
+}
+
+func TestAuthoritativeFilesystemCommitPersistsReceiptAndPayloadsAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+	// A caller clock may carry a monotonic reading and a named location. The
+	// authoritative receipt must still round-trip through canonical JSON exactly.
+	request.Outcome.OccurredAt = time.Now()
+	first, err := store.Commit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Created || first.Reservation.RunSequence != 1 || first.Reservation.JournalPosition != 1 ||
+		first.Outcome.RunSequence != 2 || first.Outcome.JournalPosition != 2 {
+		t.Fatalf("Commit() = %#v", first)
+	}
+
+	restarted, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := restarted.Commit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Created || replayed.Action != first.Action ||
+		replayed.Reservation != first.Reservation || replayed.Outcome != first.Outcome {
+		t.Fatalf("Commit(restart replay) = %#v, want immutable %#v with Created=false", replayed, first)
+	}
+	assertFilesystemPayload(t, restarted, request.Action.CanonicalRequestDigest, request.RequestPayload)
+	assertFilesystemPayload(t, restarted, request.Outcome.PayloadDigest, request.OutcomePayload)
+	feed, cursor, err := restarted.Feed(context.Background(), journal.GlobalCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != 2 || feed[0] != first.Reservation || feed[1] != first.Outcome ||
+		cursor.JournalPosition != 2 {
+		t.Fatalf("Feed(restarted) = %#v cursor %#v", feed, cursor)
+	}
+}
+
+func TestAuthoritativeFilesystemReplayAndPayloadRejectGloballyInconsistentCommit(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*filesystem.Store, journal.CommitRequest) error
+	}{
+		{
+			name: "exact replay",
+			call: func(store *filesystem.Store, request journal.CommitRequest) error {
+				_, err := store.Commit(context.Background(), request)
+				return err
+			},
+		},
+		{
+			name: "payload",
+			call: func(store *filesystem.Store, request journal.CommitRequest) error {
+				_, err := store.Payload(context.Background(), request.Action.CanonicalRequestDigest)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store, err := filesystem.New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+			if _, err := store.Commit(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+
+			path := authoritativeCommitFixturePath(root, request.Action.ID)
+			record := readAuthoritativeCommitFixture(t, path)
+			record.Reservation.RunSequence = 3
+			record.Reservation.JournalPosition = 3
+			record.Outcome.RunSequence = 4
+			record.Outcome.JournalPosition = 4
+			writeAuthoritativeCommitFixture(t, path, record)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := test.call(store, request); !errors.Is(err, controlplane.ErrCorruptStore) {
+				t.Fatalf("operation error = %v, want ErrCorruptStore", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("rejected operation mutated the corrupt authoritative record")
+			}
+			assertDirectoryEntryCount(t, filepath.Join(root, "journal", "commits"), 1)
+			assertDirectoryEntryCount(t, filepath.Join(root, "journal", "commit-staging"), 0)
+		})
+	}
+}
+
+func TestAuthoritativeFilesystemOperationsRejectLifetimeCommitDirectoryReplacement(t *testing.T) {
+	operations := []struct {
+		name    string
+		prepare bool
+		call    func(*filesystem.Store, journal.CommitRequest) error
+	}{
+		{
+			name: "commit",
+			call: func(store *filesystem.Store, request journal.CommitRequest) error {
+				_, err := store.Commit(context.Background(), request)
+				return err
+			},
+		},
+		{
+			name:    "exact replay",
+			prepare: true,
+			call: func(store *filesystem.Store, request journal.CommitRequest) error {
+				_, err := store.Commit(context.Background(), request)
+				return err
+			},
+		},
+		{
+			name:    "payload",
+			prepare: true,
+			call: func(store *filesystem.Store, request journal.CommitRequest) error {
+				_, err := store.Payload(context.Background(), request.Action.CanonicalRequestDigest)
+				return err
+			},
+		},
+	}
+	for _, replacement := range []string{"directory", "symlink"} {
+		for _, operation := range operations {
+			t.Run(replacement+"/"+operation.name, func(t *testing.T) {
+				root := t.TempDir()
+				store, err := filesystem.New(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+				if operation.prepare {
+					if _, err := store.Commit(context.Background(), request); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				commits := filepath.Join(root, "journal", "commits")
+				original := filepath.Join(t.TempDir(), "original-commits")
+				if err := os.Rename(commits, original); err != nil {
+					t.Fatal(err)
+				}
+				originalCount := directoryEntryCount(t, original)
+				switch replacement {
+				case "directory":
+					if err := os.Mkdir(commits, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				case "symlink":
+					if err := os.Symlink(original, commits); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				if err := operation.call(store, request); !errors.Is(err, controlplane.ErrCorruptStore) {
+					t.Fatalf("operation error = %v, want ErrCorruptStore", err)
+				}
+				if got := directoryEntryCount(t, original); got != originalCount {
+					t.Fatalf("original commits entries = %d, want unchanged %d", got, originalCount)
+				}
+				if replacement == "directory" {
+					assertDirectoryEntryCount(t, commits, 0)
+				}
+			})
+		}
+	}
+}
+
+func TestAuthoritativeFilesystemCommitRejectsLifetimeStagingDirectoryReplacement(t *testing.T) {
+	for _, replacement := range []string{"directory", "symlink"} {
+		t.Run(replacement, func(t *testing.T) {
+			root := t.TempDir()
+			crash := errors.New("prepared boundary reached")
+			injected := false
+			store, err := filesystem.NewWithOptions(root, filesystem.WithFaultInjector(func(boundary filesystem.DurableBoundary) error {
+				if boundary == filesystem.BoundaryAuthoritativeCommitPrepared {
+					injected = true
+					return crash
+				}
+				return nil
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			staging := filepath.Join(root, "journal", "commit-staging")
+			original := filepath.Join(t.TempDir(), "original-staging")
+			if err := os.Rename(staging, original); err != nil {
+				t.Fatal(err)
+			}
+			switch replacement {
+			case "directory":
+				if err := os.Mkdir(staging, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink(original, staging); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+			if _, err := store.Commit(context.Background(), request); !errors.Is(err, controlplane.ErrCorruptStore) {
+				t.Fatalf("Commit() error = %v, want ErrCorruptStore", err)
+			}
+			if injected {
+				t.Fatal("commit reached the prepared boundary after staging identity replacement")
+			}
+			assertDirectoryEntryCount(t, original, 0)
+			if replacement == "directory" {
+				assertDirectoryEntryCount(t, staging, 0)
+			}
+			assertDirectoryEntryCount(t, filepath.Join(root, "journal", "commits"), 0)
+		})
+	}
+}
+
+func TestAuthoritativeFilesystemRecoveryRejectsLifetimeStagingDirectoryReplacement(t *testing.T) {
+	for _, replacement := range []string{"directory", "symlink"} {
+		t.Run(replacement, func(t *testing.T) {
+			root := t.TempDir()
+			crash := errors.New("crash after preparation")
+			failPrepared := true
+			store, err := filesystem.NewWithOptions(root, filesystem.WithFaultInjector(func(boundary filesystem.DurableBoundary) error {
+				if failPrepared && boundary == filesystem.BoundaryAuthoritativeCommitPrepared {
+					failPrepared = false
+					return crash
+				}
+				return nil
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+			if _, err := store.Commit(context.Background(), request); !errors.Is(err, crash) {
+				t.Fatalf("first Commit() error = %v, want injected crash", err)
+			}
+			staging := filepath.Join(root, "journal", "commit-staging")
+			original := filepath.Join(t.TempDir(), "original-staging")
+			if err := os.Rename(staging, original); err != nil {
+				t.Fatal(err)
+			}
+			assertDirectoryEntryCount(t, original, 1)
+			switch replacement {
+			case "directory":
+				if err := os.Mkdir(staging, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink(original, staging); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if _, err := store.Commit(context.Background(), request); !errors.Is(err, controlplane.ErrCorruptStore) {
+				t.Fatalf("Commit(recovery) error = %v, want ErrCorruptStore", err)
+			}
+			assertDirectoryEntryCount(t, original, 1)
+			if replacement == "directory" {
+				assertDirectoryEntryCount(t, staging, 0)
+			}
+			assertDirectoryEntryCount(t, filepath.Join(root, "journal", "commits"), 0)
+		})
+	}
+}
+
+func TestAuthoritativeFilesystemCommitEnforcesGlobalAndPerRunCAS(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installationID := readInstallationID(t, root)
+	first := filesystemCommitRequest(t, installationID, "run-a", "action-a", "key-a")
+	if _, err := store.Commit(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := filesystemCommitRequest(t, installationID, "run-b", "action-b", "key-b")
+	if _, err := store.Commit(context.Background(), second); !errors.Is(err, journal.ErrConflict) {
+		t.Fatalf("Commit(stale global cursor) error = %v, want ErrConflict", err)
+	}
+	if _, err := store.Payload(context.Background(), second.Action.CanonicalRequestDigest); !errors.Is(err, journal.ErrNotFound) {
+		t.Fatalf("Payload(rejected global CAS) error = %v, want ErrNotFound", err)
+	}
+	second.ExpectedGlobal.JournalPosition = 2
+	secondReceipt, err := store.Commit(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondReceipt.Reservation.JournalPosition != 3 || secondReceipt.Outcome.JournalPosition != 4 {
+		t.Fatalf("second receipt = %#v", secondReceipt)
+	}
+
+	staleRun := filesystemCommitRequest(t, installationID, "run-a", "action-c", "key-c")
+	staleRun.ExpectedGlobal.JournalPosition = 4
+	if _, err := store.Commit(context.Background(), staleRun); !errors.Is(err, journal.ErrConflict) {
+		t.Fatalf("Commit(stale run cursor) error = %v, want ErrConflict", err)
+	}
+	changedReplay := first
+	changedReplay.RequestPayload = canonicalFilesystemPayload(t, map[string]any{"request": "changed"})
+	if _, err := store.Commit(context.Background(), changedReplay); !errors.Is(err, journal.ErrConflict) {
+		t.Fatalf("Commit(changed replay) error = %v, want ErrConflict", err)
+	}
+	feed, cursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != 4 || cursor.JournalPosition != 4 {
+		t.Fatalf("Feed() = %#v cursor %#v, want two complete commits", feed, cursor)
+	}
+}
+
+func TestCrashAuthoritativeFilesystemCommitNeverPublishesPartialState(t *testing.T) {
+	boundaries := []filesystem.DurableBoundary{
+		filesystem.BoundaryBeforeAuthoritativeCommit,
+		filesystem.BoundaryAuthoritativeCommitPrepared,
+		filesystem.BoundaryAuthoritativeCommitVisible,
+		filesystem.BoundaryAuthoritativeCommitResponse,
+	}
+	for _, boundary := range boundaries {
+		t.Run(string(boundary), func(t *testing.T) {
+			root := t.TempDir()
+			crash := errors.New("crash at " + string(boundary))
+			injected := false
+			store, err := filesystem.NewWithOptions(root, filesystem.WithFaultInjector(func(got filesystem.DurableBoundary) error {
+				if !injected && got == boundary {
+					injected = true
+					return crash
+				}
+				return nil
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+			if _, err := store.Commit(context.Background(), request); !errors.Is(err, crash) {
+				t.Fatalf("Commit() error = %v, want injected crash", err)
+			}
+			if !injected {
+				t.Fatal("fault boundary was not reached")
+			}
+			directFeed, directCursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			directVisible := boundary == filesystem.BoundaryAuthoritativeCommitVisible ||
+				boundary == filesystem.BoundaryAuthoritativeCommitResponse
+			if directVisible {
+				if len(directFeed) != 2 || directCursor.JournalPosition != 2 {
+					t.Fatalf("post-error visible feed = %#v cursor %#v", directFeed, directCursor)
+				}
+			} else if len(directFeed) != 0 || directCursor.JournalPosition != 0 {
+				t.Fatalf("post-error invisible feed = %#v cursor %#v", directFeed, directCursor)
+			}
+
+			restarted, err := filesystem.New(root)
+			if err != nil {
+				t.Fatalf("New(restart) error = %v", err)
+			}
+			feed, cursor, err := restarted.Feed(context.Background(), journal.GlobalCursor{}, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			visible := boundary == filesystem.BoundaryAuthoritativeCommitVisible ||
+				boundary == filesystem.BoundaryAuthoritativeCommitResponse
+			if visible {
+				if len(feed) != 2 || cursor.JournalPosition != 2 {
+					t.Fatalf("post-visibility restart feed = %#v cursor %#v", feed, cursor)
+				}
+				assertFilesystemPayload(t, restarted, request.Action.CanonicalRequestDigest, request.RequestPayload)
+				assertFilesystemPayload(t, restarted, request.Outcome.PayloadDigest, request.OutcomePayload)
+			} else {
+				if len(feed) != 0 || cursor.JournalPosition != 0 {
+					t.Fatalf("pre-visibility restart feed = %#v cursor %#v", feed, cursor)
+				}
+				if _, err := restarted.Payload(context.Background(), request.Action.CanonicalRequestDigest); !errors.Is(err, journal.ErrNotFound) {
+					t.Fatalf("Payload(pre-visibility) error = %v, want ErrNotFound", err)
+				}
+			}
+			receipt, err := restarted.Commit(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Created == visible {
+				t.Fatalf("Commit(replay) Created = %v, want %v", receipt.Created, !visible)
+			}
+			feed, cursor, err = restarted.Feed(context.Background(), journal.GlobalCursor{}, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(feed) != 2 || cursor.JournalPosition != 2 {
+				t.Fatalf("recovered feed = %#v cursor %#v", feed, cursor)
+			}
+		})
+	}
+}
+
+func TestCrashAuthoritativeFilesystemCommitNearPayloadLimitDiscardsPreparedStage(t *testing.T) {
+	root := t.TempDir()
+	crash := errors.New("crash after near-limit commit preparation")
+	store, err := filesystem.NewWithOptions(root, filesystem.WithFaultInjector(func(got filesystem.DurableBoundary) error {
+		if got == filesystem.BoundaryAuthoritativeCommitPrepared {
+			return crash
+		}
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+	nearLimit := []byte("\"" + strings.Repeat("x", journal.MaxPayloadBytes-3) + "\"\n")
+	if len(nearLimit) != journal.MaxPayloadBytes {
+		t.Fatalf("near-limit fixture bytes = %d, want %d", len(nearLimit), journal.MaxPayloadBytes)
+	}
+	request.RequestPayload = append([]byte(nil), nearLimit...)
+	request.Action.CanonicalRequestDigest = digestFilesystemPayload(request.RequestPayload)
+	request.OutcomePayload = append([]byte(nil), nearLimit...)
+	request.Outcome.PayloadDigest = digestFilesystemPayload(request.OutcomePayload)
+	if _, err := store.Commit(context.Background(), request); !errors.Is(err, crash) {
+		t.Fatalf("Commit() error = %v, want injected crash", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "journal", "commit-staging"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("prepared staging entries = %v error %v", entries, err)
+	}
+	info, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() <= int64(2*journal.MaxPayloadBytes) {
+		t.Fatalf("prepared encoded record size = %d, want base64-expanded size above %d", info.Size(), 2*journal.MaxPayloadBytes)
+	}
+
+	restarted, err := filesystem.New(root)
+	if err != nil {
+		t.Fatalf("New(restart near payload limit) error = %v", err)
+	}
+	receipt, err := restarted.Commit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.Created {
+		t.Fatalf("Commit(retry) = %#v, want newly created receipt", receipt)
+	}
+	assertFilesystemPayload(t, restarted, request.Action.CanonicalRequestDigest, nearLimit)
+	reopened, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFilesystemPayload(t, reopened, request.Outcome.PayloadDigest, nearLimit)
+}
+
+func TestAuthoritativeFilesystemCommitCorruptionSymlinkDuplicateAndUnknownFailClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{
+			name: "corrupt commit",
+			mutate: func(t *testing.T, root string) {
+				entries, err := os.ReadDir(filepath.Join(root, "journal", "commits"))
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("commit entries = %v error %v", entries, err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "journal", "commits", entries[0].Name()), []byte("{\"corrupt\":true}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink commit",
+			mutate: func(t *testing.T, root string) {
+				if err := os.Symlink(filepath.Join(root, "journal", "manifest.json"), filepath.Join(root, "journal", "commits", "symlink.json")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unknown staging entry",
+			mutate: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "journal", "commit-staging", "unknown"), []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "malformed staging entry",
+			mutate: func(t *testing.T, root string) {
+				path := filepath.Join(root, "journal", "commit-staging", ".commit-not-an-action-hash-1.tmp")
+				if err := os.WriteFile(path, []byte("incomplete"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store, err := filesystem.New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := filesystemCommitRequest(t, readInstallationID(t, root), "run-a", "action-a", "key-a")
+			if _, err := store.Commit(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, root)
+			if _, err := filesystem.New(root); !errors.Is(err, controlplane.ErrCorruptStore) {
+				t.Fatalf("New(corrupt authoritative commit) error = %v, want ErrCorruptStore", err)
+			}
+		})
+	}
+}
+
+func TestAuthoritativeFilesystemCommitRejectsStructurallyValidDuplicateIdentity(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installationID := readInstallationID(t, root)
+	first := filesystemCommitRequest(t, installationID, "run-a", "action-a", "key-a")
+	if _, err := store.Commit(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := filesystemCommitRequest(t, installationID, "run-b", "action-b", "key-b")
+	second.ExpectedGlobal.JournalPosition = 2
+	if _, err := store.Commit(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filesystem.New(root); err != nil {
+		t.Fatalf("New(structurally valid second commit) error = %v", err)
+	}
+
+	path := authoritativeCommitFixturePath(root, second.Action.ID)
+	record := readAuthoritativeCommitFixture(t, path)
+	record.Action.IdempotencyKey = first.Action.IdempotencyKey
+	actionDigest, err := journal.Digest(record.Action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Reservation.PayloadDigest = actionDigest
+	writeAuthoritativeCommitFixture(t, path, record)
+	if _, err := filesystem.New(root); !errors.Is(err, controlplane.ErrCorruptStore) {
+		t.Fatalf("New(duplicate idempotency identity) error = %v, want ErrCorruptStore", err)
+	}
+}
+
+type authoritativeCommitFixture struct {
+	SchemaVersion  string         `json:"schema_version"`
+	Action         journal.Action `json:"action"`
+	Reservation    journal.Event  `json:"reservation"`
+	Outcome        journal.Event  `json:"outcome"`
+	RequestPayload []byte         `json:"request_payload"`
+	OutcomePayload []byte         `json:"outcome_payload"`
+}
+
+func authoritativeCommitFixturePath(root, actionID string) string {
+	return filepath.Join(
+		root, "journal", "commits", fmt.Sprintf("%x.json", sha256.Sum256([]byte(actionID))),
+	)
+}
+
+func readAuthoritativeCommitFixture(t *testing.T, path string) authoritativeCommitFixture {
+	t.Helper()
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record authoritativeCommitFixture
+	if err := json.Unmarshal(encoded, &record); err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+func writeAuthoritativeCommitFixture(t *testing.T, path string, record authoritativeCommitFixture) {
+	t.Helper()
+	encoded, err := journal.CanonicalJSON(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func directoryEntryCount(t *testing.T, path string) int {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+func assertDirectoryEntryCount(t *testing.T, path string, want int) {
+	t.Helper()
+	if got := directoryEntryCount(t, path); got != want {
+		t.Fatalf("directory %q entries = %d, want %d", path, got, want)
+	}
+}
+
+func filesystemCommitRequest(
+	t *testing.T,
+	installationID, runID, actionID, key string,
+) journal.CommitRequest {
+	t.Helper()
+	requestPayload := canonicalFilesystemPayload(t, map[string]any{
+		"action_id":      actionID,
+		"control_run_id": runID,
+		"principal":      "principal-a",
+		"project":        "project-a",
+		"request":        "admit",
+	})
+	outcomePayload := canonicalFilesystemPayload(t, map[string]any{
+		"decision": "admit",
+		"weight":   1,
+	})
+	return journal.CommitRequest{
+		Action: journal.Action{
+			ID: actionID, ControlRunID: runID, TaskID: "task-a", AttemptID: "attempt-a",
+			Kind: journal.KindDispatch, GraphRevision: 1, ExpectedProjection: 1,
+			CanonicalRequestDigest: digestFilesystemPayload(requestPayload), IdempotencyKey: key,
+		},
+		ExpectedRun:    journal.NewRunCursor(installationID, runID),
+		ExpectedGlobal: journal.NewGlobalCursor(installationID),
+		RequestPayload: requestPayload,
+		Outcome: journal.Event{
+			ID: "outcome-" + actionID, ControlRunID: runID, ActionID: actionID,
+			Kind: journal.EventActionResult, PayloadDigest: digestFilesystemPayload(outcomePayload),
+			OccurredAt: time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC),
+		},
+		OutcomePayload: outcomePayload,
+	}
+}
+
+func canonicalFilesystemPayload(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := journal.CanonicalJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func digestFilesystemPayload(value []byte) string {
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(value))
+}
+
+func assertFilesystemPayload(t *testing.T, store journal.AuthoritativeStore, digest string, want []byte) {
+	t.Helper()
+	got, err := store.Payload(context.Background(), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Payload(%q) = %q, want %q", digest, got, want)
+	}
+	if len(got) != 0 {
+		got[0] ^= 0xff
+	}
+	again, err := store.Payload(context.Background(), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, want) {
+		t.Fatalf("Payload(%q) was mutable: %q, want %q", digest, again, want)
 	}
 }
 

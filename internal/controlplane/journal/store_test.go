@@ -1,15 +1,18 @@
 package journal_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/araihu/paje/internal/controlplane/journal"
+	controlplanemock "github.com/araihu/paje/internal/controlplane/mock"
 )
 
 func TestJournalConcurrentExactReservationCreatesOneActionAndEvent(t *testing.T) {
@@ -409,6 +412,314 @@ func TestJournalZeroReadCursorBootstrapsImmutableInstallationBinding(t *testing.
 	if len(runEvents) != 1 || run.InstallationID != "installation-a" ||
 		run.SchemaVersion != journal.SchemaVersion || run.RunSequence != 1 {
 		t.Fatalf("RunEvents(zero cursor) = %#v cursor %#v", runEvents, run)
+	}
+}
+
+func TestAuthoritativeCommitAtomicallyBindsPayloadsAndReplaysWithStaleCursors(t *testing.T) {
+	t.Parallel()
+
+	store, err := journal.NewMemoryStore("installation-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := authoritativeCommitRequest(t, "installation-a", "run-a", "action-a", "key-a")
+	first, err := store.Commit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Created || first.Action != request.Action || first.Outcome.RunSequence != 2 ||
+		first.Outcome.JournalPosition != 2 || first.Reservation.RunSequence != 1 ||
+		first.Reservation.JournalPosition != 1 {
+		t.Fatalf("Commit() receipt = %#v", first)
+	}
+	assertPayloadBytes(t, store, request.Action.CanonicalRequestDigest, request.RequestPayload)
+	assertPayloadBytes(t, store, request.Outcome.PayloadDigest, request.OutcomePayload)
+
+	replayed, err := store.Commit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Created || replayed.Action != first.Action ||
+		replayed.Reservation != first.Reservation || replayed.Outcome != first.Outcome {
+		t.Fatalf("Commit(replay) = %#v, want immutable %#v with Created=false", replayed, first)
+	}
+	feed, cursor, err := store.Feed(context.Background(), journal.NewGlobalCursor("installation-a"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != 2 || feed[0] != first.Reservation || feed[1] != first.Outcome ||
+		cursor.JournalPosition != 2 {
+		t.Fatalf("Feed() = %#v cursor %#v", feed, cursor)
+	}
+}
+
+func TestAuthoritativeCommitRejectsChangedReplayAndStaleGlobalCASWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	store, err := journal.NewMemoryStore("installation-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := authoritativeCommitRequest(t, "installation-a", "run-a", "action-a", "key-a")
+	if _, err := store.Commit(context.Background(), original); err != nil {
+		t.Fatal(err)
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*journal.CommitRequest)
+	}{
+		{
+			name: "request payload",
+			mutate: func(request *journal.CommitRequest) {
+				request.RequestPayload = canonicalPayload(t, map[string]any{"request": "changed"})
+			},
+		},
+		{
+			name: "outcome",
+			mutate: func(request *journal.CommitRequest) {
+				request.Outcome.ProviderReceipt = "changed-receipt"
+			},
+		},
+		{
+			name: "outcome payload",
+			mutate: func(request *journal.CommitRequest) {
+				request.OutcomePayload = canonicalPayload(t, map[string]any{"decision": "defer"})
+			},
+		},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			changed := original
+			changed.RequestPayload = append([]byte(nil), original.RequestPayload...)
+			changed.OutcomePayload = append([]byte(nil), original.OutcomePayload...)
+			test.mutate(&changed)
+			if _, err := store.Commit(context.Background(), changed); !errors.Is(err, journal.ErrConflict) {
+				t.Fatalf("Commit(changed replay) error = %v, want ErrConflict", err)
+			}
+		})
+	}
+
+	stale := authoritativeCommitRequest(t, "installation-a", "run-b", "action-b", "key-b")
+	if _, err := store.Commit(context.Background(), stale); !errors.Is(err, journal.ErrConflict) {
+		t.Fatalf("Commit(stale global cursor) error = %v, want ErrConflict", err)
+	}
+	if _, err := store.Payload(context.Background(), stale.Action.CanonicalRequestDigest); !errors.Is(err, journal.ErrNotFound) {
+		t.Fatalf("Payload(rejected request) error = %v, want ErrNotFound", err)
+	}
+	feed, cursor, err := store.Feed(context.Background(), journal.NewGlobalCursor("installation-a"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != 2 || cursor.JournalPosition != 2 {
+		t.Fatalf("rejected commits changed feed: %#v cursor %#v", feed, cursor)
+	}
+}
+
+func TestAuthoritativeCommitGlobalCursorAllowsExactlyOneConcurrentRun(t *testing.T) {
+	t.Parallel()
+
+	store, err := journal.NewMemoryStore("installation-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := []journal.CommitRequest{
+		authoritativeCommitRequest(t, "installation-a", "run-a", "action-a", "key-a"),
+		authoritativeCommitRequest(t, "installation-a", "run-b", "action-b", "key-b"),
+	}
+	type result struct {
+		index   int
+		receipt journal.CommitReceipt
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan result, len(requests))
+	for index := range requests {
+		go func() {
+			<-start
+			receipt, commitErr := store.Commit(context.Background(), requests[index])
+			results <- result{index: index, receipt: receipt, err: commitErr}
+		}()
+	}
+	close(start)
+	winner := -1
+	for range requests {
+		got := <-results
+		switch {
+		case got.err == nil:
+			if winner != -1 || !got.receipt.Created {
+				t.Fatalf("unexpected successful receipt %#v after winner %d", got.receipt, winner)
+			}
+			winner = got.index
+		case !errors.Is(got.err, journal.ErrConflict):
+			t.Fatalf("Commit(concurrent) error = %v, want ErrConflict", got.err)
+		}
+	}
+	if winner == -1 {
+		t.Fatal("no concurrent commit won the global cursor CAS")
+	}
+	loser := 1 - winner
+	if _, err := store.Payload(context.Background(), requests[loser].Action.CanonicalRequestDigest); !errors.Is(err, journal.ErrNotFound) {
+		t.Fatalf("Payload(loser) error = %v, want ErrNotFound", err)
+	}
+	feed, cursor, err := store.Feed(context.Background(), journal.NewGlobalCursor("installation-a"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != 2 || cursor.JournalPosition != 2 {
+		t.Fatalf("Feed() = %#v cursor %#v, want one atomic two-event commit", feed, cursor)
+	}
+}
+
+func TestAuthoritativeCommitRejectsUnsafePayloadsBeforeMutation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*journal.CommitRequest)
+	}{
+		{
+			name: "malformed request",
+			mutate: func(request *journal.CommitRequest) {
+				request.RequestPayload = []byte(`{"request":`)
+				request.Action.CanonicalRequestDigest = digestBytes(request.RequestPayload)
+			},
+		},
+		{
+			name: "noncanonical request",
+			mutate: func(request *journal.CommitRequest) {
+				request.RequestPayload = []byte("{\"request\":\"admit\"}")
+				request.Action.CanonicalRequestDigest = digestBytes(request.RequestPayload)
+			},
+		},
+		{
+			name: "mismatched request digest",
+			mutate: func(request *journal.CommitRequest) {
+				request.Action.CanonicalRequestDigest = digest("different")
+			},
+		},
+		{
+			name: "noncanonical outcome",
+			mutate: func(request *journal.CommitRequest) {
+				request.OutcomePayload = []byte(" {\"decision\":\"admit\"}\n")
+				request.Outcome.PayloadDigest = digestBytes(request.OutcomePayload)
+			},
+		},
+		{
+			name: "oversized outcome",
+			mutate: func(request *journal.CommitRequest) {
+				request.OutcomePayload = []byte("\"" + strings.Repeat("x", journal.MaxPayloadBytes) + "\"\n")
+				request.Outcome.PayloadDigest = digestBytes(request.OutcomePayload)
+			},
+		},
+		{
+			name: "oversized cursor identity",
+			mutate: func(request *journal.CommitRequest) {
+				identity := strings.Repeat("i", 129)
+				request.ExpectedRun.InstallationID = identity
+				request.ExpectedGlobal.InstallationID = identity
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := journal.NewMemoryStore("installation-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := authoritativeCommitRequest(t, "installation-a", "run-a", "action-a", "key-a")
+			test.mutate(&request)
+			if _, err := store.Commit(context.Background(), request); !errors.Is(err, journal.ErrInvalidRecord) {
+				t.Fatalf("Commit(unsafe payload) error = %v, want ErrInvalidRecord", err)
+			}
+			feed, cursor, err := store.Feed(context.Background(), journal.NewGlobalCursor("installation-a"), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(feed) != 0 || cursor.JournalPosition != 0 {
+				t.Fatalf("unsafe payload changed feed: %#v cursor %#v", feed, cursor)
+			}
+		})
+	}
+}
+
+func TestAuthoritativeMockStoreCommitsAndReturnsImmutablePayload(t *testing.T) {
+	t.Parallel()
+
+	store := controlplanemock.NewStore()
+	request := authoritativeCommitRequest(t, store.InstallationID(), "run-a", "action-a", "key-a")
+	receipt, err := store.Commit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.Created || receipt.Action != request.Action {
+		t.Fatalf("Commit() = %#v", receipt)
+	}
+	assertPayloadBytes(t, store, request.Action.CanonicalRequestDigest, request.RequestPayload)
+}
+
+func authoritativeCommitRequest(
+	t *testing.T,
+	installationID, runID, actionID, key string,
+) journal.CommitRequest {
+	t.Helper()
+	requestPayload := canonicalPayload(t, map[string]any{
+		"action_id":      actionID,
+		"control_run_id": runID,
+		"principal":      "principal-a",
+		"project":        "project-a",
+		"request":        "admit",
+	})
+	outcomePayload := canonicalPayload(t, map[string]any{
+		"decision": "admit",
+		"weight":   1,
+	})
+	action := testAction(runID, actionID, key, "placeholder")
+	action.CanonicalRequestDigest = digestBytes(requestPayload)
+	return journal.CommitRequest{
+		Action:         action,
+		ExpectedRun:    journal.NewRunCursor(installationID, runID),
+		ExpectedGlobal: journal.NewGlobalCursor(installationID),
+		RequestPayload: requestPayload,
+		Outcome: journal.Event{
+			ID: "outcome-" + actionID, ControlRunID: runID, ActionID: actionID,
+			Kind: journal.EventActionResult, PayloadDigest: digestBytes(outcomePayload),
+			OccurredAt: time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC),
+		},
+		OutcomePayload: outcomePayload,
+	}
+}
+
+func canonicalPayload(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := journal.CanonicalJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func digestBytes(value []byte) string {
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(value))
+}
+
+func assertPayloadBytes(t *testing.T, store journal.AuthoritativeStore, digest string, want []byte) {
+	t.Helper()
+	got, err := store.Payload(context.Background(), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Payload(%q) = %q, want %q", digest, got, want)
+	}
+	if len(got) != 0 {
+		got[0] ^= 0xff
+	}
+	again, err := store.Payload(context.Background(), digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, want) {
+		t.Fatalf("Payload(%q) was mutable: %q, want %q", digest, again, want)
 	}
 }
 
