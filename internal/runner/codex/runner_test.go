@@ -83,7 +83,7 @@ func TestRunRejectsSuccessfulStreamWithoutAgentMessage(t *testing.T) {
 	}
 }
 
-func TestRunIgnoresNonJSONDiagnosticsAroundCodexEvents(t *testing.T) {
+func TestRunRejectsNonJSONDiagnosticsAroundCodexEvents(t *testing.T) {
 	t.Parallel()
 
 	executor, err := codex.New(os.Args[0])
@@ -95,11 +95,8 @@ func TestRunIgnoresNonJSONDiagnosticsAroundCodexEvents(t *testing.T) {
 		WorkspacePath:   t.TempDir(),
 		Env:             map[string]string{"GO_WANT_CODEX_HELPER": "1"},
 	})
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.Output != "completed after diagnostic" {
-		t.Errorf("Output = %q, want agent message", result.Output)
+	if err == nil {
+		t.Fatal("Run() error = nil, want non-JSON protocol denial")
 	}
 	if !strings.Contains(result.Transcript, "Reading additional input from stdin") {
 		t.Errorf("Transcript = %q, want raw diagnostic preserved", result.Transcript)
@@ -132,6 +129,26 @@ func TestRunPreservesNonzeroCodexDiagnostic(t *testing.T) {
 	}
 }
 
+func TestRunRejectsTruncatedSuccessfulCodexStream(t *testing.T) {
+	t.Parallel()
+
+	executor, err := codex.New(os.Args[0])
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := executor.Run(context.Background(), runner.RunRequest{
+		TaskDescription: "truncated-success",
+		WorkspacePath:   t.TempDir(),
+		Env:             map[string]string{"GO_WANT_CODEX_HELPER": "1"},
+	})
+	if err == nil {
+		t.Fatal("Run() error = nil, want truncated protocol denial")
+	}
+	if !result.Truncated {
+		t.Fatal("Run() did not preserve truncation evidence")
+	}
+}
+
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_CODEX_HELPER") != "1" {
 		return
@@ -161,16 +178,22 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"thread.started","thread_id":"thread-1"}`)
 		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"first completed message"}}`)
 		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"second completed message"}}`)
+		fmt.Println(`{"type":"turn.completed"}`)
 	case "no-agent-message":
 		fmt.Println(`{"type":"thread.started","thread_id":"thread-1"}`)
 		fmt.Println(`{"type":"item.completed","item":{"type":"reasoning","text":"internal"}}`)
+		fmt.Println(`{"type":"turn.completed"}`)
 	case "diagnostic-before-json":
 		fmt.Fprintln(os.Stderr, "Reading additional input from stdin...")
 		fmt.Println(`{"type":"thread.started","thread_id":"thread-1"}`)
 		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"completed after diagnostic"}}`)
+		fmt.Println(`{"type":"turn.completed"}`)
 	case "exit-9":
 		fmt.Fprintln(os.Stderr, "codex: refused to execute")
 		os.Exit(9)
+	case "truncated-success":
+		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"must not be trusted"}}`)
+		fmt.Print(strings.Repeat("x", (1<<20)+1))
 	}
 	os.Exit(0)
 }
