@@ -177,7 +177,35 @@ func (materialization Materialization) Delivery() string { return materializatio
 func (materialization Materialization) Target() string   { return materialization.target }
 func (materialization Materialization) Value() []byte    { return slices.Clone(materialization.value) }
 func (materialization Materialization) Files() []File    { return cloneFiles(materialization.files) }
-func (materialization Materialization) String() string   { return "[secret materialization]" }
+
+// ValueBounded returns a caller-owned copy only when the retained value fits
+// the supplied byte budget. It never serializes or exposes the retained value.
+func (materialization Materialization) ValueBounded(maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 || len(materialization.value) == 0 || int64(len(materialization.value)) > maxBytes {
+		return nil, errors.New("secret materialization exceeds byte budget")
+	}
+	return slices.Clone(materialization.value), nil
+}
+
+// FilesBounded returns caller-owned file copies only when both the file count
+// and aggregate contents fit the supplied budgets. Bounds are checked before
+// any file contents are cloned.
+func (materialization Materialization) FilesBounded(maxFiles int, maxBytes, maxFileBytes int64) ([]File, error) {
+	if maxFiles < 0 || maxBytes < 0 || maxFileBytes <= 0 ||
+		len(materialization.files) == 0 || len(materialization.files) > maxFiles {
+		return nil, errors.New("secret materialization exceeds file budget")
+	}
+	var total int64
+	for index := range materialization.files {
+		size := int64(len(materialization.files[index].bytes))
+		if size <= 0 || size > maxFileBytes || total > maxBytes-size {
+			return nil, errors.New("secret materialization exceeds byte budget")
+		}
+		total += size
+	}
+	return cloneFiles(materialization.files), nil
+}
+func (materialization Materialization) String() string { return "[secret materialization]" }
 func (Materialization) Format(state fmt.State, _ rune) {
 	_, _ = state.Write([]byte("[secret materialization]"))
 }

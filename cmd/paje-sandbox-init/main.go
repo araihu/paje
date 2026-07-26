@@ -25,10 +25,30 @@ type operations struct {
 }
 
 func main() {
-	if err := runDocument(sandboxinit.DocumentPath, realOperations()); err != nil {
+	if err := run(os.Args[1:], os.Stdin, realOperations()); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "paje-sandbox-init: initialization failed")
 		os.Exit(1)
 	}
+}
+
+func run(arguments []string, stdin io.Reader, ops operations) error {
+	switch {
+	case len(arguments) == 0:
+		return runDocument(sandboxinit.DocumentPath, ops)
+	case len(arguments) == 1 && arguments[0] == "--bootstrap-stdin":
+		return runBootstrap(stdin, "/", ops)
+	case len(arguments) == 1 && filepath.IsAbs(arguments[0]):
+		return runDocument(arguments[0], ops)
+	default:
+		return errors.New("sandbox init invocation is invalid")
+	}
+}
+
+func runBootstrap(stdin io.Reader, root string, ops operations) error {
+	if err := sandboxinit.ExtractBootstrap(stdin, root); err != nil {
+		return err
+	}
+	return runDocument(sandboxinit.DocumentPath, ops)
 }
 
 func runDocument(documentPath string, ops operations) error {

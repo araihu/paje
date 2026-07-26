@@ -164,6 +164,28 @@ func TestRunnerDoesNotDestroyCollidingAttemptItDidNotCreate(t *testing.T) {
 	}
 }
 
+func TestRunnerDestroysAmbiguousAttemptWithoutCreatedEvidence(t *testing.T) {
+	target := &recordingExecutor{
+		err: executor.WrapError("internal", "ambiguous_attempt", errors.New("create response lost")),
+	}
+	runner, err := New(Config{
+		Executor: target, Profile: commandProfile(t), Attempt: commandAttempt(),
+		Workspace: t.TempDir(), Environment: map[string]string{"PATH": "/usr/bin:/bin"}, OutputLimit: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := runner.Run(context.Background(), verification.Command{
+		Name: "go version", Directory: ".", Executable: "go", Timeout: time.Minute, Required: true,
+	})
+	if got.Passed || got.FailureClass != "internal" || got.CauseCode != "ambiguous_attempt" {
+		t.Fatalf("Run() = %#v", got)
+	}
+	if target.destroyCalls != 1 {
+		t.Fatalf("ambiguous attempt cleanup calls = %d, want 1", target.destroyCalls)
+	}
+}
+
 type recordingExecutor struct {
 	requests       []executor.Request
 	result         executor.Result

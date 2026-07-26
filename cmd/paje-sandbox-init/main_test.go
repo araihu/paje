@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +15,81 @@ import (
 	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/sandboxinit"
 )
+
+func TestRunBootstrapExtractsLiveArchiveBeforeExecutingDocument(t *testing.T) {
+	document := sandboxinit.Document{
+		WorkspaceRoot: "/workspace",
+		Command:       executor.Command{Executable: "codex", Directory: "/workspace"},
+		Environment:   map[string]string{"PATH": "/usr/bin:/bin"},
+		EnvironmentFiles: map[string]string{
+			"CODEX_TOKEN": "/run/paje/secrets/token",
+		},
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	writer := tar.NewWriter(&archive)
+	for name, value := range map[string][]byte{
+		"run/paje/command.json":  encoded,
+		"run/paje/secrets/token": []byte("secret"),
+	} {
+		if err := writer.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o400, Size: int64(len(value)), Typeflag: tar.TypeReg,
+			Uid: sandboxinit.BootstrapUID, Gid: sandboxinit.BootstrapGID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	execReturned := errors.New("exec returned")
+	ops := realOperations()
+	ops.resolve = func(string, string, map[string]string) (string, error) {
+		return "/usr/bin/codex", nil
+	}
+	ops.chdir = func(string) error { return nil }
+	ops.exec = func(string, []string, []string) error { return execReturned }
+	ops.readFile = func(name string, limit int64) ([]byte, error) {
+		if name == sandboxinit.DocumentPath {
+			name = filepath.Join(root, "run", "paje", "command.json")
+		} else if name == sandboxinit.SecretRoot+"/token" {
+			name = filepath.Join(root, "run", "paje", "secrets", "token")
+		}
+		return readBoundedRegularFile(name, limit)
+	}
+	ops.remove = func(name string) error {
+		if name == sandboxinit.DocumentPath {
+			name = filepath.Join(root, "run", "paje", "command.json")
+		} else if name == sandboxinit.SecretRoot+"/token" {
+			name = filepath.Join(root, "run", "paje", "secrets", "token")
+		}
+		return os.Remove(name)
+	}
+	if err := runBootstrap(bytes.NewReader(archive.Bytes()), root, ops); !errors.Is(err, execReturned) {
+		t.Fatalf("runBootstrap() = %v", err)
+	}
+	for _, name := range []string{
+		filepath.Join(root, "run", "paje", "command.json"),
+		filepath.Join(root, "run", "paje", "secrets", "token"),
+	} {
+		if _, err := os.Stat(name); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("private bootstrap material remains at %s: %v", name, err)
+		}
+	}
+}
+
+func TestRunRejectsUnknownSandboxInitMode(t *testing.T) {
+	if err := run([]string{"--unknown"}, io.NopCloser(bytes.NewReader(nil)), realOperations()); err == nil {
+		t.Fatal("unknown sandbox-init mode succeeded")
+	}
+}
 
 func TestRunDocumentExecutesExactArgvAndEnvironmentThenRemovesMaterial(t *testing.T) {
 	document := sandboxinit.Document{

@@ -99,7 +99,7 @@ func (runner *Runner) Run(ctx context.Context, command verification.Command) ver
 	result.Truncated = execution.StdoutTruncated || execution.StderrTruncated
 	classify(&result, execution, executeErr, command.Required)
 
-	if execution.Created {
+	if execution.Created || ambiguousAttempt(executeErr) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		destroyErr := runner.target.Destroy(cleanupCtx, attempt)
 		cancel()
@@ -108,6 +108,11 @@ func (runner *Runner) Run(ctx context.Context, command verification.Command) ver
 		}
 	}
 	return result
+}
+
+func ambiguousAttempt(err error) bool {
+	var providerError *executor.ProviderError
+	return errors.As(err, &providerError) && providerError.CauseCode == "ambiguous_attempt"
 }
 
 func nilExecutor(target executor.Executor) bool {
