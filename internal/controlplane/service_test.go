@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/araihu/paje/internal/agentharness"
 	"github.com/araihu/paje/internal/controlplane"
+	"github.com/araihu/paje/internal/controlplane/journal"
 	controlmock "github.com/araihu/paje/internal/controlplane/mock"
 )
 
@@ -405,6 +407,15 @@ func TestPrepareObserveLosesCASRaceToCursorAdvanceWithoutPersistingStaleAction(t
 			t.Fatalf("stale observe action persisted: %#v", action)
 		}
 	}
+	feed, _, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range feed {
+		if event.Kind == journal.EventActionReserved && snapshot.Actions[event.ActionID].ID == "" {
+			t.Fatalf("stale observe reservation persisted without snapshot binding: %#v", event)
+		}
+	}
 	beforeStaleRetry := snapshot
 	restarted := controlplane.NewService(store, controlplane.WithClock(fixedClock))
 	if _, _, err := restarted.PrepareObserve(
@@ -419,6 +430,299 @@ func TestPrepareObserveLosesCASRaceToCursorAdvanceWithoutPersistingStaleAction(t
 	if afterStaleRetry.Run.EventCursor != beforeStaleRetry.Run.EventCursor ||
 		len(afterStaleRetry.Events) != len(beforeStaleRetry.Events) || len(afterStaleRetry.Actions) != len(beforeStaleRetry.Actions) {
 		t.Fatalf("stale restart retry mutated state: before=%#v after=%#v", beforeStaleRetry, afterStaleRetry)
+	}
+}
+
+func TestReservationCASLoserIsNotJournaledAndEligibleRetrySucceeds(t *testing.T) {
+	store, service, runID, attempt := persistentService(t)
+	activatePersistentAttempt(t, service, runID, attempt.ID, "runtime-reservation-cas", "cursor-1", 1)
+
+	barrier := newLoadBarrierStore(store, 2)
+	concurrent := controlplane.NewService(barrier, controlplane.WithClock(fixedClock))
+	type preparation struct {
+		kind   agentharness.ActionKind
+		digest string
+		action controlplane.LifecycleAction
+		err    error
+	}
+	results := make(chan preparation, 2)
+	prepare := func(kind agentharness.ActionKind, requestDigest string) {
+		action, err := concurrent.PrepareAction(
+			context.Background(), runID, attempt.ID, kind, requestDigest,
+		)
+		results <- preparation{kind: kind, digest: requestDigest, action: action, err: err}
+	}
+	go prepare(agentharness.ActionWait, digest("reservation-cas-wait"))
+	go prepare(agentharness.ActionSend, digest("reservation-cas-send"))
+
+	first, second := <-results, <-results
+	var winner, loser preparation
+	for _, result := range []preparation{first, second} {
+		switch {
+		case result.err == nil:
+			winner = result
+		case errors.Is(result.err, controlplane.ErrVersionConflict):
+			loser = result
+		default:
+			t.Fatalf("PrepareAction() error = %v, want success or ErrVersionConflict", result.err)
+		}
+	}
+	if winner.action.ID == "" || loser.kind == "" {
+		t.Fatalf("concurrent preparations = %#v, %#v, want one winner and one CAS loser", first, second)
+	}
+
+	afterRace, err := store.Load(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed, _, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range feed {
+		if event.Kind == journal.EventActionReserved && afterRace.Actions[event.ActionID].ID == "" {
+			t.Fatalf("CAS loser left unbound reservation %#v", event)
+		}
+	}
+
+	retried, err := controlplane.NewService(store, controlplane.WithClock(fixedClock)).PrepareAction(
+		context.Background(), runID, attempt.ID, loser.kind, loser.digest,
+	)
+	if err != nil {
+		t.Fatalf("PrepareAction(eligible loser retry) error = %v", err)
+	}
+	if retried.ID == "" || retried.ID == winner.action.ID {
+		t.Fatalf("eligible retry = %#v, winner %#v", retried, winner.action)
+	}
+}
+
+func TestOutcomeSaveRejectsMultipleTerminalActionsInMockWithoutJournalMutation(t *testing.T) {
+	store, service, runID, attempt := persistentService(t)
+	activatePersistentAttempt(t, service, runID, attempt.ID, "runtime-multi-outcome", "cursor-1", 1)
+	first, err := service.PrepareAction(
+		context.Background(), runID, attempt.ID, agentharness.ActionSend, digest("multi-outcome-first"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.PrepareAction(
+		context.Background(), runID, attempt.ID, agentharness.ActionSend, digest("multi-outcome-second"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Load(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := controlplane.CloneSnapshot(current)
+	for index, actionID := range []string{first.ID, second.ID} {
+		action := next.Actions[actionID]
+		action.Completed = true
+		action.CompletedAt = fixedClock()
+		action.Result = agentharness.ActionResult{
+			ActionID: actionID, RuntimeWorkIDs: []string{"runtime-multi-outcome"},
+			ResultDigest:   digest(fmt.Sprintf("multi-outcome-result-%d", index)),
+			MessageReceipt: fmt.Sprintf("receipt-%d", index),
+		}
+		next.Actions[actionID] = action
+	}
+	beforeFeed, beforeCursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for retry := 0; retry < 5; retry++ {
+		if _, err := store.Save(context.Background(), next, current.Version); !errors.Is(err, controlplane.ErrInvalidRecord) {
+			t.Fatalf("Save(two terminal outcomes, retry %d) error = %v, want ErrInvalidRecord", retry, err)
+		}
+		loaded, loadErr := controlplane.NewService(store).Load(context.Background(), runID)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if !reflect.DeepEqual(loaded, current) {
+			t.Fatalf("rejected multi-outcome Save changed snapshot on retry %d", retry)
+		}
+		feed, cursor, feedErr := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+		if feedErr != nil {
+			t.Fatal(feedErr)
+		}
+		if !reflect.DeepEqual(feed, beforeFeed) || cursor != beforeCursor {
+			t.Fatalf("rejected multi-outcome Save changed journal on retry %d", retry)
+		}
+	}
+	single := controlplane.CloneSnapshot(current)
+	single.Actions[first.ID] = next.Actions[first.ID]
+	saved, err := store.Save(context.Background(), single, current.Version)
+	if err != nil {
+		t.Fatalf("Save(single terminal outcome): %v", err)
+	}
+	if !saved.Actions[first.ID].Completed || saved.Actions[second.ID].Completed {
+		t.Fatalf("single-outcome Save = first %#v second %#v", saved.Actions[first.ID], saved.Actions[second.ID])
+	}
+	feed, _, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != len(beforeFeed)+1 || feed[len(feed)-1].Kind != journal.EventActionResult ||
+		feed[len(feed)-1].ActionID != first.ID {
+		t.Fatalf("single-outcome journal binding = %#v", feed[len(feed)-1])
+	}
+}
+
+func TestRebindOutcomeSavePreflightRejectsMissingReservationAndImmutableIdentityInMock(t *testing.T) {
+	t.Run("missing reservation", func(t *testing.T) {
+		store, _, runID, attempt := persistentService(t)
+		current, err := store.Load(context.Background(), runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := controlplane.CloneSnapshot(current)
+		action := controlplane.LifecycleAction{
+			ID: "unreserved-action", AttemptID: attempt.ID, Kind: agentharness.ActionSend,
+			RequestDigest: digest("unreserved-request"), PreparedAt: fixedClock(),
+		}
+		pending.Actions[action.ID] = action
+		pendingAttempt := pending.Attempts[attempt.ID]
+		pendingAttempt.ActionIDs = append(pendingAttempt.ActionIDs, action.ID)
+		pending.Attempts[attempt.ID] = pendingAttempt
+		pending, err = store.Save(context.Background(), pending, current.Version)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		beforeFeed, beforeCursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		terminal := controlplane.CloneSnapshot(pending)
+		unreserved := terminal.Actions[action.ID]
+		unreserved.Ambiguous = true
+		unreserved.AmbiguityCode = "missing_reservation"
+		terminal.Actions[action.ID] = unreserved
+		if _, err := store.Save(context.Background(), terminal, pending.Version); err == nil {
+			t.Fatal("Save(unreserved terminal outcome) error = nil")
+		}
+		assertMockStoreUnchanged(t, store, pending, beforeFeed, beforeCursor)
+	})
+
+	mutations := []struct {
+		name   string
+		mutate func(*controlplane.Snapshot, string, controlplane.PlacementAttempt)
+	}{
+		{
+			name: "request digest",
+			mutate: func(next *controlplane.Snapshot, actionID string, _ controlplane.PlacementAttempt) {
+				action := next.Actions[actionID]
+				action.RequestDigest = digest("rebound-request")
+				next.Actions[actionID] = action
+			},
+		},
+		{
+			name: "kind",
+			mutate: func(next *controlplane.Snapshot, actionID string, _ controlplane.PlacementAttempt) {
+				action := next.Actions[actionID]
+				action.Kind = agentharness.ActionInterrupt
+				next.Actions[actionID] = action
+			},
+		},
+		{
+			name: "attempt",
+			mutate: func(next *controlplane.Snapshot, actionID string, attempt controlplane.PlacementAttempt) {
+				rebound := attempt
+				rebound.ID = "attempt-rebound"
+				rebound.State = controlplane.AttemptCompleted
+				rebound.ActionIDs = nil
+				next.Attempts[rebound.ID] = rebound
+				action := next.Actions[actionID]
+				action.AttemptID = rebound.ID
+				next.Actions[actionID] = action
+			},
+		},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			store, service, runID, attempt := persistentService(t)
+			prepared, err := service.PrepareAction(
+				context.Background(), runID, attempt.ID, agentharness.ActionSend, digest("immutable-request"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, err := store.Load(context.Background(), runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeFeed, beforeCursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := controlplane.CloneSnapshot(current)
+			action := next.Actions[prepared.ID]
+			action.Ambiguous = true
+			action.AmbiguityCode = "rebound_identity"
+			next.Actions[prepared.ID] = action
+			test.mutate(&next, prepared.ID, attempt)
+			if _, err := store.Save(context.Background(), next, current.Version); err == nil {
+				t.Fatal("Save(rebound terminal outcome) error = nil")
+			}
+			assertMockStoreUnchanged(t, store, current, beforeFeed, beforeCursor)
+		})
+	}
+}
+
+func TestUnknownKindSnapshotValidationFailsClosed(t *testing.T) {
+	store, _, runID, attempt := persistentService(t)
+	snapshot, err := store.Load(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := controlplane.LifecycleAction{
+		ID: "unknown-action", AttemptID: attempt.ID,
+		Kind:          agentharness.ActionKind("future_kind"),
+		RequestDigest: digest("unknown-request"), PreparedAt: fixedClock(),
+	}
+	snapshot.Actions[action.ID] = action
+	storedAttempt := snapshot.Attempts[attempt.ID]
+	storedAttempt.ActionIDs = append(storedAttempt.ActionIDs, action.ID)
+	snapshot.Attempts[attempt.ID] = storedAttempt
+	if err := controlplane.ValidateSnapshot(snapshot); !errors.Is(err, controlplane.ErrInvalidRecord) {
+		t.Fatalf("ValidateSnapshot(unknown action kind) error = %v, want ErrInvalidRecord", err)
+	}
+	beforeFeed, beforeCursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Load(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Save(context.Background(), snapshot, current.Version); !errors.Is(err, controlplane.ErrInvalidRecord) {
+		t.Fatalf("Save(unknown action kind) error = %v, want ErrInvalidRecord", err)
+	}
+	assertMockStoreUnchanged(t, store, current, beforeFeed, beforeCursor)
+}
+
+func assertMockStoreUnchanged(
+	t *testing.T,
+	store *controlmock.Store,
+	want controlplane.Snapshot,
+	wantFeed []journal.Event,
+	wantCursor journal.GlobalCursor,
+) {
+	t.Helper()
+	got, err := store.Load(context.Background(), want.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rejected Save changed snapshot: got %#v want %#v", got, want)
+	}
+	feed, cursor, err := store.Feed(context.Background(), journal.GlobalCursor{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(feed, wantFeed) || cursor != wantCursor {
+		t.Fatalf("rejected Save changed journal: feed %#v cursor %#v", feed, cursor)
 	}
 }
 
@@ -456,6 +760,99 @@ func TestStrictModelRejectsUnknownFieldsAndInvalidGraphs(t *testing.T) {
 				t.Fatalf("ValidateGraph() error = %v, want ErrInvalidGraph", err)
 			}
 		})
+	}
+}
+
+func TestPromotionTriggerNormalizesLegacyPlacementAndPersistsOnAttempts(t *testing.T) {
+	t.Parallel()
+
+	store := controlmock.NewStore()
+	service := controlplane.NewService(store, controlplane.WithClock(fixedClock))
+	graph := validGraph()
+	graph.Tasks = graph.Tasks[:1]
+	graph.IntegrationOrder = graph.IntegrationOrder[:1]
+	graph.Tasks[0].State = controlplane.TaskReady
+	if graph.Tasks[0].Placement.PromotionTrigger != "" {
+		t.Fatal("test requires a legacy placement without an explicit trigger")
+	}
+	run := validRun(graph)
+	created, err := service.Create(context.Background(), run, graph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Graph.Tasks[0].Placement.PromotionTrigger != controlplane.PromotionTriggerNone {
+		t.Fatalf("created trigger = %q, want %q", created.Graph.Tasks[0].Placement.PromotionTrigger, controlplane.PromotionTriggerNone)
+	}
+	attempt, err := service.CreateAttempt(context.Background(), run.ID, graph.Tasks[0].ID, completeCapabilities())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.PromotionTrigger != controlplane.PromotionTriggerNone {
+		t.Fatalf("attempt trigger = %q, want %q", attempt.PromotionTrigger, controlplane.PromotionTriggerNone)
+	}
+	restarted := controlplane.NewService(store, controlplane.WithClock(fixedClock))
+	replayed, err := restarted.Load(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Graph.Tasks[0].Placement.PromotionTrigger != controlplane.PromotionTriggerNone ||
+		replayed.Attempts[attempt.ID].PromotionTrigger != controlplane.PromotionTriggerNone {
+		t.Fatalf("restart lost trigger: task %#v attempt %#v", replayed.Graph.Tasks[0].Placement, replayed.Attempts[attempt.ID])
+	}
+}
+
+func TestJournalServiceBindsOneReservationAndResultWithoutReplayMutation(t *testing.T) {
+	store, service, runID, attempt := persistentService(t)
+	action, err := service.PrepareAction(
+		context.Background(), runID, attempt.ID, agentharness.ActionDispatch, digest("journal-dispatch"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := agentharness.ActionResult{
+		ActionID: action.ID, RuntimeWorkIDs: []string{"runtime-journal"},
+		ResultDigest: digest("journal-dispatch-result"),
+	}
+	if _, err := service.CompleteAction(context.Background(), runID, action.ID, result); err != nil {
+		t.Fatal(err)
+	}
+	beforeReplay, next, err := store.Feed(
+		context.Background(), journal.NewGlobalCursor(store.InstallationID()), 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, results := 0, 0
+	var reservationPosition, resultPosition journal.JournalPosition
+	for _, event := range beforeReplay {
+		if event.ActionID != action.ID {
+			continue
+		}
+		switch event.Kind {
+		case journal.EventActionReserved:
+			reservations++
+			reservationPosition = event.JournalPosition
+		case journal.EventActionResult:
+			results++
+			resultPosition = event.JournalPosition
+		}
+	}
+	if reservations != 1 || results != 1 || reservationPosition >= resultPosition {
+		t.Fatalf("action journal = reservations %d results %d positions %d/%d feed %#v", reservations, results, reservationPosition, resultPosition, beforeReplay)
+	}
+
+	restarted := controlplane.NewService(store, controlplane.WithClock(fixedClock))
+	if _, err := restarted.CompleteAction(context.Background(), runID, action.ID, result); err != nil {
+		t.Fatal(err)
+	}
+	afterReplay, afterCursor, err := store.Feed(
+		context.Background(), journal.NewGlobalCursor(store.InstallationID()), 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(afterReplay, beforeReplay) || afterCursor != next {
+		t.Fatalf("exact result replay mutated journal:\nbefore %#v %#v\nafter %#v %#v", beforeReplay, next, afterReplay, afterCursor)
 	}
 }
 
@@ -842,4 +1239,21 @@ func (s *orderedSaveStore) Save(
 		}
 	}
 	return s.Store.Save(ctx, next, expectedVersion)
+}
+
+func (s *orderedSaveStore) ReserveAction(
+	ctx context.Context,
+	next controlplane.Snapshot,
+	expectedVersion uint64,
+	action journal.Action,
+) (controlplane.Snapshot, bool, error) {
+	if ctx.Value(storeOperationKey{}) == "prepare" {
+		s.once.Do(func() { close(s.prepareSaving) })
+		select {
+		case <-s.releasePrepare:
+		case <-ctx.Done():
+			return controlplane.Snapshot{}, false, ctx.Err()
+		}
+	}
+	return s.Store.ReserveAction(ctx, next, expectedVersion, action)
 }

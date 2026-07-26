@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/araihu/paje/internal/agentharness"
+	"github.com/araihu/paje/internal/controlplane/journal"
 )
 
 type Option func(*Service)
@@ -166,6 +168,7 @@ func (s *Service) CreateAttempt(
 			CapabilitySnapshot: cloneCapabilities(capabilities),
 			LifecycleOwner:     task.Placement.LifecycleOwner, State: AttemptReserved,
 			RuntimeWorkIDs: []string{}, ActionIDs: []string{}, ObservedEvents: map[string]string{},
+			PromotionTrigger: normalizedPromotionTrigger(task.Placement.PromotionTrigger),
 		}
 		snapshot.Attempts[id] = result
 		setTaskState(&snapshot.Graph, taskID, TaskDispatched)
@@ -224,6 +227,7 @@ func (s *Service) PromoteAttempt(
 		if err != nil {
 			return err
 		}
+		promoted.Placement.PromotionTrigger = promotionTriggerFor(promotion)
 		capacity := Capacity{
 			Active: make(map[agentharness.Primitive]int), ProjectActive: make(map[string]int),
 			ProjectLimits: make(map[string]int),
@@ -270,6 +274,7 @@ func (s *Service) PromoteAttempt(
 			CapabilitySnapshot: cloneCapabilities(capabilities), LifecycleOwner: promoted.Placement.LifecycleOwner,
 			State: AttemptReserved, RuntimeWorkIDs: []string{}, ActionIDs: []string{},
 			ObservedEvents: map[string]string{}, PromotedFromAttemptID: source.ID, HandoffID: handoff.ID,
+			PromotionTrigger: promoted.Placement.PromotionTrigger,
 		}
 		snapshot.Attempts[replacement.ID] = replacement
 		appendEvent(snapshot, Event{
@@ -287,12 +292,9 @@ func (s *Service) PrepareAction(
 	kind agentharness.ActionKind,
 	requestDigest string,
 ) (LifecycleAction, error) {
-	var result LifecycleAction
-	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
-		var prepareErr error
-		result, _, prepareErr = s.prepareAction(snapshot, controlRunID, attemptID, kind, requestDigest)
-		return prepareErr
-	})
+	result, _, err := s.prepareActionTransaction(
+		ctx, controlRunID, attemptID, kind, requestDigest, nil,
+	)
 	return result, err
 }
 
@@ -315,42 +317,82 @@ func (s *Service) PrepareObserve(
 	controlRunID, attemptID, requestDigest, afterCursor string,
 	afterSequence uint64,
 ) (LifecycleAction, bool, error) {
-	var result LifecycleAction
-	var reused bool
-	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
-		attempt, ok := snapshot.Attempts[attemptID]
-		if !ok || requestDigest != ObserveRequestDigest(controlRunID, attemptID, afterCursor, afterSequence) {
-			return ErrActionConflict
-		}
-		capability, err := agentharness.OperationCapability(agentharness.ActionObserve, attempt.Primitive)
-		if err != nil {
-			return err
-		}
-		primitiveCapabilities := attempt.CapabilitySnapshot.Primitives[attempt.Primitive]
-		if !primitiveCapabilities.Supports(capability) {
-			return ErrCapabilityUnavailable
-		}
-		for _, actionID := range attempt.ActionIDs {
-			action := snapshot.Actions[actionID]
-			if action.Kind == agentharness.ActionObserve && action.RequestDigest == requestDigest {
-				result = action
-				reused = true
-				return nil
+	return s.prepareActionTransaction(
+		ctx, controlRunID, attemptID, agentharness.ActionObserve, requestDigest,
+		func(snapshot *Snapshot) (LifecycleAction, bool, error) {
+			attempt, ok := snapshot.Attempts[attemptID]
+			if !ok || requestDigest != ObserveRequestDigest(controlRunID, attemptID, afterCursor, afterSequence) {
+				return LifecycleAction{}, false, ErrActionConflict
 			}
-		}
-		if primitiveCapabilities.Supports(agentharness.CapCursor) {
-			if afterCursor != attempt.LastCursor || afterSequence != attempt.CursorSequence {
-				return ErrActionConflict
+			capability, err := agentharness.OperationCapability(agentharness.ActionObserve, attempt.Primitive)
+			if err != nil {
+				return LifecycleAction{}, false, err
 			}
-		} else if afterCursor != "" || afterSequence != 0 {
-			return ErrActionConflict
+			primitiveCapabilities := attempt.CapabilitySnapshot.Primitives[attempt.Primitive]
+			if !primitiveCapabilities.Supports(capability) {
+				return LifecycleAction{}, false, ErrCapabilityUnavailable
+			}
+			for _, actionID := range attempt.ActionIDs {
+				action := snapshot.Actions[actionID]
+				if action.Kind == agentharness.ActionObserve && action.RequestDigest == requestDigest {
+					return action, true, nil
+				}
+			}
+			if primitiveCapabilities.Supports(agentharness.CapCursor) {
+				if afterCursor != attempt.LastCursor || afterSequence != attempt.CursorSequence {
+					return LifecycleAction{}, false, ErrActionConflict
+				}
+			} else if afterCursor != "" || afterSequence != 0 {
+				return LifecycleAction{}, false, ErrActionConflict
+			}
+			return LifecycleAction{}, false, nil
+		},
+	)
+}
+
+func (s *Service) prepareActionTransaction(
+	ctx context.Context,
+	controlRunID, attemptID string,
+	kind agentharness.ActionKind,
+	requestDigest string,
+	preflight func(*Snapshot) (LifecycleAction, bool, error),
+) (LifecycleAction, bool, error) {
+	if s == nil || s.store == nil {
+		return LifecycleAction{}, false, invalidRecord("store is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return LifecycleAction{}, false, err
+	}
+	current, err := s.store.Load(ctx, controlRunID)
+	if err != nil {
+		return LifecycleAction{}, false, err
+	}
+	next := CloneSnapshot(current)
+	if preflight != nil {
+		result, reused, preflightErr := preflight(&next)
+		if preflightErr != nil || reused {
+			return result, reused, preflightErr
 		}
-		result, reused, err = s.prepareAction(
-			snapshot, controlRunID, attemptID, agentharness.ActionObserve, requestDigest,
-		)
-		return err
-	})
-	return result, reused, err
+	}
+	result, reservation, reused, err := s.prepareAction(
+		&next, controlRunID, attemptID, kind, requestDigest,
+	)
+	if err != nil || reused {
+		return result, reused, err
+	}
+	next.Run.UpdatedAt = s.now()
+	saved, created, err := s.store.ReserveAction(ctx, next, current.Version, reservation)
+	if errors.Is(err, journal.ErrConflict) {
+		return LifecycleAction{}, false, ErrActionConflict
+	}
+	if err != nil {
+		return result, false, err
+	}
+	stored, ok := saved.Actions[result.ID]
+	if !ok || stored.ID != result.ID {
+		return LifecycleAction{}, false, invalidRecord("reserved action is absent from saved projection")
+	}
+	return stored, !created, nil
 }
 
 func (s *Service) prepareAction(
@@ -358,18 +400,22 @@ func (s *Service) prepareAction(
 	controlRunID, attemptID string,
 	kind agentharness.ActionKind,
 	requestDigest string,
-) (LifecycleAction, bool, error) {
+) (LifecycleAction, journal.Action, bool, error) {
 	attempt, ok := snapshot.Attempts[attemptID]
 	if !ok {
-		return LifecycleAction{}, false, ErrNotFound
+		return LifecycleAction{}, journal.Action{}, false, ErrNotFound
+	}
+	reservationKind, err := JournalActionKind(kind)
+	if err != nil {
+		return LifecycleAction{}, journal.Action{}, false, err
 	}
 	capability, err := agentharness.OperationCapability(kind, attempt.Primitive)
 	if err != nil {
-		return LifecycleAction{}, false, err
+		return LifecycleAction{}, journal.Action{}, false, err
 	}
 	primitiveCapabilities := attempt.CapabilitySnapshot.Primitives[attempt.Primitive]
 	if !primitiveCapabilities.Supports(capability) {
-		return LifecycleAction{}, false, ErrCapabilityUnavailable
+		return LifecycleAction{}, journal.Action{}, false, ErrCapabilityUnavailable
 	}
 	for _, actionID := range attempt.ActionIDs {
 		action := snapshot.Actions[actionID]
@@ -378,22 +424,29 @@ func (s *Service) prepareAction(
 		}
 		if action.RequestDigest != requestDigest {
 			if singleShotAction(kind) {
-				return LifecycleAction{}, false, ErrActionConflict
+				return LifecycleAction{}, journal.Action{}, false, ErrActionConflict
 			}
 			continue
 		}
-		return action, true, nil
+		return action, journal.Action{}, true, nil
 	}
 	actionID, err := agentharness.StableActionID(
 		controlRunID, attempt.TaskID, attemptID, snapshot.Graph.Revision,
 		attempt.Primitive, kind, requestDigest,
 	)
 	if err != nil {
-		return LifecycleAction{}, false, err
+		return LifecycleAction{}, journal.Action{}, false, err
 	}
 	result := LifecycleAction{
 		ID: actionID, AttemptID: attemptID, Kind: kind,
 		RequestDigest: requestDigest, PreparedAt: s.now(),
+	}
+	reservation := journal.Action{
+		ID: result.ID, ControlRunID: controlRunID, TaskID: attempt.TaskID,
+		AttemptID: attemptID, Kind: reservationKind,
+		GraphRevision: snapshot.Graph.Revision, ExpectedProjection: snapshot.Version,
+		CanonicalRequestDigest: requestDigest,
+		IdempotencyKey:         journalIdempotencyKey(controlRunID, attemptID, kind, result.ID),
 	}
 	snapshot.Actions[actionID] = result
 	attempt.ActionIDs = append(attempt.ActionIDs, actionID)
@@ -402,7 +455,7 @@ func (s *Service) prepareAction(
 		Kind: EventActionPrepared, TaskID: attempt.TaskID, AttemptID: attemptID,
 		ActionID: actionID, Digest: digestStrings("prepare", actionID, requestDigest),
 	}, s.now())
-	return result, false, nil
+	return result, reservation, false, nil
 }
 
 func (s *Service) CompleteAction(
@@ -1203,6 +1256,9 @@ func (s *Service) mutate(
 	if err := change(&next); err != nil {
 		return Snapshot{}, err
 	}
+	if reflect.DeepEqual(current, next) {
+		return current, nil
+	}
 	next.Run.UpdatedAt = s.now()
 	return s.store.Save(ctx, next, current.Version)
 }
@@ -1595,4 +1651,35 @@ func ambiguityError(code string) error {
 		return errors.Join(ErrAmbiguousDispatch, ErrAmbiguousCreate)
 	}
 	return ErrAmbiguousDispatch
+}
+
+func normalizedPromotionTrigger(trigger string) string {
+	if strings.TrimSpace(trigger) == "" {
+		return PromotionTriggerNone
+	}
+	return trigger
+}
+
+func promotionTriggerFor(promotion Promotion) string {
+	switch {
+	case promotion.RequiresMutation && promotion.RequiresRestart:
+		return "scope_ownership_isolation"
+	case promotion.RequiresMutation:
+		return "scope_ownership"
+	case promotion.RequiresRestart:
+		return "duration_isolation"
+	default:
+		return "capability"
+	}
+}
+
+func journalIdempotencyKey(
+	controlRunID, attemptID string,
+	kind agentharness.ActionKind,
+	actionID string,
+) string {
+	if singleShotAction(kind) {
+		return stableID("action_slot", controlRunID, attemptID, string(kind))
+	}
+	return actionID
 }

@@ -22,6 +22,8 @@ const SchemaVersion = "paje.controlplane/v1"
 
 const ParentAddress = "parent"
 
+const PromotionTriggerNone = "none"
+
 type Status string
 
 const (
@@ -183,6 +185,7 @@ type ExecutionPlacement struct {
 	CapabilityRequirements []agentharness.Capability `json:"capability_requirements"`
 	LifecycleOwner         string                    `json:"lifecycle_owner"`
 	Fallback               string                    `json:"fallback"`
+	PromotionTrigger       string                    `json:"promotion_trigger"`
 }
 
 type FrozenInput struct {
@@ -238,6 +241,7 @@ type PlacementAttempt struct {
 	BlockCode             string                          `json:"block_code,omitempty"`
 	PromotedFromAttemptID string                          `json:"promoted_from_attempt_id,omitempty"`
 	HandoffID             string                          `json:"handoff_id,omitempty"`
+	PromotionTrigger      string                          `json:"promotion_trigger"`
 }
 
 type AgentSession struct {
@@ -365,6 +369,7 @@ func NewSnapshot(run ControlRun, graph TaskGraph) (Snapshot, error) {
 	if graph.SchemaVersion == "" {
 		graph.SchemaVersion = SchemaVersion
 	}
+	normalizePromotionTriggers(&graph, nil)
 	snapshot := Snapshot{
 		SchemaVersion: SchemaVersion, Version: 1, Run: run, Graph: CloneGraph(graph),
 		Attempts: map[string]PlacementAttempt{}, Sessions: map[string]AgentSession{},
@@ -383,6 +388,7 @@ func DecodeTaskGraph(encoded []byte) (TaskGraph, error) {
 	if err := strictDecode(encoded, &graph); err != nil {
 		return TaskGraph{}, fmt.Errorf("%w: decode task graph: %v", ErrInvalidRecord, err)
 	}
+	normalizePromotionTriggers(&graph, nil)
 	if err := ValidateGraph(graph, nil); err != nil {
 		return TaskGraph{}, err
 	}
@@ -394,6 +400,7 @@ func DecodeSnapshot(encoded []byte) (Snapshot, error) {
 	if err := strictDecode(encoded, &snapshot); err != nil {
 		return Snapshot{}, fmt.Errorf("%w: decode snapshot: %v", ErrInvalidRecord, err)
 	}
+	normalizePromotionTriggers(&snapshot.Graph, snapshot.Attempts)
 	if err := ValidateSnapshot(snapshot); err != nil {
 		return Snapshot{}, err
 	}
@@ -528,8 +535,9 @@ func ValidateSnapshot(snapshot Snapshot) error {
 		return invalidRecord("event cursor does not match append-only stream")
 	}
 	for id, action := range snapshot.Actions {
+		_, kindErr := JournalActionKind(action.Kind)
 		if action.ID != id || snapshot.Attempts[action.AttemptID].ID == "" ||
-			action.RequestDigest == "" || action.Kind == "" {
+			action.RequestDigest == "" || kindErr != nil {
 			return invalidRecord("lifecycle action is invalid")
 		}
 		if action.Completed && action.Result.ActionID != action.ID {
@@ -586,6 +594,17 @@ func ValidateSave(current, next Snapshot) error {
 		!current.Run.CreatedAt.Equal(next.Run.CreatedAt) {
 		return fmt.Errorf("%w: durable run identity changed", ErrImmutableBoundary)
 	}
+	terminalOutcomes := 0
+	for id, nextAction := range next.Actions {
+		previous := current.Actions[id]
+		if !previous.Completed && nextAction.Completed ||
+			!previous.Ambiguous && nextAction.Ambiguous {
+			terminalOutcomes++
+		}
+	}
+	if terminalOutcomes > 1 {
+		return invalidRecord("save introduces multiple terminal action outcomes")
+	}
 	if next.Graph.Revision < current.Graph.Revision ||
 		next.Graph.Revision > current.Graph.Revision+1 {
 		return ErrVersionConflict
@@ -603,7 +622,13 @@ func ValidateSave(current, next Snapshot) error {
 		}
 	}
 	for id, action := range current.Actions {
-		if action.Completed && !reflect.DeepEqual(action, next.Actions[id]) {
+		nextAction, ok := next.Actions[id]
+		if !ok || action.ID != nextAction.ID || action.AttemptID != nextAction.AttemptID ||
+			action.Kind != nextAction.Kind || action.RequestDigest != nextAction.RequestDigest ||
+			!action.PreparedAt.Equal(nextAction.PreparedAt) {
+			return fmt.Errorf("%w: lifecycle action identity changed", ErrImmutableBoundary)
+		}
+		if action.Completed && !reflect.DeepEqual(action, nextAction) {
 			return fmt.Errorf("%w: completed action changed", ErrImmutableBoundary)
 		}
 	}
@@ -1314,4 +1339,18 @@ func validPromotionSave(current, next Snapshot, oldTask, nextTask Task) bool {
 		matched++
 	}
 	return matched == 1
+}
+
+func normalizePromotionTriggers(graph *TaskGraph, attempts map[string]PlacementAttempt) {
+	for index := range graph.Tasks {
+		if strings.TrimSpace(graph.Tasks[index].Placement.PromotionTrigger) == "" {
+			graph.Tasks[index].Placement.PromotionTrigger = PromotionTriggerNone
+		}
+	}
+	for id, attempt := range attempts {
+		if strings.TrimSpace(attempt.PromotionTrigger) == "" {
+			attempt.PromotionTrigger = PromotionTriggerNone
+			attempts[id] = attempt
+		}
+	}
 }
