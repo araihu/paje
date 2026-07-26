@@ -128,6 +128,9 @@ func (s *Store) MarkCancellationRequested(
 		return submission.Record{}, submission.ErrNotFound
 	}
 	if record.CancellationRequested == nil {
+		if at.IsZero() || at.Before(record.UpdatedAt) {
+			return cloneRecord(record), submission.ErrIdempotencyConflict
+		}
 		value := at
 		record.CancellationRequested = &value
 		record.UpdatedAt = at

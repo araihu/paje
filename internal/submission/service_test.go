@@ -11,11 +11,209 @@ import (
 
 	"github.com/araihu/paje/internal/run"
 	"github.com/araihu/paje/internal/submission"
+	submissionfilesystem "github.com/araihu/paje/internal/submission/filesystem"
 	submissionmock "github.com/araihu/paje/internal/submission/mock"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
 )
+
+func validStoreReservation() submission.Reservation {
+	createdAt := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	return submission.Reservation{
+		IdempotencyKey: strings.Repeat("a", 32),
+		Record: submission.Record{
+			RunID:                "paje_abc",
+			CredentialID:         testCredentialID,
+			RequestDigest:        strings.Repeat("1", 64),
+			IdempotencyKeyDigest: strings.Repeat("2", 64),
+			Template:             templatecodechange.ID,
+			CanonicalInput:       json.RawMessage(`{"task_description":"change timeout"}`),
+			Origin: submission.Origin{
+				Harness: "codex", SessionID: "session-1", TurnID: "turn-1",
+			},
+			RootRunID: "paje_abc",
+			Depth:     0,
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+		},
+	}
+}
+
+func TestStoreContract(t *testing.T) {
+	tests := []struct {
+		name string
+		new  func(*testing.T) submission.Store
+	}{
+		{
+			name: "mock",
+			new: func(*testing.T) submission.Store {
+				return submissionmock.NewStore()
+			},
+		},
+		{
+			name: "filesystem",
+			new: func(t *testing.T) submission.Store {
+				t.Helper()
+				store, err := submissionfilesystem.New(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return store
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Run("exact reuse", func(t *testing.T) {
+				store := test.new(t)
+				reservation := validStoreReservation()
+				first, owned, err := store.Reserve(context.Background(), reservation)
+				if err != nil || !owned {
+					t.Fatalf("first Reserve() = (%#v, %v, %v), want owner", first, owned, err)
+				}
+				second, owned, err := store.Reserve(context.Background(), reservation)
+				if err != nil || owned || second.RunID != first.RunID {
+					t.Fatalf("second Reserve() = (%#v, %v, %v), want exact reuse", second, owned, err)
+				}
+			})
+
+			t.Run("changed digest conflicts", func(t *testing.T) {
+				store := test.new(t)
+				reservation := validStoreReservation()
+				if _, _, err := store.Reserve(context.Background(), reservation); err != nil {
+					t.Fatal(err)
+				}
+				reservation.Record.RequestDigest = strings.Repeat("f", 64)
+				_, _, err := store.Reserve(context.Background(), reservation)
+				if !errors.Is(err, submission.ErrIdempotencyConflict) {
+					t.Fatalf("changed Reserve() error = %v, want idempotency conflict", err)
+				}
+			})
+
+			t.Run("thirty two exact reservations have one owner", func(t *testing.T) {
+				store := test.new(t)
+				reservation := validStoreReservation()
+				type result struct {
+					record submission.Record
+					owned  bool
+					err    error
+				}
+				results := make(chan result, 32)
+				var wait sync.WaitGroup
+				for range 32 {
+					wait.Add(1)
+					go func() {
+						defer wait.Done()
+						record, owned, err := store.Reserve(context.Background(), reservation)
+						results <- result{record: record, owned: owned, err: err}
+					}()
+				}
+				wait.Wait()
+				close(results)
+				owners := 0
+				for result := range results {
+					if result.err != nil {
+						t.Fatal(result.err)
+					}
+					if result.record.RunID != reservation.Record.RunID {
+						t.Fatalf("Reserve() run ID = %q, want %q", result.record.RunID, reservation.Record.RunID)
+					}
+					if result.owned {
+						owners++
+					}
+				}
+				if owners != 1 {
+					t.Fatalf("reservation owners = %d, want 1", owners)
+				}
+			})
+
+			t.Run("different requests racing on one key conflict", func(t *testing.T) {
+				store := test.new(t)
+				left := validStoreReservation()
+				right := validStoreReservation()
+				right.Record.RequestDigest = strings.Repeat("f", 64)
+				type result struct {
+					owned bool
+					err   error
+				}
+				results := make(chan result, 32)
+				var wait sync.WaitGroup
+				for index := range 32 {
+					reservation := left
+					if index%2 == 1 {
+						reservation = right
+					}
+					wait.Add(1)
+					go func() {
+						defer wait.Done()
+						_, owned, err := store.Reserve(context.Background(), reservation)
+						results <- result{owned: owned, err: err}
+					}()
+				}
+				wait.Wait()
+				close(results)
+				owners := 0
+				conflicts := 0
+				for result := range results {
+					switch {
+					case result.err == nil && result.owned:
+						owners++
+					case result.err == nil:
+					case errors.Is(result.err, submission.ErrIdempotencyConflict):
+						conflicts++
+					default:
+						t.Fatalf("Reserve() error = %v", result.err)
+					}
+				}
+				if owners != 1 || conflicts != 16 {
+					t.Fatalf("race owners/conflicts = %d/%d, want 1/16", owners, conflicts)
+				}
+			})
+
+			t.Run("trigger binding is exact compare and swap", func(t *testing.T) {
+				store := test.new(t)
+				reservation := validStoreReservation()
+				if _, _, err := store.Reserve(context.Background(), reservation); err != nil {
+					t.Fatal(err)
+				}
+				reference := submission.TriggerReference{Provider: "hatchet", ExternalRunID: "run-1"}
+				first, err := store.BindTrigger(context.Background(), reservation.Record.RunID, reference)
+				if err != nil || first.Trigger == nil || *first.Trigger != reference {
+					t.Fatalf("first BindTrigger() = (%#v, %v)", first, err)
+				}
+				second, err := store.BindTrigger(context.Background(), reservation.Record.RunID, reference)
+				if err != nil || second.Trigger == nil || *second.Trigger != reference {
+					t.Fatalf("second BindTrigger() = (%#v, %v)", second, err)
+				}
+				changed := submission.TriggerReference{Provider: "hatchet", ExternalRunID: "run-2"}
+				_, err = store.BindTrigger(context.Background(), reservation.Record.RunID, changed)
+				if !errors.Is(err, submission.ErrIdempotencyConflict) {
+					t.Fatalf("changed BindTrigger() error = %v, want idempotency conflict", err)
+				}
+			})
+
+			t.Run("cancellation timestamp never moves", func(t *testing.T) {
+				store := test.new(t)
+				reservation := validStoreReservation()
+				if _, _, err := store.Reserve(context.Background(), reservation); err != nil {
+					t.Fatal(err)
+				}
+				requestedAt := reservation.Record.UpdatedAt.Add(time.Minute)
+				first, err := store.MarkCancellationRequested(context.Background(), reservation.Record.RunID, requestedAt)
+				if err != nil || first.CancellationRequested == nil || !first.CancellationRequested.Equal(requestedAt) {
+					t.Fatalf("first MarkCancellationRequested() = (%#v, %v)", first, err)
+				}
+				for _, repeatedAt := range []time.Time{requestedAt.Add(-time.Second), requestedAt.Add(time.Hour)} {
+					repeated, err := store.MarkCancellationRequested(context.Background(), reservation.Record.RunID, repeatedAt)
+					if err != nil || repeated.CancellationRequested == nil || !repeated.CancellationRequested.Equal(requestedAt) || !repeated.UpdatedAt.Equal(requestedAt) {
+						t.Fatalf("repeated MarkCancellationRequested(%s) = (%#v, %v)", repeatedAt, repeated, err)
+					}
+				}
+			})
+		})
+	}
+}
 
 const (
 	testCredentialID = "cred-codex-service"

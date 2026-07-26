@@ -2,8 +2,12 @@ package submission
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrCorruptStore reports durable state that cannot be reconciled safely.
+var ErrCorruptStore = errors.New("submission store is corrupt")
 
 // Reservation atomically binds a principal-scoped client key to Record.
 // IdempotencyKey is used only as an indexing input and must not be copied into
