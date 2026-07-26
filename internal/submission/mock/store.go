@@ -117,26 +117,28 @@ func (s *Store) MarkCancellationRequested(
 	ctx context.Context,
 	runID string,
 	at time.Time,
-) (submission.Record, error) {
+) (submission.Record, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, exists := s.records[runID]
 	if !exists {
-		return submission.Record{}, submission.ErrNotFound
+		return submission.Record{}, false, submission.ErrNotFound
 	}
+	newlyRequested := false
 	if record.CancellationRequested == nil {
 		if at.IsZero() || at.Before(record.UpdatedAt) {
-			return cloneRecord(record), submission.ErrIdempotencyConflict
+			return cloneRecord(record), false, submission.ErrIdempotencyConflict
 		}
 		value := at
 		record.CancellationRequested = &value
 		record.UpdatedAt = at
 		s.records[runID] = cloneRecord(record)
+		newlyRequested = true
 	}
-	return cloneRecord(record), nil
+	return cloneRecord(record), newlyRequested, nil
 }
 
 // SetRecord replaces one stored record without changing its key index. It is

@@ -317,47 +317,47 @@ func (s *Store) MarkCancellationRequested(
 	ctx context.Context,
 	runID string,
 	at time.Time,
-) (submission.Record, error) {
+) (submission.Record, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	if !validID(runID) {
-		return submission.Record{}, submission.ErrNotFound
+		return submission.Record{}, false, submission.ErrNotFound
 	}
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if err := ctx.Err(); err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	if err := s.prepareLocked(); err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	record, exists, err := s.loadRecordIfExistsLocked(runID)
 	if err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	if !exists {
-		return submission.Record{}, submission.ErrNotFound
+		return submission.Record{}, false, submission.ErrNotFound
 	}
 	if _, err := s.bindingForRunLocked(runID); err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	if record.CancellationRequested != nil {
-		return cloneRecord(record), nil
+		return cloneRecord(record), false, nil
 	}
 	if at.IsZero() || at.Before(record.UpdatedAt) {
-		return cloneRecord(record), submission.ErrIdempotencyConflict
+		return cloneRecord(record), false, submission.ErrIdempotencyConflict
 	}
 	value := at
 	record.CancellationRequested = &value
 	record.UpdatedAt = at
 	if err := atomicWriteJSON(ctx, s.recordPath(runID), record); err != nil {
-		return submission.Record{}, fmt.Errorf("persist submission cancellation: %w", err)
+		return submission.Record{}, false, fmt.Errorf("persist submission cancellation: %w", err)
 	}
 	if err := s.auditLocked(); err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
-	return cloneRecord(record), nil
+	return cloneRecord(record), true, nil
 }
 
 func (s *Store) prepareLocked() error {

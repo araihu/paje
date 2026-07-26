@@ -248,32 +248,32 @@ func (s *Service) Cancel(
 	ctx context.Context,
 	principal Principal,
 	runID string,
-) (View, error) {
+) (View, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return View{}, err
+		return View{}, false, err
 	}
 	if err := validatePrincipal(principal); err != nil {
-		return View{}, err
+		return View{}, false, err
 	}
 	if !principal.Actions[ActionCancel] {
-		return View{}, newDomainError(
+		return View{}, false, newDomainError(
 			ErrForbidden,
 			"the submission action is outside the principal scope",
 			nil,
 		)
 	}
 	if !safeRequired(runID) {
-		return View{}, newDomainError(ErrNotFound, "the submission was not found", nil)
+		return View{}, false, newDomainError(ErrNotFound, "the submission was not found", nil)
 	}
 	unlock := s.lock("cancel\x00" + runID)
 	defer unlock()
 
 	record, err := s.loadOwned(ctx, principal, runID)
 	if err != nil {
-		return View{}, err
+		return View{}, false, err
 	}
 	if record.Trigger == nil {
-		return View{}, newDomainError(
+		return View{}, false, newDomainError(
 			ErrRunNotCancelable,
 			"the submission is not cancelable",
 			nil,
@@ -286,29 +286,29 @@ func (s *Service) Cancel(
 			return View{
 				Record: cloneRecord(record),
 				Status: StatusCancellationRequested,
-			}, nil
+			}, false, nil
 		}
-		return View{}, err
+		return View{}, false, err
 	}
 	if terminalStatus(current.Status) {
-		return current, nil
+		return current, false, nil
 	}
 	if record.CancellationRequested != nil {
 		current.Status = StatusCancellationRequested
-		return current, nil
+		return current, false, nil
 	}
 	now := s.clock()
 	if now.IsZero() || now.Before(record.UpdatedAt) {
-		return View{}, newDomainError(
+		return View{}, false, newDomainError(
 			ErrProviderUnavailable,
 			"the submission clock is unavailable",
 			nil,
 		)
 	}
 	beforeCancellation := record
-	record, err = s.store.MarkCancellationRequested(ctx, record.RunID, now)
+	record, newlyRequested, err := s.store.MarkCancellationRequested(ctx, record.RunID, now)
 	if err != nil {
-		return View{}, newDomainError(
+		return View{}, false, newDomainError(
 			ErrProviderUnavailable,
 			"the submission store is unavailable",
 			err,
@@ -321,23 +321,24 @@ func (s *Service) Cancel(
 		record.Trigger == nil ||
 		*record.Trigger != *beforeCancellation.Trigger ||
 		validateStoredRecord(record) != nil {
-		return View{}, newDomainError(
+		return View{}, false, newDomainError(
 			ErrProviderUnavailable,
 			"the cancellation binding is invalid",
 			nil,
 		)
 	}
+	view := View{Record: cloneRecord(record), Status: StatusCancellationRequested}
+	if !newlyRequested {
+		return view, false, nil
+	}
 	if err := s.trigger.Cancel(ctx, *record.Trigger); err != nil {
-		return View{}, newDomainError(
+		return View{}, true, newDomainError(
 			ErrProviderUnavailable,
 			"the submission provider is unavailable",
 			err,
 		)
 	}
-	return View{
-		Record: cloneRecord(record),
-		Status: StatusCancellationRequested,
-	}, nil
+	return view, true, nil
 }
 
 func (s *Service) loadOwned(

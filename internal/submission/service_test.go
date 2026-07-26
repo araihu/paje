@@ -200,15 +200,59 @@ func TestStoreContract(t *testing.T) {
 					t.Fatal(err)
 				}
 				requestedAt := reservation.Record.UpdatedAt.Add(time.Minute)
-				first, err := store.MarkCancellationRequested(context.Background(), reservation.Record.RunID, requestedAt)
-				if err != nil || first.CancellationRequested == nil || !first.CancellationRequested.Equal(requestedAt) {
-					t.Fatalf("first MarkCancellationRequested() = (%#v, %v)", first, err)
+				first, newlyRequested, err := store.MarkCancellationRequested(context.Background(), reservation.Record.RunID, requestedAt)
+				if err != nil || !newlyRequested || first.CancellationRequested == nil || !first.CancellationRequested.Equal(requestedAt) {
+					t.Fatalf("first MarkCancellationRequested() = (%#v, %t, %v)", first, newlyRequested, err)
 				}
 				for _, repeatedAt := range []time.Time{requestedAt.Add(-time.Second), requestedAt.Add(time.Hour)} {
-					repeated, err := store.MarkCancellationRequested(context.Background(), reservation.Record.RunID, repeatedAt)
-					if err != nil || repeated.CancellationRequested == nil || !repeated.CancellationRequested.Equal(requestedAt) || !repeated.UpdatedAt.Equal(requestedAt) {
-						t.Fatalf("repeated MarkCancellationRequested(%s) = (%#v, %v)", repeatedAt, repeated, err)
+					repeated, newlyRequested, err := store.MarkCancellationRequested(context.Background(), reservation.Record.RunID, repeatedAt)
+					if err != nil || newlyRequested || repeated.CancellationRequested == nil || !repeated.CancellationRequested.Equal(requestedAt) || !repeated.UpdatedAt.Equal(requestedAt) {
+						t.Fatalf("repeated MarkCancellationRequested(%s) = (%#v, %t, %v)", repeatedAt, repeated, newlyRequested, err)
 					}
+				}
+			})
+
+			t.Run("concurrent cancellation has one durable owner", func(t *testing.T) {
+				store := test.new(t)
+				reservation := validStoreReservation()
+				if _, _, err := store.Reserve(context.Background(), reservation); err != nil {
+					t.Fatal(err)
+				}
+				requestedAt := reservation.Record.UpdatedAt.Add(time.Minute)
+				type result struct {
+					record submission.Record
+					owned  bool
+					err    error
+				}
+				results := make(chan result, 32)
+				var wait sync.WaitGroup
+				for range 32 {
+					wait.Add(1)
+					go func() {
+						defer wait.Done()
+						record, owned, err := store.MarkCancellationRequested(
+							context.Background(), reservation.Record.RunID, requestedAt,
+						)
+						results <- result{record: record, owned: owned, err: err}
+					}()
+				}
+				wait.Wait()
+				close(results)
+				owners := 0
+				for result := range results {
+					if result.err != nil {
+						t.Fatal(result.err)
+					}
+					if result.record.CancellationRequested == nil ||
+						!result.record.CancellationRequested.Equal(requestedAt) {
+						t.Fatalf("cancellation record = %#v", result.record)
+					}
+					if result.owned {
+						owners++
+					}
+				}
+				if owners != 1 {
+					t.Fatalf("cancellation owners = %d, want 1", owners)
 				}
 			})
 		})
@@ -1685,7 +1729,7 @@ func TestInspectAndCancelRejectMisindexedStoreLoad(t *testing.T) {
 				principal submission.Principal,
 				runID string,
 			) error {
-				_, err := service.Cancel(ctx, principal, runID)
+				_, _, err := service.Cancel(ctx, principal, runID)
 				return err
 			},
 		},
@@ -1741,7 +1785,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 			Status: submission.StatusRunning,
 		})
 
-		first, err := fixture.service.Cancel(
+		first, newlyRequested, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
@@ -1749,11 +1793,11 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if first.Status != submission.StatusCancellationRequested ||
+		if !newlyRequested || first.Status != submission.StatusCancellationRequested ||
 			first.Record.CancellationRequested == nil {
 			t.Fatalf("first Cancel() = %+v, want cancellation requested", first)
 		}
-		second, err := fixture.service.Cancel(
+		second, newlyRequested, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
@@ -1761,7 +1805,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if second.Status != submission.StatusCancellationRequested {
+		if newlyRequested || second.Status != submission.StatusCancellationRequested {
 			t.Fatalf("second Cancel() status = %q", second.Status)
 		}
 		if calls := fixture.trigger.CancelCalls(reference); calls != 1 {
@@ -1791,7 +1835,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 				Status: run.StatusSucceeded,
 			},
 		})
-		view, err := fixture.service.Cancel(
+		view, newlyRequested, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
@@ -1799,7 +1843,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if view.Status != submission.StatusSucceeded ||
+		if newlyRequested || view.Status != submission.StatusSucceeded ||
 			view.Record.CancellationRequested != nil {
 			t.Fatalf("Cancel() = %+v, want unchanged terminal success", view)
 		}
@@ -1813,7 +1857,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		submitted := submitTestRun(t, fixture, testPrincipal())
 		principal := testPrincipal()
 		delete(principal.Actions, submission.ActionCancel)
-		_, err := fixture.service.Cancel(
+		_, _, err := fixture.service.Cancel(
 			context.Background(),
 			principal,
 			submitted.Record.RunID,
@@ -1828,7 +1872,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		submitted := submitTestRun(t, fixture, testPrincipal())
 		principal := testPrincipal()
 		principal.CredentialID = "cred-other-service"
-		_, err := fixture.service.Cancel(
+		_, _, err := fixture.service.Cancel(
 			context.Background(),
 			principal,
 			submitted.Record.RunID,
@@ -1846,7 +1890,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 			Status: submission.StatusRunning,
 		})
 		fixture.trigger.SetCancelError(errors.New("provider secret-marker"))
-		_, err := fixture.service.Cancel(
+		_, _, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
@@ -1858,13 +1902,16 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 			t.Fatalf("Cancel() leaked provider diagnostic: %v", err)
 		}
 		fixture.trigger.SetCancelError(nil)
-		second, err := fixture.service.Cancel(
+		second, newlyRequested, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
 		)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if newlyRequested {
+			t.Fatal("second Cancel() newly requested = true, want false")
 		}
 		if second.Status != submission.StatusCancellationRequested {
 			t.Fatalf("second Cancel() status = %q", second.Status)
@@ -1881,7 +1928,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		fixture.trigger.SetState(reference, submission.TriggerState{
 			Status: submission.StatusRunning,
 		})
-		if _, err := fixture.service.Cancel(
+		if _, _, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
@@ -1889,13 +1936,16 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 			t.Fatal(err)
 		}
 		fixture.trigger.SetInspectError(errors.New("provider unavailable"))
-		repeated, err := fixture.service.Cancel(
+		repeated, newlyRequested, err := fixture.service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
 		)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if newlyRequested {
+			t.Fatal("repeated Cancel() newly requested = true, want false")
 		}
 		if repeated.Status != submission.StatusCancellationRequested {
 			t.Fatalf("repeated Cancel() status = %q", repeated.Status)
@@ -1937,7 +1987,7 @@ func TestCancelRecordsIntentOnceAndPreservesTerminalState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = service.Cancel(
+		_, _, err = service.Cancel(
 			context.Background(),
 			testPrincipal(),
 			submitted.Record.RunID,
@@ -1992,13 +2042,13 @@ func (s corruptCancellationStore) MarkCancellationRequested(
 	ctx context.Context,
 	runID string,
 	at time.Time,
-) (submission.Record, error) {
-	record, err := s.Store.MarkCancellationRequested(ctx, runID, at)
+) (submission.Record, bool, error) {
+	record, newlyRequested, err := s.Store.MarkCancellationRequested(ctx, runID, at)
 	if err != nil {
-		return submission.Record{}, err
+		return submission.Record{}, false, err
 	}
 	record.Trigger = nil
-	return record, nil
+	return record, newlyRequested, nil
 }
 
 type misindexedStore struct {

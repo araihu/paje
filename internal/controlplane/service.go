@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -288,11 +289,40 @@ func (s *Service) PrepareAction(
 ) (LifecycleAction, error) {
 	var result LifecycleAction
 	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
+		var prepareErr error
+		result, _, prepareErr = s.prepareAction(snapshot, controlRunID, attemptID, kind, requestDigest)
+		return prepareErr
+	})
+	return result, err
+}
+
+// ObserveRequestDigest binds an Observe action to one exact persisted attempt
+// cursor tuple under a versioned provider-neutral domain.
+func ObserveRequestDigest(
+	controlRunID, attemptID, afterCursor string,
+	afterSequence uint64,
+) string {
+	return digestStrings(
+		"paje-control-observe-v1", controlRunID, attemptID, afterCursor,
+		strconv.FormatUint(afterSequence, 10),
+	)
+}
+
+// PrepareObserve atomically reconciles an exact prior prepare before checking
+// that a new Observe action starts from the attempt's current cursor tuple.
+func (s *Service) PrepareObserve(
+	ctx context.Context,
+	controlRunID, attemptID, requestDigest, afterCursor string,
+	afterSequence uint64,
+) (LifecycleAction, bool, error) {
+	var result LifecycleAction
+	var reused bool
+	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
 		attempt, ok := snapshot.Attempts[attemptID]
-		if !ok {
-			return ErrNotFound
+		if !ok || requestDigest != ObserveRequestDigest(controlRunID, attemptID, afterCursor, afterSequence) {
+			return ErrActionConflict
 		}
-		capability, err := agentharness.OperationCapability(kind, attempt.Primitive)
+		capability, err := agentharness.OperationCapability(agentharness.ActionObserve, attempt.Primitive)
 		if err != nil {
 			return err
 		}
@@ -302,39 +332,77 @@ func (s *Service) PrepareAction(
 		}
 		for _, actionID := range attempt.ActionIDs {
 			action := snapshot.Actions[actionID]
-			if action.Kind != kind {
-				continue
+			if action.Kind == agentharness.ActionObserve && action.RequestDigest == requestDigest {
+				result = action
+				reused = true
+				return nil
 			}
-			if action.RequestDigest != requestDigest {
-				if singleShotAction(kind) {
-					return ErrActionConflict
-				}
-				continue
-			}
-			result = action
-			return nil
 		}
-		actionID, err := agentharness.StableActionID(
-			controlRunID, attempt.TaskID, attemptID, snapshot.Graph.Revision,
-			attempt.Primitive, kind, requestDigest,
+		if primitiveCapabilities.Supports(agentharness.CapCursor) {
+			if afterCursor != attempt.LastCursor || afterSequence != attempt.CursorSequence {
+				return ErrActionConflict
+			}
+		} else if afterCursor != "" || afterSequence != 0 {
+			return ErrActionConflict
+		}
+		result, reused, err = s.prepareAction(
+			snapshot, controlRunID, attemptID, agentharness.ActionObserve, requestDigest,
 		)
-		if err != nil {
-			return err
-		}
-		result = LifecycleAction{
-			ID: actionID, AttemptID: attemptID, Kind: kind,
-			RequestDigest: requestDigest, PreparedAt: s.now(),
-		}
-		snapshot.Actions[actionID] = result
-		attempt.ActionIDs = append(attempt.ActionIDs, actionID)
-		snapshot.Attempts[attemptID] = attempt
-		appendEvent(snapshot, Event{
-			Kind: EventActionPrepared, TaskID: attempt.TaskID, AttemptID: attemptID,
-			ActionID: actionID, Digest: digestStrings("prepare", actionID, requestDigest),
-		}, s.now())
-		return nil
+		return err
 	})
-	return result, err
+	return result, reused, err
+}
+
+func (s *Service) prepareAction(
+	snapshot *Snapshot,
+	controlRunID, attemptID string,
+	kind agentharness.ActionKind,
+	requestDigest string,
+) (LifecycleAction, bool, error) {
+	attempt, ok := snapshot.Attempts[attemptID]
+	if !ok {
+		return LifecycleAction{}, false, ErrNotFound
+	}
+	capability, err := agentharness.OperationCapability(kind, attempt.Primitive)
+	if err != nil {
+		return LifecycleAction{}, false, err
+	}
+	primitiveCapabilities := attempt.CapabilitySnapshot.Primitives[attempt.Primitive]
+	if !primitiveCapabilities.Supports(capability) {
+		return LifecycleAction{}, false, ErrCapabilityUnavailable
+	}
+	for _, actionID := range attempt.ActionIDs {
+		action := snapshot.Actions[actionID]
+		if action.Kind != kind {
+			continue
+		}
+		if action.RequestDigest != requestDigest {
+			if singleShotAction(kind) {
+				return LifecycleAction{}, false, ErrActionConflict
+			}
+			continue
+		}
+		return action, true, nil
+	}
+	actionID, err := agentharness.StableActionID(
+		controlRunID, attempt.TaskID, attemptID, snapshot.Graph.Revision,
+		attempt.Primitive, kind, requestDigest,
+	)
+	if err != nil {
+		return LifecycleAction{}, false, err
+	}
+	result := LifecycleAction{
+		ID: actionID, AttemptID: attemptID, Kind: kind,
+		RequestDigest: requestDigest, PreparedAt: s.now(),
+	}
+	snapshot.Actions[actionID] = result
+	attempt.ActionIDs = append(attempt.ActionIDs, actionID)
+	snapshot.Attempts[attemptID] = attempt
+	appendEvent(snapshot, Event{
+		Kind: EventActionPrepared, TaskID: attempt.TaskID, AttemptID: attemptID,
+		ActionID: actionID, Digest: digestStrings("prepare", actionID, requestDigest),
+	}, s.now())
+	return result, false, nil
 }
 
 func (s *Service) CompleteAction(
@@ -344,150 +412,166 @@ func (s *Service) CompleteAction(
 ) (LifecycleAction, error) {
 	var completed LifecycleAction
 	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
-		action, ok := snapshot.Actions[actionID]
-		if !ok {
-			return ErrNotFound
-		}
-		if action.Ambiguous {
-			return ErrAmbiguousDispatch
-		}
-		if result.ActionID != actionID || strings.TrimSpace(result.ResultDigest) == "" {
-			return ErrActionConflict
-		}
-		if action.Completed {
-			if !sameActionResult(action.Result, result) {
-				return ErrActionConflict
-			}
-			completed = action
-			return nil
-		}
-		attempt := snapshot.Attempts[action.AttemptID]
-		primitiveCapabilities := attempt.CapabilitySnapshot.Primitives[attempt.Primitive]
-		expectedRuntimeIDs := attempt.RuntimeWorkIDs
-		if action.Kind == agentharness.ActionDispatch {
-			expectedRuntimeIDs = nil
-		}
-		trustedResult := result
-		trustedResult.Events = make([]agentharness.WorkEvent, 0, len(result.Events))
-		duplicateEvents := 0
-		if attempt.ObservedEvents == nil {
-			attempt.ObservedEvents = make(map[string]string)
-		}
-		for _, event := range result.Events {
-			if digest, exists := attempt.ObservedEvents[event.ID]; exists {
-				if digest != event.ResultDigest || !completedEventMatches(*snapshot, attempt, event) {
-					return ErrActionConflict
-				}
-				duplicateEvents++
-				continue
-			}
-			trustedResult.Events = append(trustedResult.Events, event)
-		}
-		validationCursorSequence := attempt.CursorSequence
-		if duplicateEvents > 0 && len(trustedResult.Events) == 0 {
-			if result.Cursor != attempt.LastCursor || result.CursorSequence != attempt.CursorSequence {
-				return ErrActionConflict
-			}
-			validationCursorSequence = 0
-		}
-		if err := agentharness.ValidateActionResult(
-			action.Kind, attempt.Primitive, expectedRuntimeIDs,
-			validationCursorSequence, primitiveCapabilities.Supports(agentharness.CapCursor), trustedResult,
-		); err != nil {
-			if errors.Is(err, agentharness.ErrCursorRegression) {
-				return ErrCursorRegression
-			}
-			if errors.Is(err, agentharness.ErrUnexpectedRuntimeIdentity) {
-				return err
-			}
-			return ErrActionConflict
-		}
-		if (action.Kind == agentharness.ActionSend || action.Kind == agentharness.ActionAcknowledge) &&
-			strings.TrimSpace(result.MessageReceipt) == "" {
-			return ErrActionConflict
-		}
-		if len(result.RuntimeWorkIDs) > 0 && !primitiveCapabilities.Supports(agentharness.CapRuntimeIdentity) {
-			return agentharness.ErrUnexpectedRuntimeIdentity
-		}
-		if action.Kind == agentharness.ActionDispatch &&
-			attempt.Primitive == agentharness.PersistentSession && len(result.RuntimeWorkIDs) != 1 {
-			return agentharness.ErrUnexpectedRuntimeIdentity
-		}
-		if action.Kind != agentharness.ActionDispatch && len(result.RuntimeWorkIDs) > 0 &&
-			!sameStrings(attempt.RuntimeWorkIDs, result.RuntimeWorkIDs) {
-			return ErrActionConflict
-		}
-		action.Completed = true
-		action.Result = cloneActionResult(result)
-		action.CompletedAt = s.now()
-		snapshot.Actions[actionID] = action
-		if result.Cursor != "" && result.CursorSequence > attempt.CursorSequence {
-			attempt.LastCursor = result.Cursor
-			attempt.CursorSequence = result.CursorSequence
-		}
-		if action.Kind == agentharness.ActionDispatch {
-			attempt.RuntimeWorkIDs = append([]string(nil), result.RuntimeWorkIDs...)
-			attempt.State = AttemptActive
-			setTaskState(&snapshot.Graph, attempt.TaskID, TaskActive)
-			if attempt.Primitive == agentharness.PersistentSession {
-				runtimeID := result.RuntimeWorkIDs[0]
-				sessionID := stableID("session", controlRunID, attempt.ID, runtimeID)
-				if existing, exists := snapshot.Sessions[sessionID]; exists && existing.RuntimeChildID != runtimeID {
-					return ErrActionConflict
-				}
-				snapshot.Sessions[sessionID] = AgentSession{
-					ID: sessionID, AttemptID: attempt.ID, TaskID: attempt.TaskID,
-					HarnessID: attempt.CapabilitySnapshot.HarnessID, RuntimeChildID: runtimeID,
-					LastCursor: result.Cursor, State: SessionRegistered,
-				}
-			}
-		}
-		if action.Kind == agentharness.ActionObserve || action.Kind == agentharness.ActionWait {
-			for _, event := range trustedResult.Events {
-				attempt.ObservedEvents[event.ID] = event.ResultDigest
-				if event.Terminal {
-					attempt.TerminalObserved = true
-					break
-				}
-			}
-		}
-		if action.Kind == agentharness.ActionClose {
-			if err := validateClosePrerequisites(*snapshot, attempt); err != nil {
-				return err
-			}
-			closeEvidence, err := controlCloseEvidence(result.CloseEvidence)
-			if err != nil {
-				return err
-			}
-			if err := validateCloseEvidence(attempt.Primitive, closeEvidence); err != nil {
-				return err
-			}
-			if attempt.CloseEvidence.Kind != "" && attempt.CloseEvidence != closeEvidence {
-				return ErrActionConflict
-			}
-			attempt.CloseEvidence = closeEvidence
-			if attempt.TerminalEvidence.ID != "" {
-				attempt.State = AttemptCompleted
-			}
-			if attempt.Primitive == agentharness.PersistentSession {
-				for id, session := range snapshot.Sessions {
-					if session.AttemptID == attempt.ID {
-						session.ArchiveReceipt = closeEvidence.Receipt
-						session.State = SessionArchived
-						snapshot.Sessions[id] = session
-					}
-				}
-			}
-		}
-		snapshot.Attempts[attempt.ID] = attempt
-		appendEvent(snapshot, Event{
-			Kind: EventActionCompleted, TaskID: attempt.TaskID, AttemptID: attempt.ID,
-			ActionID: actionID, Digest: digestStrings("complete", actionID, result.ResultDigest),
-		}, s.now())
-		completed = action
-		return nil
+		return s.completeAction(snapshot, controlRunID, actionID, result, &completed, nil)
 	})
 	return completed, err
+}
+
+func (s *Service) completeAction(
+	snapshot *Snapshot,
+	controlRunID, actionID string,
+	result agentharness.ActionResult,
+	completed *LifecycleAction,
+	completedAttempt *PlacementAttempt,
+) error {
+	action, ok := snapshot.Actions[actionID]
+	if !ok {
+		return ErrNotFound
+	}
+	if action.Ambiguous {
+		return ErrAmbiguousDispatch
+	}
+	if result.ActionID != actionID || strings.TrimSpace(result.ResultDigest) == "" {
+		return ErrActionConflict
+	}
+	if action.Completed {
+		if !sameActionResult(action.Result, result) {
+			return ErrActionConflict
+		}
+		*completed = action
+		if completedAttempt != nil {
+			*completedAttempt = snapshot.Attempts[action.AttemptID]
+		}
+		return nil
+	}
+	attempt := snapshot.Attempts[action.AttemptID]
+	primitiveCapabilities := attempt.CapabilitySnapshot.Primitives[attempt.Primitive]
+	expectedRuntimeIDs := attempt.RuntimeWorkIDs
+	if action.Kind == agentharness.ActionDispatch {
+		expectedRuntimeIDs = nil
+	}
+	trustedResult := result
+	trustedResult.Events = make([]agentharness.WorkEvent, 0, len(result.Events))
+	duplicateEvents := 0
+	if attempt.ObservedEvents == nil {
+		attempt.ObservedEvents = make(map[string]string)
+	}
+	for _, event := range result.Events {
+		if digest, exists := attempt.ObservedEvents[event.ID]; exists {
+			if digest != event.ResultDigest || !completedEventMatches(*snapshot, attempt, event) {
+				return ErrActionConflict
+			}
+			duplicateEvents++
+			continue
+		}
+		trustedResult.Events = append(trustedResult.Events, event)
+	}
+	validationCursorSequence := attempt.CursorSequence
+	if duplicateEvents > 0 && len(trustedResult.Events) == 0 {
+		if result.Cursor != attempt.LastCursor || result.CursorSequence != attempt.CursorSequence {
+			return ErrActionConflict
+		}
+		validationCursorSequence = 0
+	}
+	if err := agentharness.ValidateActionResult(
+		action.Kind, attempt.Primitive, expectedRuntimeIDs,
+		validationCursorSequence, primitiveCapabilities.Supports(agentharness.CapCursor), trustedResult,
+	); err != nil {
+		if errors.Is(err, agentharness.ErrCursorRegression) {
+			return ErrCursorRegression
+		}
+		if errors.Is(err, agentharness.ErrUnexpectedRuntimeIdentity) {
+			return err
+		}
+		return ErrActionConflict
+	}
+	if (action.Kind == agentharness.ActionSend || action.Kind == agentharness.ActionAcknowledge) &&
+		strings.TrimSpace(result.MessageReceipt) == "" {
+		return ErrActionConflict
+	}
+	if len(result.RuntimeWorkIDs) > 0 && !primitiveCapabilities.Supports(agentharness.CapRuntimeIdentity) {
+		return agentharness.ErrUnexpectedRuntimeIdentity
+	}
+	if action.Kind == agentharness.ActionDispatch &&
+		attempt.Primitive == agentharness.PersistentSession && len(result.RuntimeWorkIDs) != 1 {
+		return agentharness.ErrUnexpectedRuntimeIdentity
+	}
+	if action.Kind != agentharness.ActionDispatch && len(result.RuntimeWorkIDs) > 0 &&
+		!sameStrings(attempt.RuntimeWorkIDs, result.RuntimeWorkIDs) {
+		return ErrActionConflict
+	}
+	action.Completed = true
+	action.Result = cloneActionResult(result)
+	action.CompletedAt = s.now()
+	snapshot.Actions[actionID] = action
+	if result.Cursor != "" && result.CursorSequence > attempt.CursorSequence {
+		attempt.LastCursor = result.Cursor
+		attempt.CursorSequence = result.CursorSequence
+	}
+	if action.Kind == agentharness.ActionDispatch {
+		attempt.RuntimeWorkIDs = append([]string(nil), result.RuntimeWorkIDs...)
+		attempt.State = AttemptActive
+		setTaskState(&snapshot.Graph, attempt.TaskID, TaskActive)
+		if attempt.Primitive == agentharness.PersistentSession {
+			runtimeID := result.RuntimeWorkIDs[0]
+			sessionID := stableID("session", controlRunID, attempt.ID, runtimeID)
+			if existing, exists := snapshot.Sessions[sessionID]; exists && existing.RuntimeChildID != runtimeID {
+				return ErrActionConflict
+			}
+			snapshot.Sessions[sessionID] = AgentSession{
+				ID: sessionID, AttemptID: attempt.ID, TaskID: attempt.TaskID,
+				HarnessID: attempt.CapabilitySnapshot.HarnessID, RuntimeChildID: runtimeID,
+				LastCursor: result.Cursor, State: SessionRegistered,
+			}
+		}
+	}
+	if action.Kind == agentharness.ActionObserve || action.Kind == agentharness.ActionWait {
+		for _, event := range trustedResult.Events {
+			attempt.ObservedEvents[event.ID] = event.ResultDigest
+			if event.Terminal {
+				attempt.TerminalObserved = true
+				break
+			}
+		}
+	}
+	if action.Kind == agentharness.ActionClose {
+		if err := validateClosePrerequisites(*snapshot, attempt); err != nil {
+			return err
+		}
+		closeEvidence, err := controlCloseEvidence(result.CloseEvidence)
+		if err != nil {
+			return err
+		}
+		if err := validateCloseEvidence(attempt.Primitive, closeEvidence); err != nil {
+			return err
+		}
+		if attempt.CloseEvidence.Kind != "" && attempt.CloseEvidence != closeEvidence {
+			return ErrActionConflict
+		}
+		attempt.CloseEvidence = closeEvidence
+		if attempt.TerminalEvidence.ID != "" {
+			attempt.State = AttemptCompleted
+		}
+		if attempt.Primitive == agentharness.PersistentSession {
+			for id, session := range snapshot.Sessions {
+				if session.AttemptID == attempt.ID {
+					session.ArchiveReceipt = closeEvidence.Receipt
+					session.State = SessionArchived
+					snapshot.Sessions[id] = session
+				}
+			}
+		}
+	}
+	snapshot.Attempts[attempt.ID] = attempt
+	appendEvent(snapshot, Event{
+		Kind: EventActionCompleted, TaskID: attempt.TaskID, AttemptID: attempt.ID,
+		ActionID: actionID, Digest: digestStrings("complete", actionID, result.ResultDigest),
+	}, s.now())
+	*completed = action
+	if completedAttempt != nil {
+		*completedAttempt = attempt
+	}
+	return nil
 }
 
 func (s *Service) MarkAmbiguous(
@@ -645,29 +729,129 @@ func (s *Service) SendMessage(
 	controlRunID string,
 	message Message,
 ) (Message, error) {
+	var result Message
 	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
-		if message.ID == "" || !validMessageKind(message.Kind) || !validDigest(message.Digest) ||
-			!messageScopeAllowed(snapshot.Graph, message.FromTaskID, message.ToTaskID) {
-			return ErrInvalidGraph
+		if err := validateSendMessage(*snapshot, message); err != nil {
+			return err
 		}
 		if existing, ok := snapshot.Messages[message.ID]; ok {
-			if existing != message {
+			if !sameSendMessage(existing, message) {
 				return ErrActionConflict
 			}
+			result = existing
 			return nil
 		}
 		snapshot.Messages[message.ID] = message
-		kind := EventSteering
-		if message.Kind == MessageDependencyHandoff {
-			kind = EventHandoff
-		}
-		appendEvent(snapshot, Event{
-			Kind: kind, TaskID: message.ToTaskID,
-			Digest: digestStrings("message", message.ID, message.Digest),
-		}, s.now())
+		appendMessageEvent(snapshot, message, s.now())
+		result = message
 		return nil
 	})
-	return message, err
+	return result, err
+}
+
+// SendRequestDigest binds an ActionSend prepare to the immutable sender input.
+// Acknowledged is intentionally excluded because it is owned by the server.
+func SendRequestDigest(message Message) string {
+	input := struct {
+		ID         string      `json:"id"`
+		FromTaskID string      `json:"from_task_id"`
+		ToTaskID   string      `json:"to_task_id"`
+		Kind       MessageKind `json:"kind"`
+		Digest     string      `json:"digest"`
+	}{
+		ID: message.ID, FromTaskID: message.FromTaskID, ToTaskID: message.ToTaskID,
+		Kind: message.Kind, Digest: message.Digest,
+	}
+	raw, _ := json.Marshal(input)
+	sum := sha256.Sum256(append([]byte("paje-control-send-v1\x00"), raw...))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// CompleteSend atomically completes a bound ActionSend and persists its exact
+// immutable message plus mailbox event in the same durable store transaction.
+func (s *Service) CompleteSend(
+	ctx context.Context,
+	controlRunID, attemptID, actionID string,
+	result agentharness.ActionResult,
+	message Message,
+) (LifecycleAction, PlacementAttempt, Message, error) {
+	var completed LifecycleAction
+	var attempt PlacementAttempt
+	var persisted Message
+	_, err := s.mutate(ctx, controlRunID, func(snapshot *Snapshot) error {
+		if err := validateSendMessage(*snapshot, message); err != nil {
+			return err
+		}
+		action, ok := snapshot.Actions[actionID]
+		if !ok {
+			return ErrNotFound
+		}
+		if action.Kind != agentharness.ActionSend || action.AttemptID != attemptID ||
+			action.RequestDigest != SendRequestDigest(message) {
+			return ErrActionConflict
+		}
+		existing, exists := snapshot.Messages[message.ID]
+		if exists && !sameSendMessage(existing, message) {
+			return ErrActionConflict
+		}
+		if exists && !sendMessageBoundToAction(*snapshot, existing, actionID) {
+			return ErrActionConflict
+		}
+		if err := s.completeAction(
+			snapshot, controlRunID, actionID, result, &completed, &attempt,
+		); err != nil {
+			return err
+		}
+		if exists {
+			persisted = existing
+			return nil
+		}
+		snapshot.Messages[message.ID] = message
+		appendMessageEvent(snapshot, message, s.now())
+		persisted = message
+		return nil
+	})
+	return completed, attempt, persisted, err
+}
+
+func validateSendMessage(snapshot Snapshot, message Message) error {
+	if message.Acknowledged || message.ID == "" || !validMessageKind(message.Kind) ||
+		!validDigest(message.Digest) ||
+		!messageScopeAllowed(snapshot.Graph, message.FromTaskID, message.ToTaskID) {
+		return ErrInvalidGraph
+	}
+	return nil
+}
+
+func sameSendMessage(first, second Message) bool {
+	return first.ID == second.ID && first.FromTaskID == second.FromTaskID &&
+		first.ToTaskID == second.ToTaskID && first.Kind == second.Kind && first.Digest == second.Digest
+}
+
+func sendMessageBoundToAction(snapshot Snapshot, message Message, actionID string) bool {
+	bound := false
+	requestDigest := SendRequestDigest(message)
+	for id, action := range snapshot.Actions {
+		if action.Kind != agentharness.ActionSend || !action.Completed || action.RequestDigest != requestDigest {
+			continue
+		}
+		if id != actionID {
+			return false
+		}
+		bound = true
+	}
+	return bound
+}
+
+func appendMessageEvent(snapshot *Snapshot, message Message, now time.Time) {
+	kind := EventSteering
+	if message.Kind == MessageDependencyHandoff {
+		kind = EventHandoff
+	}
+	appendEvent(snapshot, Event{
+		Kind: kind, TaskID: message.ToTaskID,
+		Digest: digestStrings("message", message.ID, message.Digest),
+	}, now)
 }
 
 func (s *Service) AcknowledgeMessage(

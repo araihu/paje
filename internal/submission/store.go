@@ -24,5 +24,5 @@ type Store interface {
 	BindTrigger(context.Context, string, TriggerReference) (Record, error)
 	Load(context.Context, string) (Record, error)
 	LoadByKey(context.Context, string, string) (Record, error)
-	MarkCancellationRequested(context.Context, string, time.Time) (Record, error)
+	MarkCancellationRequested(context.Context, string, time.Time) (Record, bool, error)
 }

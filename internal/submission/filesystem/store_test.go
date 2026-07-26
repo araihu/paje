@@ -451,13 +451,39 @@ func TestFilesystemStoreRejectsNonMonotonicInitialCancellation(t *testing.T) {
 	if _, _, err := store.Reserve(context.Background(), reservation); err != nil {
 		t.Fatal(err)
 	}
-	_, err := store.MarkCancellationRequested(
+	_, _, err := store.MarkCancellationRequested(
 		context.Background(),
 		reservation.Record.RunID,
 		reservation.Record.UpdatedAt.Add(-time.Second),
 	)
 	if !errors.Is(err, submission.ErrIdempotencyConflict) {
 		t.Fatalf("MarkCancellationRequested() error = %v, want idempotency conflict", err)
+	}
+}
+
+func TestFilesystemCancellationReplayAfterRestartIsNotNew(t *testing.T) {
+	root := t.TempDir()
+	store := newStore(t, root)
+	reservation := validReservation()
+	if _, _, err := store.Reserve(context.Background(), reservation); err != nil {
+		t.Fatal(err)
+	}
+	requestedAt := reservation.Record.UpdatedAt.Add(time.Minute)
+	first, newlyRequested, err := store.MarkCancellationRequested(
+		context.Background(), reservation.Record.RunID, requestedAt,
+	)
+	if err != nil || !newlyRequested || first.CancellationRequested == nil ||
+		!first.CancellationRequested.Equal(requestedAt) {
+		t.Fatalf("first cancellation = (%#v, %t, %v)", first, newlyRequested, err)
+	}
+
+	restarted := newStore(t, root)
+	replayed, newlyRequested, err := restarted.MarkCancellationRequested(
+		context.Background(), reservation.Record.RunID, requestedAt.Add(time.Hour),
+	)
+	if err != nil || newlyRequested || replayed.CancellationRequested == nil ||
+		!replayed.CancellationRequested.Equal(requestedAt) {
+		t.Fatalf("restarted cancellation = (%#v, %t, %v)", replayed, newlyRequested, err)
 	}
 }
 
