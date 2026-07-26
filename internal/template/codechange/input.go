@@ -32,11 +32,7 @@ type Input struct {
 	Profile          string                       `json:"profile,omitempty"`
 	Checks           []verification.CommandSpec   `json:"checks,omitempty"`
 	ModuleExclusions []repository.ModuleExclusion `json:"module_exclusions,omitempty"`
-	// EnvironmentKeys remains an internal zero-value bridge until Task 9
-	// replaces the legacy Execute implementation. It is not part of the wire
-	// contract, so strict decoding rejects environment_keys as unknown.
-	EnvironmentKeys []string    `json:"-"`
-	Publication     Publication `json:"publication,omitempty"`
+	Publication      Publication                  `json:"publication,omitempty"`
 }
 
 // Publication describes the requested durable output mode.

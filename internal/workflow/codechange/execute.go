@@ -2,8 +2,6 @@ package codechange
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,31 +15,58 @@ import (
 
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
-	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/executor/commandrunner"
 	"github.com/araihu/paje/internal/policy"
 	"github.com/araihu/paje/internal/repository"
 	"github.com/araihu/paje/internal/run"
-	"github.com/araihu/paje/internal/runner"
+	"github.com/araihu/paje/internal/secret"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
 	"github.com/araihu/paje/internal/workspace"
 )
 
+const (
+	defaultSandboxTimeout = time.Minute
+	defaultOutputLimit    = int64(1 << 20)
+)
+
 type executeOutcome struct {
-	execution       runner.ExecutionResult
-	profile         repository.ProfileResult
-	verification    []verification.Result
-	capture         gitcapture.Result
-	artifact        *artifact.Reference
-	failure         *run.Failure
-	cause           error
-	evidence        map[string]string
-	scrubber        durableScrubber
-	ownership       stageOwnership
-	runtimeID       string
-	ownershipLost   bool
-	ownershipRecord run.Record
-	ownershipErr    error
+	execution        executor.Result
+	agentOutput      string
+	profile          repository.ProfileResult
+	verification     []verification.Result
+	capture          gitcapture.Result
+	profileSnapshot  workerprofile.Snapshot
+	runtimeIsolated  bool
+	runtimeCertified bool
+	harnessEvidence  artifact.HarnessEvidence
+	toolEvidence     []artifact.ToolEvidence
+	attemptEvidence  []artifact.AttemptEvidence
+	artifact         *artifact.Reference
+	failure          *run.Failure
+	cause            error
+	cleanupFailed    bool
+	evidence         map[string]string
+	scrubber         durableScrubber
+	ownership        stageOwnership
+	ownershipLost    bool
+	ownershipRecord  run.Record
+	ownershipErr     error
+}
+
+type activeLease struct {
+	id              string
+	materialization secret.Materialization
+}
+
+type fencedExecutor struct {
+	service   *Service
+	target    executor.Executor
+	runID     string
+	ownership stageOwnership
+	outcome   *executeOutcome
 }
 
 type stageOwnership struct {
@@ -56,7 +81,7 @@ func (s *Service) Execute(ctx context.Context, runID string) (PhaseResult, error
 	if err != nil || record.Terminal() {
 		return phaseResult(record), err
 	}
-	record, started, err := s.beginStage(ctx, runID, "execute", run.StatusExecuting)
+	record, started, err := s.beginExecuteStage(ctx, runID)
 	if err != nil {
 		return phaseResult(record), err
 	}
@@ -77,32 +102,16 @@ func (s *Service) Execute(ctx context.Context, runID string) (PhaseResult, error
 	if err != nil {
 		return phaseResult(record), err
 	}
-	runtimeID := executeRuntimeID(runID, ownership)
-
 	prepared, err := s.workspaces.Prepare(ctx, record.RepositoryURI, record.BaseSHA)
 	if err != nil {
 		failure := classifyWorkspaceFailure(ctx, err)
 		return s.finishFailure(ctx, runID, failure, err)
 	}
 
-	outcome := s.executePrepared(ctx, record, input, prepared.Path(), runtimeID, ownership)
+	outcome := s.executePrepared(ctx, record, input, prepared.Path(), ownership)
 	outcome = outcome.withCancellation(ctx.Err())
-	cleanupErr := s.cleanupAttempt(ctx, runtimeID, prepared)
-	if cleanupErr != nil {
-		outcome.cause = errors.Join(outcome.cause, cleanupErr)
-		if outcome.failure == nil {
-			failure := run.Failure{
-				Stage: "execute", Class: run.FailureCleanup, Retryable: false,
-				Diagnostic: "attempt cleanup failed", CauseCode: "cleanup_failed",
-			}
-			outcome.failure = &failure
-		} else {
-			failure := *outcome.failure
-			failure.Retryable = false
-			failure.Diagnostic = run.SafeDiagnostic(failure.Diagnostic + "; attempt cleanup failed")
-			outcome.failure = &failure
-		}
-	}
+	cleanupErr := s.cleanupAttempt(ctx, prepared)
+	outcome = outcome.withCleanupFailure(cleanupErr)
 	outcome = outcome.withCancellation(ctx.Err())
 	if outcome.ownershipLost {
 		return s.finishOwnershipLost(ctx, runID, outcome, cleanupErr)
@@ -128,12 +137,187 @@ func (s *Service) loadExecutable(ctx context.Context, runID string) (run.Record,
 	return record, input, nil
 }
 
+// beginExecuteStage is deliberately separate from the generic stage helper:
+// taking over Execute requires executor observation, while every other phase
+// can classify an expired worker from durable state alone.
+func (s *Service) beginExecuteStage(ctx context.Context, runID string) (run.Record, bool, error) {
+	for recovery := 0; recovery < maxCASAttempts; recovery++ {
+		record, err := s.runs.Load(ctx, runID)
+		if err != nil {
+			return run.Record{}, false, err
+		}
+		if _, err := validateRunBinding(record); err != nil {
+			return record, false, err
+		}
+		if record.Terminal() {
+			return record, false, nil
+		}
+		latest, found := latestStage(record, "execute")
+		if !found || latest.Status != run.StageRunning {
+			return s.beginStage(ctx, runID, "execute", run.StatusExecuting)
+		}
+		ownership := stageOwnership{name: "execute", attempt: latest.Attempts, startedAt: latest.StartedAt}
+		if !stageExpired(latest, s.clock(), s.executeLease) || activeArtifactWriteLease(record, ownership, s.clock()) {
+			return record, false, nil
+		}
+		if record.Artifact != nil {
+			recovered, err := s.completeCheckpointedExecute(ctx, runID, ownership)
+			return recovered, false, err
+		}
+		if record.WorkerProfile == nil {
+			return record, false, fmt.Errorf("recover execute: resolved worker profile is missing")
+		}
+		target, err := s.executors.Resolve(record.WorkerProfile.Clone())
+		if err != nil {
+			return s.failAmbiguousExecute(ctx, runID, ownership, err)
+		}
+		agentAttempt := executorAttempt(runID, ownership, executor.PurposeAgent, 0)
+		state, inspectErr := target.Inspect(ctx, agentAttempt)
+		if inspectErr != nil {
+			return s.failAmbiguousExecute(ctx, runID, ownership, inspectErr)
+		}
+		owned, identityErr := s.checkExecuteIdentity(ctx, runID, ownership)
+		if identityErr != nil {
+			return owned, false, identityErr
+		}
+		if !exactStageIdentity(owned, ownership) {
+			continue
+		}
+		durableStart := latest.Evidence["agent_started"] == "true"
+		if (state != executor.StateAbsent && state != executor.StateCreated) || durableStart {
+			return s.failAmbiguousExecute(ctx, runID, ownership, errors.New("prior agent attempt may have started"))
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+		destroyErr := target.Destroy(cleanupCtx, agentAttempt)
+		cancel()
+		if destroyErr != nil {
+			return s.failAmbiguousExecute(ctx, runID, ownership, destroyErr)
+		}
+		return s.retryConclusiveNonStart(ctx, runID, ownership)
+	}
+	return run.Record{}, false, fmt.Errorf("recover execute after %d ownership races: %w", maxCASAttempts, run.ErrVersionConflict)
+}
+
+func (s *Service) checkExecuteIdentity(ctx context.Context, runID string, ownership stageOwnership) (run.Record, error) {
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	defer cancel()
+	record, err := s.runs.Load(checkCtx, runID)
+	if err != nil {
+		return run.Record{}, err
+	}
+	if _, err := validateRunBinding(record); err != nil {
+		return record, err
+	}
+	return record, nil
+}
+
+func (s *Service) completeCheckpointedExecute(ctx context.Context, runID string, ownership stageOwnership) (run.Record, error) {
+	return s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
+		if !exactStageIdentity(current, ownership) || current.Artifact == nil {
+			return current, false, ErrPhaseInProgress
+		}
+		next := run.CloneRecord(current)
+		latest, _ := latestStage(next, "execute")
+		latest.Status = run.StageSucceeded
+		latest.FinishedAt = s.clock()
+		latest.Failure = nil
+		next.Failure = nil
+		next.ArtifactWriteLease = nil
+		var err error
+		next, err = run.UpsertStage(next, latest)
+		if err != nil {
+			return run.Record{}, false, err
+		}
+		next.UpdatedAt = s.clock()
+		return next, true, nil
+	})
+}
+
+func (s *Service) failAmbiguousExecute(ctx context.Context, runID string, ownership stageOwnership, cause error) (run.Record, bool, error) {
+	record, err := s.mutate(context.WithoutCancel(ctx), runID, func(current run.Record) (run.Record, bool, error) {
+		if !exactStageIdentity(current, ownership) {
+			return current, false, ErrPhaseInProgress
+		}
+		next := run.CloneRecord(current)
+		latest, _ := latestStage(next, "execute")
+		failure := ambiguousAttemptFailure()
+		latest.Status = run.StageFailed
+		latest.FinishedAt = s.clock()
+		latest.Failure = &failure
+		next.Failure = &failure
+		next.ArtifactWriteLease = nil
+		var mutationErr error
+		next, mutationErr = run.UpsertStage(next, latest)
+		if mutationErr != nil {
+			return run.Record{}, false, mutationErr
+		}
+		next, mutationErr = run.Transition(next, run.StatusFailed, s.clock())
+		return next, true, mutationErr
+	})
+	if err != nil {
+		return record, false, err
+	}
+	failure := ambiguousAttemptFailure()
+	return record, false, newPhaseError(failure, cause)
+}
+
+func (s *Service) retryConclusiveNonStart(ctx context.Context, runID string, ownership stageOwnership) (run.Record, bool, error) {
+	started := false
+	record, err := s.mutate(ctx, runID, func(current run.Record) (run.Record, bool, error) {
+		if !exactStageIdentity(current, ownership) || !stageExpired(mustLatestStage(current, "execute"), s.clock(), s.executeLease) {
+			return current, false, ErrPhaseInProgress
+		}
+		next := run.CloneRecord(current)
+		latest, _ := latestStage(next, "execute")
+		lost := run.Failure{
+			Stage: "execute", Class: run.FailureInternal, Retryable: true,
+			Diagnostic: "worker was lost before the agent started", CauseCode: "worker_lost_before_start",
+		}
+		latest.Status = run.StageFailed
+		latest.FinishedAt = s.clock()
+		latest.Failure = &lost
+		var mutationErr error
+		next, mutationErr = run.UpsertStage(next, latest)
+		if mutationErr != nil {
+			return run.Record{}, false, mutationErr
+		}
+		next.Failure = nil
+		stage := run.StageResult{
+			Name: "execute", Status: run.StageRunning, StartedAt: s.clock(), Attempts: latest.Attempts + 1,
+		}
+		next, mutationErr = run.UpsertStage(next, stage)
+		if mutationErr != nil {
+			return run.Record{}, false, mutationErr
+		}
+		next.UpdatedAt = s.clock()
+		started = true
+		return next, true, nil
+	})
+	return record, started, err
+}
+
+func mustLatestStage(record run.Record, name string) run.StageResult {
+	stage, _ := latestStage(record, name)
+	return stage
+}
+
+func ambiguousAttemptFailure() run.Failure {
+	return run.Failure{
+		Stage: "execute", Class: run.FailureInternal, Retryable: false,
+		Diagnostic: "running attempt outcome is ambiguous", CauseCode: "ambiguous_attempt",
+	}
+}
+
+func providerReportedAmbiguousAttempt(err error) bool {
+	var providerError *executor.ProviderError
+	return errors.As(err, &providerError) && providerError.CauseCode == "ambiguous_attempt"
+}
+
 func (s *Service) executePrepared(
 	ctx context.Context,
 	record run.Record,
 	input templatecodechange.Input,
 	workspacePath string,
-	runtimeID string,
 	ownership stageOwnership,
 ) executeOutcome {
 	scrubber, scrubberErr := newDurableScrubber(workspacePath)
@@ -141,38 +325,91 @@ func (s *Service) executePrepared(
 		evidence:  make(map[string]string),
 		scrubber:  scrubber,
 		ownership: ownership,
-		runtimeID: runtimeID,
 	}
 	if scrubberErr != nil {
 		return outcome.withFailure(unsafeEphemeralPrefixFailure(), scrubberErr)
 	}
-	agentEnvironment, err := s.environments.Build(ctx, environment.Request{
-		RunID: runtimeID, Stage: environment.StageAgent, RequestedKeys: input.EnvironmentKeys,
-	})
-	if err != nil {
-		return outcome.withFailure(environmentPolicyFailure(ctx, "execute"), err)
+	if record.WorkerProfile == nil {
+		return outcome.withFailure(ambiguousAttemptFailure(), errors.New("resolved worker profile is missing"))
 	}
-	verificationEnvironment, err := s.environments.Build(ctx, environment.Request{
-		RunID: runtimeID, Stage: environment.StageVerification, RequestedKeys: input.EnvironmentKeys,
-	})
+	outcome.profileSnapshot = record.WorkerProfile.Clone()
+	target, err := s.executors.Resolve(outcome.profileSnapshot)
 	if err != nil {
-		return outcome.withFailure(environmentPolicyFailure(ctx, "execute"), err)
+		return outcome.withFailure(executorUnavailableFailure(), err)
 	}
-	outcome.scrubber, err = newDurableScrubber(
-		workspacePath, agentEnvironment.Values, verificationEnvironment.Values,
-	)
+	adapter, err := s.harnesses.Resolve(outcome.profileSnapshot)
 	if err != nil {
-		return outcome.withFailure(unsafeEphemeralPrefixFailure(), err)
+		return outcome.withFailure(executorUnavailableFailure(), err)
 	}
-	outcome.evidence["agent_environment_keys"] = encodeStrings(agentEnvironment.Keys)
-	outcome.evidence["verification_environment_keys"] = encodeStrings(verificationEnvironment.Keys)
+	fenced := &fencedExecutor{
+		service: s, target: target, runID: record.ID, ownership: ownership, outcome: &outcome,
+	}
+	baseline := sandboxEnvironment()
+	outcome.evidence["agent_environment_keys"] = encodeStrings(sortedMapKeys(baseline))
+	outcome.evidence["verification_environment_keys"] = encodeStrings(sortedMapKeys(baseline))
 
-	profile := s.profiles[input.Profile]
-	outcome.profile, err = profile.Inspect(ctx, repository.ProfileRequest{
-		Workspace: workspacePath, Environment: cloneStringMap(verificationEnvironment.Values),
+	harnessProbe := adapter.Probe()
+	harnessResult, probeErr, probeCleanupErr := fenced.runProbe(
+		ctx, workspacePath, outcome.profileSnapshot, harnessProbe, 0,
+	)
+	if probeCleanupErr != nil {
+		harnessResult.Destroy()
+		return outcome.withCleanupFailure(errors.Join(probeErr, probeCleanupErr))
+	}
+	if probeErr != nil || !probeSucceeded(harnessResult, outcome.profileSnapshot.Harness.Version) ||
+		!runtimeProbeMatches(outcome.profileSnapshot, harnessResult.SafeFacts) {
+		harnessResult.Destroy()
+		return outcome.withFailure(executorUnavailableFailure(), errors.Join(probeErr, errors.New("harness probe failed")))
+	}
+	outcome.runtimeIsolated = harnessResult.SafeFacts["isolated"] == "true"
+	outcome.runtimeCertified = harnessResult.SafeFacts["certified"] == "true"
+	harnessResult.Destroy()
+	outcome.harnessEvidence = artifact.HarnessEvidence{
+		ID: adapter.ID(), DeclaredVersion: adapter.Version(), ProbedVersion: adapter.Version(),
+		ProbePassed: true, Sequence: 0,
+	}
+	for index, tool := range outcome.profileSnapshot.Tools {
+		command := executor.Command{
+			Executable: tool.Probe.Executable, Args: append([]string(nil), tool.Probe.Args...),
+			Directory: executor.SandboxWorkspaceRoot,
+		}
+		result, probeErr, probeCleanupErr := fenced.runProbe(
+			ctx, workspacePath, outcome.profileSnapshot, command, index+1,
+		)
+		if probeCleanupErr != nil {
+			result.Destroy()
+			return outcome.withCleanupFailure(errors.Join(probeErr, probeCleanupErr))
+		}
+		if probeErr != nil || !probeSucceeded(result, tool.Probe.OutputContains) {
+			result.Destroy()
+			return outcome.withFailure(executorUnavailableFailure(), errors.Join(probeErr, errors.New("required tool probe failed")))
+		}
+		result.Destroy()
+		outcome.toolEvidence = append(outcome.toolEvidence, artifact.ToolEvidence{
+			Name: tool.Name, DeclaredVersion: tool.Version, ProbedVersion: tool.Version,
+			ProbePassed: true, Sequence: index + 1,
+		})
+	}
+	if outcome.ownershipLost {
+		return outcome
+	}
+
+	preflightRunner, err := commandrunner.New(commandrunner.Config{
+		Executor: fenced, Profile: outcome.profileSnapshot,
+		Attempt:   executorAttempt(record.ID, ownership, executor.PurposeProbe, len(outcome.profileSnapshot.Tools)),
+		Workspace: workspacePath, Environment: baseline, OutputLimit: defaultOutputLimit,
+	})
+	if err != nil {
+		return outcome.withFailure(executorUnavailableFailure(), err)
+	}
+	outcome.profile, err = s.profiles[input.Profile].Inspect(ctx, repository.ProfileRequest{
+		Workspace: workspacePath, Commands: preflightRunner,
 		Checks:           append([]verification.CommandSpec(nil), input.Checks...),
 		ModuleExclusions: append([]repository.ModuleExclusion(nil), input.ModuleExclusions...),
 	})
+	if outcome.ownershipLost {
+		return outcome
+	}
 	if err != nil {
 		return outcome.withFailure(classifyProfileFailure(ctx, err), err)
 	}
@@ -181,6 +418,7 @@ func (s *Service) executePrepared(
 
 	prompt, err := buildPrompt(promptInput{
 		Task: input.TaskDescription, BaseSHA: record.BaseSHA, Profile: input.Profile,
+		WorkerProfile: outcome.profileSnapshot.Metadata.String(), WorkerProfileDigest: outcome.profileSnapshot.Digest,
 		Facts: outcome.profile.Facts, Memory: record.MemorySnapshot,
 	}, maxAgentPromptBytes)
 	if err != nil {
@@ -190,95 +428,144 @@ func (s *Service) executePrepared(
 		}
 		return outcome.withFailure(failure, err)
 	}
-	if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, record.ID, ownership); ownershipErr != nil || !owned {
-		return outcome.withOwnershipLost(ownedRecord, ownershipErr)
-	}
 
-	outcome.execution, err = s.agent.Run(ctx, runner.RunRequest{
-		TaskDescription: prompt, WorkspacePath: workspacePath,
-		Env: cloneStringMap(agentEnvironment.Values),
-	})
-	if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, record.ID, ownership); ownershipErr != nil || !owned {
-		return outcome.withOwnershipLost(ownedRecord, ownershipErr)
+	leases, acquireErr := s.acquireAgentLeases(ctx, record, ownership, &outcome)
+	if acquireErr != nil {
+		return outcome.withFailure(secretAcquisitionFailure(ctx), acquireErr)
 	}
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-		return outcome.withFailure(canceledFailure("execute"), errors.Join(err, ctx.Err()))
-	}
+	detector := detectorForLeases(leases)
+	defer detector.Destroy()
+	agentCommand, err := adapter.AgentCommand(prompt)
 	if err != nil {
-		retryable := !outcome.execution.Started && !outcome.execution.Completed
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailureAgent, Retryable: retryable,
-			Diagnostic: "agent execution was unavailable", CauseCode: "agent_unavailable",
+		cleanupErr := s.cleanupAgent(ctx, fenced, leases, false)
+		outcome = outcome.withFailure(agentProtocolFailure(), err)
+		return outcome.withCleanupFailure(cleanupErr)
+	}
+	agentAttempt := executorAttempt(record.ID, ownership, executor.PurposeAgent, 0)
+	agentRequest := executor.Request{
+		Attempt: agentAttempt, Profile: outcome.profileSnapshot.Clone(), Command: agentCommand,
+		Workspace:   executor.Workspace{HostPath: workspacePath, SandboxPath: executor.SandboxWorkspaceRoot, Writable: true},
+		Environment: cloneStringMap(baseline), Secrets: leaseMaterializations(leases),
+		Timeout: s.executeLease, OutputLimit: defaultOutputLimit,
+	}
+	var executorErr error
+	outcome.execution, executorErr = fenced.Execute(ctx, agentRequest)
+	agentRequest.Destroy()
+
+	if ctx.Err() != nil || errors.Is(executorErr, context.Canceled) || errors.Is(executorErr, context.DeadlineExceeded) {
+		confirmed, cleanupErr := s.cancelAndCleanupAgent(ctx, fenced, leases, agentAttempt)
+		if !confirmed {
+			return outcome.withFailure(ambiguousAttemptFailure(), errors.Join(executorErr, ctx.Err(), cleanupErr))
 		}
-		if !outcome.execution.Started {
-			return outcome.withFailure(failure, err)
+		return outcome.withFailure(canceledFailure("execute"), errors.Join(executorErr, ctx.Err(), cleanupErr))
+	}
+	if outcome.ownershipLost {
+		if cleanupErr := s.cleanupAgent(ctx, fenced, leases, false); cleanupErr != nil {
+			outcome.cleanupFailed = true
+			outcome.ownershipErr = errors.Join(outcome.ownershipErr, cleanupErr)
 		}
-		outcome = outcome.withFailure(failure, err)
-	} else if outcome.execution.ExitCode != 0 {
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailureAgent, Retryable: false,
-			Diagnostic: fmt.Sprintf("agent exited with code %d", outcome.execution.ExitCode),
-			CauseCode:  "nonzero_exit",
+		return outcome
+	}
+	if outcome.execution.SecretDetected || detector.Scan(outcome.execution.Stdout) || detector.Scan(outcome.execution.Stderr) {
+		cleanupErr := s.cleanupAgent(ctx, fenced, leases, false)
+		outcome.execution.Destroy()
+		outcome = outcome.withFailure(secretDetectedFailure(), nil)
+		return outcome.withCleanupFailure(cleanupErr)
+	}
+	if outcome.failure == nil {
+		switch {
+		case providerReportedAmbiguousAttempt(executorErr):
+			outcome = outcome.withFailure(ambiguousAttemptFailure(), executorErr)
+		case executorErr != nil && outcome.execution.Started:
+			outcome = outcome.withFailure(ambiguousAttemptFailure(), executorErr)
+		case executorErr != nil:
+			failure := run.Failure{Stage: "execute", Class: run.FailureAgent, Retryable: !outcome.execution.Started,
+				Diagnostic: "agent execution was unavailable", CauseCode: "agent_unavailable"}
+			outcome = outcome.withFailure(failure, executorErr)
+		case !outcome.execution.Started || !outcome.execution.Completed:
+			if outcome.execution.Started {
+				outcome = outcome.withFailure(ambiguousAttemptFailure(), errors.New("agent response was incomplete after start"))
+			} else {
+				failure := run.Failure{Stage: "execute", Class: run.FailureAgent, Retryable: true,
+					Diagnostic: "agent did not start", CauseCode: "agent_unavailable"}
+				outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
+			}
+		case outcome.execution.ExitCode != 0:
+			failure := run.Failure{Stage: "execute", Class: run.FailureAgent, Retryable: false,
+				Diagnostic: fmt.Sprintf("agent exited with code %d", outcome.execution.ExitCode), CauseCode: "nonzero_exit"}
+			outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
 		}
-		outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
-	} else if !outcome.execution.Completed {
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailureAgent,
-			Retryable: !outcome.execution.Started, Diagnostic: "agent response was incomplete",
-			CauseCode: "incomplete_response",
+	}
+	if outcome.failure == nil {
+		var parseErr error
+		outcome.agentOutput, parseErr = adapter.Parse(outcome.execution.Clone())
+		if parseErr == nil && detector.Scan([]byte(outcome.agentOutput)) {
+			parseErr = errors.New("agent parser returned leased secret material")
+			outcome = outcome.withFailure(secretDetectedFailure(), parseErr)
+		} else if parseErr != nil {
+			outcome = outcome.withFailure(agentProtocolFailure(), parseErr)
 		}
-		if !outcome.execution.Started {
-			return outcome.withFailure(failure, errors.New(failure.Diagnostic))
+	}
+	outcome.execution.Destroy()
+
+	if outcome.execution.Started {
+		transient, captureErr := s.captureOwned(ctx, record, workspacePath, ownership, &outcome)
+		if captureErr != nil && !outcome.ownershipLost {
+			outcome = outcome.withFailure(captureFailure(outcome.execution.Completed), captureErr)
+		} else if !policy.DetectSecretMaterial(ctx, transient, detector).Allowed {
+			outcome = outcome.withFailure(secretDetectedFailure(), errors.New("transient capture contains leased secret material"))
 		}
-		outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
+	}
+	cleanupErr := s.cleanupAgent(ctx, fenced, leases, false)
+	if cleanupErr != nil {
+		outcome = outcome.withCleanupFailure(cleanupErr)
+	}
+	if outcome.ownershipLost {
+		return outcome
+	}
+	if outcome.failure != nil && outcome.failure.Class == run.FailurePolicy {
+		return outcome
+	}
+	if outcome.failure != nil && (!outcome.execution.Started ||
+		outcome.cleanupFailed ||
+		outcome.failure.CauseCode == "ambiguous_attempt" ||
+		outcome.failure.CauseCode == "capture_failed" ||
+		outcome.failure.CauseCode == "cleanup_failed") {
+		return outcome
 	}
 
 	if outcome.failure == nil {
-		outcome = s.runVerification(ctx, record.ID, outcome, verificationEnvironment.Values)
-		if outcome.ownershipLost {
-			return outcome
-		}
-		if outcome.failure != nil && outcome.failure.Class == run.FailureCanceled {
+		outcome = s.runVerification(ctx, record, workspacePath, baseline, detector, fenced, outcome)
+		if outcome.ownershipLost || outcome.failure != nil && outcome.failure.Class == run.FailureCanceled {
 			return outcome
 		}
 	}
-
-	outcome.capture, err = s.capturer.Capture(ctx, gitcapture.Request{
-		Workspace: workspacePath, BaseSHA: record.BaseSHA, MaxBytes: maxCaptureBytes,
-	})
+	outcome.capture, err = s.captureOwned(ctx, record, workspacePath, ownership, &outcome)
+	if outcome.ownershipLost {
+		return outcome
+	}
 	if err != nil {
-		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-			return outcome.withFailure(canceledFailure("execute"), errors.Join(err, ctx.Err()))
-		}
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailureInternal,
-			Retryable:  !outcome.execution.Completed,
-			Diagnostic: "capture change set failed", CauseCode: "capture_failed",
-		}
-		return outcome.withFailure(failure, err)
+		return outcome.withFailure(captureFailure(outcome.execution.Completed), err)
+	}
+	if !policy.DetectSecretMaterial(ctx, outcome.capture, detector).Allowed {
+		return outcome.withFailure(secretDetectedFailure(), errors.New("captured changes contain leased secret material"))
 	}
 	if err := validateCapturedEvidence(outcome.capture, outcome.scrubber); err != nil {
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailurePolicy, Retryable: false,
-			Diagnostic: "captured changes contain unsafe path evidence",
-			CauseCode:  "unsafe_capture_path",
-		}
+		failure := run.Failure{Stage: "execute", Class: run.FailurePolicy, Retryable: false,
+			Diagnostic: "captured changes contain unsafe path evidence", CauseCode: "unsafe_capture_path"}
 		return outcome.withFailure(failure, err)
 	}
+	decision := s.policy.Evaluate(ctx, outcome.capture)
 	if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, record.ID, ownership); ownershipErr != nil || !owned {
 		return outcome.withOwnershipLost(ownedRecord, ownershipErr)
 	}
-
-	decision := s.policy.Evaluate(ctx, outcome.capture)
 	if ctx.Err() != nil {
 		return outcome.withFailure(canceledFailure("execute"), ctx.Err())
 	}
 	if !decision.Allowed {
 		outcome.evidence["policy_findings"] = encodeFindings(decision.Findings)
-		failure := run.Failure{
-			Stage: "execute", Class: run.FailurePolicy, Retryable: false,
-			Diagnostic: "captured changes were denied by policy", CauseCode: "change_policy_denied",
-		}
+		failure := run.Failure{Stage: "execute", Class: run.FailurePolicy, Retryable: false,
+			Diagnostic: "captured changes were denied by policy", CauseCode: "change_policy_denied"}
 		return outcome.withFailure(failure, errors.New(failure.Diagnostic))
 	}
 
@@ -356,18 +643,35 @@ func (s *Service) executePrepared(
 
 func (s *Service) runVerification(
 	ctx context.Context,
-	runID string,
-	outcome executeOutcome,
+	record run.Record,
+	workspacePath string,
 	environmentValues map[string]string,
+	detector secret.Detector,
+	fenced *fencedExecutor,
+	outcome executeOutcome,
 ) executeOutcome {
-	for _, command := range outcome.profile.Commands {
-		if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, runID, outcome.ownership); ownershipErr != nil || !owned {
-			return outcome.withOwnershipLost(ownedRecord, ownershipErr)
+	runner, err := commandrunner.New(commandrunner.Config{
+		Executor: fenced, Profile: outcome.profileSnapshot,
+		Attempt:   executorAttempt(record.ID, outcome.ownership, executor.PurposeVerification, 0),
+		Workspace: workspacePath, Environment: environmentValues, OutputLimit: defaultOutputLimit,
+	})
+	if err != nil {
+		return outcome.withFailure(executorUnavailableFailure(), err)
+	}
+	for _, original := range outcome.profile.Commands {
+		command := original
+		command.Directory, err = durableDirectory(workspacePath, command.Directory)
+		if err != nil {
+			return outcome.withFailure(run.Failure{Stage: "execute", Class: run.FailureInternal, Retryable: false,
+				Diagnostic: "verification command directory is unsafe", CauseCode: "verification_internal"}, err)
 		}
-		result := s.verifier.Run(ctx, command, cloneStringMap(environmentValues))
+		result := runner.Run(ctx, command)
 		outcome.verification = append(outcome.verification, result)
-		if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, runID, outcome.ownership); ownershipErr != nil || !owned {
-			return outcome.withOwnershipLost(ownedRecord, ownershipErr)
+		if outcome.ownershipLost {
+			return outcome
+		}
+		if detector.Scan([]byte(result.Output)) {
+			return outcome.withFailure(secretDetectedFailure(), errors.New("verification output contains leased secret material"))
 		}
 		if !command.Required || result.Passed || outcome.failure != nil {
 			continue
@@ -376,6 +680,8 @@ func (s *Service) runVerification(
 		case "canceled":
 			failure := canceledFailure("execute")
 			outcome = outcome.withFailure(failure, context.Canceled)
+		case "cleanup":
+			outcome = outcome.withCleanupFailure(errors.New("verification sandbox cleanup failed"))
 		case "environment":
 			failure := run.Failure{
 				Stage: "execute", Class: run.FailureEnvironment,
@@ -400,11 +706,439 @@ func (s *Service) runVerification(
 			outcome = outcome.withFailure(failure, errors.New(failure.Diagnostic))
 		}
 	}
+	outcome.attemptEvidence = append([]artifact.AttemptEvidence(nil), fenced.outcome.attemptEvidence...)
+	if fenced.outcome.ownershipLost {
+		return outcome.withOwnershipLost(fenced.outcome.ownershipRecord, fenced.outcome.ownershipErr)
+	}
 	return outcome
 }
 
+func executorAttempt(runID string, ownership stageOwnership, purpose executor.Purpose, sequence int) executor.AttemptID {
+	return executor.AttemptID{
+		RunID: runID, Stage: ownership.name, Attempt: ownership.attempt,
+		StartedAt: ownership.startedAt, Purpose: purpose, Sequence: sequence,
+	}
+}
+
+func sandboxEnvironment() map[string]string {
+	return map[string]string{
+		"HOME": "/home/paje", "PATH": "/usr/local/bin:/usr/bin:/bin", "TMPDIR": "/tmp",
+	}
+}
+
+func sortedMapKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (s *Service) cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.cleanupTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
+
+func (target *fencedExecutor) check(ctx context.Context) bool {
+	record, owned, err := target.service.checkExecuteOwnership(ctx, target.runID, target.ownership)
+	if err == nil && owned {
+		return true
+	}
+	*target.outcome = target.outcome.withOwnershipLost(record, err)
+	return false
+}
+
+func (target *fencedExecutor) Execute(ctx context.Context, request executor.Request) (executor.Result, error) {
+	if !target.check(ctx) {
+		return executor.Result{}, ErrPhaseInProgress
+	}
+	result, executeErr := target.target.Execute(ctx, request)
+	target.recordExecution(request.Attempt, result)
+	if request.Attempt.Purpose == executor.PurposeAgent && result.Started {
+		if err := target.service.checkpointAgentLifecycle(ctx, target.runID, target.ownership, result); err != nil {
+			executeErr = errors.Join(executeErr, err)
+			if errors.Is(err, ErrPhaseInProgress) {
+				target.check(ctx)
+			}
+		}
+	}
+	if !target.check(ctx) {
+		return result, errors.Join(executeErr, ErrPhaseInProgress)
+	}
+	return result, executeErr
+}
+
+func (target *fencedExecutor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {
+	if !target.check(ctx) {
+		return executor.StateUnknown, ErrPhaseInProgress
+	}
+	state, err := target.target.Inspect(ctx, attempt)
+	if !target.check(ctx) {
+		return state, errors.Join(err, ErrPhaseInProgress)
+	}
+	return state, err
+}
+
+func (target *fencedExecutor) Cancel(ctx context.Context, attempt executor.AttemptID) error {
+	preOwned := target.check(ctx)
+	cancelCtx, cancel := target.service.cleanupContext(ctx)
+	err := target.target.Cancel(cancelCtx, attempt)
+	cancel()
+	postOwned := target.check(ctx)
+	target.markAttempt(attempt, func(evidence *artifact.AttemptEvidence) { evidence.Canceled = err == nil })
+	if !preOwned || !postOwned {
+		return errors.Join(err, ErrPhaseInProgress)
+	}
+	return err
+}
+
+func (target *fencedExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
+	preOwned := target.check(ctx)
+	destroyCtx, cancelDestroy := target.service.cleanupContext(ctx)
+	destroyErr := target.target.Destroy(destroyCtx, attempt)
+	cancelDestroy()
+	postDestroyOwned := target.check(ctx)
+
+	inspectCtx, cancelInspect := target.service.cleanupContext(ctx)
+	state, inspectErr := target.Inspect(inspectCtx, attempt)
+	cancelInspect()
+	confirmed := destroyErr == nil && inspectErr == nil &&
+		(state == executor.StateAbsent || state == executor.StateDestroyed)
+	target.markAttempt(attempt, func(evidence *artifact.AttemptEvidence) { evidence.Destroyed = confirmed })
+	var confirmationErr error
+	if !confirmed {
+		confirmationErr = errors.New("executor termination was not confirmed")
+	}
+	if !preOwned || !postDestroyOwned {
+		return errors.Join(destroyErr, inspectErr, confirmationErr, ErrPhaseInProgress)
+	}
+	return errors.Join(destroyErr, inspectErr, confirmationErr)
+}
+
+func (target *fencedExecutor) runProbe(
+	ctx context.Context,
+	workspacePath string,
+	profile workerprofile.Snapshot,
+	command executor.Command,
+	sequence int,
+) (executor.Result, error, error) {
+	attempt := executorAttempt(target.runID, target.ownership, executor.PurposeProbe, sequence)
+	request := executor.Request{
+		Attempt: attempt, Profile: profile.Clone(), Command: command.Clone(),
+		Workspace:   executor.Workspace{HostPath: workspacePath, SandboxPath: executor.SandboxWorkspaceRoot},
+		Environment: sandboxEnvironment(), Timeout: defaultSandboxTimeout, OutputLimit: defaultOutputLimit,
+	}
+	result, err := target.Execute(ctx, request)
+	request.Destroy()
+	destroyErr := target.Destroy(ctx, attempt)
+	return result, err, destroyErr
+}
+
+func (target *fencedExecutor) recordExecution(attempt executor.AttemptID, result executor.Result) {
+	target.markAttempt(attempt, func(evidence *artifact.AttemptEvidence) {
+		evidence.Created = result.Created
+		evidence.Started = result.Started
+		evidence.Completed = result.Completed
+		evidence.ExitCode = result.ExitCode
+		evidence.Duration = result.Duration.Seconds()
+		evidence.Truncated = result.StdoutTruncated || result.StderrTruncated
+	})
+}
+
+func (target *fencedExecutor) markAttempt(attempt executor.AttemptID, update func(*artifact.AttemptEvidence)) {
+	for index := range target.outcome.attemptEvidence {
+		if target.outcome.attemptEvidence[index].ID.Key() == attempt.Key() {
+			update(&target.outcome.attemptEvidence[index])
+			return
+		}
+	}
+	evidence := artifact.AttemptEvidence{ID: attempt}
+	update(&evidence)
+	target.outcome.attemptEvidence = append(target.outcome.attemptEvidence, evidence)
+}
+
+func (s *Service) checkpointAgentLifecycle(
+	ctx context.Context,
+	runID string,
+	ownership stageOwnership,
+	result executor.Result,
+) error {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
+	defer cancel()
+	_, err := s.mutate(persistCtx, runID, func(current run.Record) (run.Record, bool, error) {
+		if !exactStageIdentity(current, ownership) {
+			return current, false, ErrPhaseInProgress
+		}
+		next := run.CloneRecord(current)
+		latest, _ := latestStage(next, "execute")
+		if latest.Evidence == nil {
+			latest.Evidence = make(map[string]string)
+		}
+		changed := false
+		for key, present := range map[string]bool{
+			"agent_created": result.Created, "agent_started": result.Started, "agent_completed": result.Completed,
+		} {
+			if present && latest.Evidence[key] != "true" {
+				latest.Evidence[key] = "true"
+				changed = true
+			}
+		}
+		if !changed {
+			return current, false, nil
+		}
+		var mutationErr error
+		next, mutationErr = run.UpsertStage(next, latest)
+		if mutationErr != nil {
+			return run.Record{}, false, mutationErr
+		}
+		next.UpdatedAt = s.clock()
+		return next, true, nil
+	})
+	return err
+}
+
+func probeSucceeded(result executor.Result, required string) bool {
+	if !result.Created || !result.Started || !result.Completed || result.ExitCode != 0 || result.SecretDetected {
+		return false
+	}
+	return required == "" || strings.Contains(string(result.Stdout)+string(result.Stderr), required)
+}
+
+func runtimeProbeMatches(profile workerprofile.Snapshot, facts map[string]string) bool {
+	switch profile.Runtime.Kind {
+	case workerprofile.RuntimeOCI:
+		return facts["runtime_kind"] == workerprofile.RuntimeOCI &&
+			facts["image"] == profile.Runtime.Image && facts["platform"] == profile.Runtime.Platform &&
+			facts["isolated"] == "true"
+	case workerprofile.RuntimeHost:
+		return facts["runtime_kind"] == workerprofile.RuntimeHost &&
+			facts["isolated"] == "false" && facts["certified"] == "false"
+	default:
+		return false
+	}
+}
+
+func (s *Service) acquireAgentLeases(
+	ctx context.Context,
+	record run.Record,
+	ownership stageOwnership,
+	outcome *executeOutcome,
+) ([]activeLease, error) {
+	profile := record.WorkerProfile.Clone()
+	leases := make([]activeLease, 0, len(profile.Secrets))
+	deadline := ownership.startedAt.Add(s.executeLease)
+	for index, requirement := range profile.Secrets {
+		ownedRecord, owned, err := s.checkExecuteOwnership(ctx, record.ID, ownership)
+		if err != nil || !owned {
+			*outcome = outcome.withOwnershipLost(ownedRecord, err)
+			return leases, errors.Join(ErrPhaseInProgress, err, s.revokeAgentLeases(ctx, record.ID, ownership, leases, outcome))
+		}
+		if index >= len(record.SecretBindings) {
+			return leases, errors.Join(errors.New("resolved secret binding is missing"), s.revokeAgentLeases(ctx, record.ID, ownership, leases, outcome))
+		}
+		binding := record.SecretBindings[index]
+		lease, acquireErr := s.secrets.Acquire(ctx, secret.AcquireRequest{
+			RunID: record.ID, Attempt: ownership.attempt, StartedAt: ownership.startedAt,
+			ProfileID: profile.Metadata, Capability: requirement.Capability,
+			Binding: binding.Revision, Delivery: requirement, Deadline: deadline,
+		})
+		if acquireErr != nil {
+			return leases, errors.Join(acquireErr, s.revokeAgentLeases(ctx, record.ID, ownership, leases, outcome))
+		}
+		materialization := lease.Materialization()
+		leases = append(leases, activeLease{id: lease.ID(), materialization: materialization})
+		lease.Destroy()
+		ownedRecord, owned, err = s.checkExecuteOwnership(ctx, record.ID, ownership)
+		if err != nil || !owned {
+			*outcome = outcome.withOwnershipLost(ownedRecord, err)
+			return leases, errors.Join(ErrPhaseInProgress, err, s.revokeAgentLeases(ctx, record.ID, ownership, leases, outcome))
+		}
+	}
+	return leases, nil
+}
+
+func detectorForLeases(leases []activeLease) secret.Detector {
+	materializations := make([]secret.Materialization, len(leases))
+	for index := range leases {
+		materializations[index] = leases[index].materialization.Clone()
+	}
+	detector := secret.NewDetector(materializations...)
+	for index := range materializations {
+		materializations[index].Destroy()
+	}
+	return detector
+}
+
+func leaseMaterializations(leases []activeLease) []secret.Materialization {
+	materializations := make([]secret.Materialization, len(leases))
+	for index := range leases {
+		materializations[index] = leases[index].materialization.Clone()
+	}
+	return materializations
+}
+
+func (s *Service) cleanupAgent(
+	ctx context.Context,
+	target *fencedExecutor,
+	leases []activeLease,
+	_ bool,
+) error {
+	agentAttempt := executorAttempt(target.runID, target.ownership, executor.PurposeAgent, 0)
+	destroyErr := target.Destroy(ctx, agentAttempt)
+	revokeErr := s.revokeAgentLeases(ctx, target.runID, target.ownership, leases, target.outcome)
+	return errors.Join(destroyErr, revokeErr)
+}
+
+func (s *Service) cancelAndCleanupAgent(
+	ctx context.Context,
+	target *fencedExecutor,
+	leases []activeLease,
+	attempt executor.AttemptID,
+) (bool, error) {
+	cancelErr := target.Cancel(ctx, attempt)
+	cleanupErr := s.cleanupAgent(ctx, target, leases, false)
+	return cleanupErr == nil, errors.Join(cancelErr, cleanupErr)
+}
+
+func (s *Service) revokeAgentLeases(
+	ctx context.Context,
+	runID string,
+	ownership stageOwnership,
+	leases []activeLease,
+	outcome *executeOutcome,
+) error {
+	var revokeErrors []error
+	for index := len(leases) - 1; index >= 0; index-- {
+		if ownedRecord, owned, err := s.checkExecuteOwnership(ctx, runID, ownership); err != nil || !owned {
+			*outcome = outcome.withOwnershipLost(ownedRecord, err)
+		}
+		revokeCtx, cancelRevoke := s.cleanupContext(ctx)
+		err := s.secrets.Revoke(revokeCtx, leases[index].id)
+		cancelRevoke()
+		if err != nil {
+			outcome.cleanupFailed = true
+			revokeErrors = append(revokeErrors, err)
+		}
+		if ownedRecord, owned, err := s.checkExecuteOwnership(ctx, runID, ownership); err != nil || !owned {
+			*outcome = outcome.withOwnershipLost(ownedRecord, err)
+		}
+		leases[index].materialization.Destroy()
+	}
+	return errors.Join(revokeErrors...)
+}
+
+func (s *Service) captureOwned(
+	ctx context.Context,
+	record run.Record,
+	workspacePath string,
+	ownership stageOwnership,
+	outcome *executeOutcome,
+) (gitcapture.Result, error) {
+	if ownedRecord, owned, err := s.checkExecuteOwnership(ctx, record.ID, ownership); err != nil || !owned {
+		*outcome = outcome.withOwnershipLost(ownedRecord, err)
+		return gitcapture.Result{}, errors.Join(ErrPhaseInProgress, err)
+	}
+	result, err := s.capturer.Capture(ctx, gitcapture.Request{
+		Workspace: workspacePath, BaseSHA: record.BaseSHA, MaxBytes: maxCaptureBytes,
+	})
+	if ownedRecord, owned, ownershipErr := s.checkExecuteOwnership(ctx, record.ID, ownership); ownershipErr != nil || !owned {
+		*outcome = outcome.withOwnershipLost(ownedRecord, ownershipErr)
+		return result, errors.Join(err, ErrPhaseInProgress, ownershipErr)
+	}
+	return result, err
+}
+
+func executorUnavailableFailure() run.Failure {
+	return run.Failure{Stage: "execute", Class: run.FailureEnvironment, Retryable: false,
+		Diagnostic: "worker runtime is unavailable", CauseCode: "executor_unavailable"}
+}
+
+func agentProtocolFailure() run.Failure {
+	return run.Failure{Stage: "execute", Class: run.FailureAgent, Retryable: false,
+		Diagnostic: "agent harness protocol failed", CauseCode: "agent_protocol"}
+}
+
+func secretAcquisitionFailure(ctx context.Context) run.Failure {
+	if ctx.Err() != nil {
+		return canceledFailure("execute")
+	}
+	return run.Failure{Stage: "execute", Class: run.FailureEnvironment, Retryable: true,
+		Diagnostic: "required agent secret is unavailable", CauseCode: "secret_unavailable"}
+}
+
+func secretDetectedFailure() run.Failure {
+	return run.Failure{Stage: "execute", Class: run.FailurePolicy, Retryable: false,
+		Diagnostic: "execution output contains secret material", CauseCode: "secret_detected"}
+}
+
+func captureFailure(agentCompleted bool) run.Failure {
+	return run.Failure{Stage: "execute", Class: run.FailureInternal, Retryable: !agentCompleted,
+		Diagnostic: "capture change set failed", CauseCode: "capture_failed"}
+}
+
+func (outcome executeOutcome) withCleanupFailure(cause error) executeOutcome {
+	if cause == nil {
+		return outcome
+	}
+	outcome.cleanupFailed = true
+	outcome.cause = errors.Join(outcome.cause, cause)
+	return outcome.normalizeCleanupFailure()
+}
+
+func (outcome executeOutcome) normalizeCleanupFailure() executeOutcome {
+	if !outcome.cleanupFailed {
+		return outcome
+	}
+	diagnostic := "attempt cleanup failed"
+	if outcome.failure != nil && outcome.failure.Diagnostic != "" &&
+		outcome.failure.Class != run.FailureCleanup {
+		diagnostic = outcome.failure.Diagnostic + "; " + diagnostic
+	}
+	failure := run.Failure{Stage: "execute", Class: run.FailureCleanup, Retryable: false,
+		Diagnostic: run.SafeDiagnostic(diagnostic), CauseCode: "cleanup_failed"}
+	outcome.failure = &failure
+	return outcome
+}
+
+func imageDigest(image string) string {
+	const marker = "@sha256:"
+	index := strings.LastIndex(image, marker)
+	if index < 0 {
+		return ""
+	}
+	return image[index+len(marker):]
+}
+
 func buildBundle(record run.Record, outcome executeOutcome) (artifact.Bundle, error) {
-	executionMetadata, err := json.Marshal(artifact.ExecutionEvidenceFrom(outcome.execution))
+	runtimeEvidence := artifact.RuntimeEvidence{
+		Kind: outcome.profileSnapshot.Runtime.Kind, Isolated: outcome.runtimeIsolated, Certified: outcome.runtimeCertified,
+	}
+	if outcome.profileSnapshot.Runtime.Kind == workerprofile.RuntimeOCI {
+		runtimeEvidence.ImageDigest = imageDigest(outcome.profileSnapshot.Runtime.Image)
+		runtimeEvidence.Platform = outcome.profileSnapshot.Runtime.Platform
+	}
+	tools := make(artifact.ToolEvidenceList, len(outcome.toolEvidence))
+	copy(tools, outcome.toolEvidence)
+	attempts := make(artifact.AttemptEvidenceList, len(outcome.attemptEvidence))
+	copy(attempts, outcome.attemptEvidence)
+	agentKeys := artifact.EnvironmentKeyList(sortedMapKeys(sandboxEnvironment()))
+	verificationKeys := artifact.EnvironmentKeyList(sortedMapKeys(sandboxEnvironment()))
+	executionMetadata, err := json.Marshal(artifact.ExecutionEvidence{
+		ExitCode: outcome.execution.ExitCode, Duration: outcome.execution.Duration.Seconds(),
+		Started: outcome.execution.Started, Completed: outcome.execution.Completed,
+		Truncated: outcome.execution.StdoutTruncated || outcome.execution.StderrTruncated,
+		Profile: &artifact.WorkerProfileEvidence{Name: outcome.profileSnapshot.Metadata.Name,
+			Revision: outcome.profileSnapshot.Metadata.Revision, Digest: outcome.profileSnapshot.Digest},
+		Runtime: &runtimeEvidence, Harness: &outcome.harnessEvidence,
+		Tools:                       &tools,
+		Attempts:                    &attempts,
+		AgentEnvironmentKeys:        &agentKeys,
+		VerificationEnvironmentKeys: &verificationKeys,
+	})
 	if err != nil {
 		return artifact.Bundle{}, err
 	}
@@ -434,7 +1168,7 @@ func buildBundle(record run.Record, outcome executeOutcome) (artifact.Bundle, er
 			MemoryIDs: memoryIDs, MemoryCount: len(memoryIDs),
 		},
 		ChangesPatch:      append([]byte(nil), outcome.capture.Patch...),
-		AgentOutput:       []byte(outcome.scrubber.string(outcome.execution.Output)),
+		AgentOutput:       []byte(outcome.scrubber.string(outcome.agentOutput)),
 		ExecutionMetadata: executionMetadata,
 		Verification:      verificationEvidence,
 		Preflight:         preflight,
@@ -649,7 +1383,14 @@ func durableDirectory(workspacePath, directory string) (string, error) {
 	}
 	workspacePath = filepath.Clean(workspacePath)
 	if !filepath.IsAbs(directory) {
-		return "", fmt.Errorf("durable verification directory is not compiled")
+		relative := filepath.ToSlash(filepath.Clean(directory))
+		if relative == "." {
+			return relative, nil
+		}
+		if relative == ".." || strings.HasPrefix(relative, "../") || path.Clean(relative) != relative {
+			return "", fmt.Errorf("durable verification directory escapes workspace")
+		}
+		return relative, nil
 	}
 	relative, err := filepath.Rel(workspacePath, filepath.Clean(directory))
 	if err != nil {
@@ -661,14 +1402,11 @@ func durableDirectory(workspacePath, directory string) (string, error) {
 	return filepath.ToSlash(relative), nil
 }
 
-func (s *Service) cleanupAttempt(ctx context.Context, runID string, prepared workspace.Workspace) error {
-	runtimeCtx, cancelRuntime := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
-	runtimeErr := s.environments.Cleanup(runtimeCtx, runID)
-	cancelRuntime()
+func (s *Service) cleanupAttempt(ctx context.Context, prepared workspace.Workspace) error {
 	workspaceCtx, cancelWorkspace := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	workspaceErr := prepared.Cleanup(workspaceCtx)
 	cancelWorkspace()
-	return errors.Join(runtimeErr, workspaceErr)
+	return workspaceErr
 }
 
 func (s *Service) acquireArtifactWrite(
@@ -747,6 +1485,7 @@ func (s *Service) finishExecute(
 	ownership stageOwnership,
 	outcome executeOutcome,
 ) (PhaseResult, error) {
+	outcome = outcome.normalizeCleanupFailure()
 	outcome = outcome.withCancellation(ctx.Err())
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 	defer cancel()
@@ -804,7 +1543,8 @@ func (s *Service) finishExecute(
 		return next, true, nil
 	})
 	outcome = outcome.withCancellation(ctx.Err())
-	if ctx.Err() != nil {
+	if ctx.Err() != nil && !outcome.cleanupFailed && (outcome.failure == nil ||
+		outcome.failure.CauseCode != "ambiguous_attempt" && outcome.failure.Class != run.FailureCleanup) {
 		originalErr := err
 		compensated, compensationErr := s.persistLateCancellation(
 			ctx, runID, ownership, persistedFailure,
@@ -927,14 +1667,6 @@ func (s *Service) checkExecuteOwnership(
 	return record, s.ownsStage(record, ownership), nil
 }
 
-func executeRuntimeID(runID string, ownership stageOwnership) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf(
-		"%s\x00%s\x00%d\x00%s", runID, ownership.name, ownership.attempt,
-		ownership.startedAt.UTC().Format(time.RFC3339Nano),
-	)))
-	return "execute-" + hex.EncodeToString(sum[:16])
-}
-
 func (outcome executeOutcome) withOwnershipLost(record run.Record, cause error) executeOutcome {
 	outcome.ownershipLost = true
 	outcome.ownershipRecord = record
@@ -1036,12 +1768,17 @@ func (outcome executeOutcome) withFailure(failure run.Failure, cause error) exec
 	failure.Diagnostic = run.SafeDiagnostic(failure.Diagnostic)
 	outcome.failure = &failure
 	outcome.cause = errors.Join(outcome.cause, cause)
-	return outcome
+	return outcome.normalizeCleanupFailure()
 }
 
 func (outcome executeOutcome) withCancellation(cause error) executeOutcome {
 	if cause == nil {
 		return outcome
+	}
+	if outcome.cleanupFailed || outcome.failure != nil &&
+		(outcome.failure.CauseCode == "ambiguous_attempt" || outcome.failure.Class == run.FailureCleanup) {
+		outcome.cause = errors.Join(outcome.cause, cause)
+		return outcome.normalizeCleanupFailure()
 	}
 	return outcome.withFailure(canceledFailure("execute"), cause)
 }

@@ -2,13 +2,63 @@ package artifact
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/verification"
 )
+
+func TestExecutionMetadataAcceptsOnlyPortableSafeEvidence(t *testing.T) {
+	evidence := ExecutionEvidence{
+		Started: true, Completed: true,
+		Profile: &WorkerProfileEvidence{
+			Name: "codex-go", Revision: 1, Digest: strings.Repeat("a", 64),
+		},
+		Runtime: &RuntimeEvidence{
+			Kind: "oci", ImageDigest: strings.Repeat("b", 64),
+			Platform: "linux/amd64", Isolated: true, Certified: true,
+		},
+		Harness: &HarnessEvidence{
+			ID: "codex", DeclaredVersion: "0.144.5", ProbedVersion: "0.144.5",
+			ProbePassed: true, Sequence: 0,
+		},
+		Tools: &ToolEvidenceList{{
+			Name: "go", DeclaredVersion: "1.26.1", ProbedVersion: "1.26.1",
+			ProbePassed: true, Sequence: 1,
+		}},
+		Attempts: &AttemptEvidenceList{{
+			ID: executor.AttemptID{
+				RunID: "run-1", Stage: "execute", Attempt: 1,
+				StartedAt: time.Unix(100, 7).UTC(), Purpose: executor.PurposeAgent,
+			},
+			Created: true, Started: true, Completed: true, ExitCode: 0,
+		}},
+		AgentEnvironmentKeys:        &EnvironmentKeyList{"HOME", "PATH"},
+		VerificationEnvironmentKeys: &EnvironmentKeyList{"HOME", "PATH"},
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := canonicalExecutionMetadata(raw); err != nil {
+		t.Fatalf("canonicalExecutionMetadata() error = %v", err)
+	}
+
+	for _, raw := range [][]byte{
+		append(raw[:len(raw)-1], []byte(`,"provider":"docker"}`)...),
+		[]byte(strings.Replace(string(raw), `"linux/amd64"`, `"/tmp/ephemeral/workspace"`, 1)),
+		append(raw[:len(raw)-1], []byte(`,"source_reference":"/etc/paje/secrets/codex"}`)...),
+	} {
+		if _, err := canonicalExecutionMetadata(raw); err == nil {
+			t.Fatalf("unsafe execution metadata was accepted: %s", raw)
+		}
+	}
+}
 
 func TestPreflightBundleSizeBoundsEveryStringAndCollectionOverhead(t *testing.T) {
 	const limit = 16 << 10

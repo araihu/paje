@@ -58,6 +58,7 @@ type Dependencies struct {
 	Profiles       map[string]repository.Profile
 	WorkerProfiles workerprofile.Registry
 	SecretBindings secret.Registry
+	Secrets        secret.Broker
 	Executors      *executor.Registry
 	Harnesses      *harness.Registry
 	Environments   environment.Builder
@@ -90,6 +91,7 @@ type Service struct {
 	profiles            map[string]repository.Profile
 	workerProfiles      workerprofile.Registry
 	secretBindings      secret.Registry
+	secrets             secret.Broker
 	executors           *executor.Registry
 	harnesses           *harness.Registry
 	environments        environment.Builder
@@ -121,6 +123,7 @@ func New(dependencies Dependencies) (*Service, error) {
 		{"workspace manager", dependencies.Workspaces},
 		{"worker profile registry", dependencies.WorkerProfiles},
 		{"secret binding registry", dependencies.SecretBindings},
+		{"secret broker", dependencies.Secrets},
 		{"executor registry", dependencies.Executors},
 		{"harness registry", dependencies.Harnesses},
 		{"environment builder", dependencies.Environments},
@@ -168,6 +171,7 @@ func New(dependencies Dependencies) (*Service, error) {
 		workspaces: dependencies.Workspaces, profiles: profiles,
 		workerProfiles: dependencies.WorkerProfiles,
 		secretBindings: dependencies.SecretBindings,
+		secrets:        dependencies.Secrets,
 		executors:      dependencies.Executors, harnesses: dependencies.Harnesses,
 		environments: dependencies.Environments, agent: dependencies.Agent,
 		verifier: dependencies.Verifier, capturer: dependencies.Capturer,

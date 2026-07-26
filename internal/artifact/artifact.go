@@ -17,6 +17,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/runner"
 	"github.com/araihu/paje/internal/template"
 	"github.com/araihu/paje/internal/verification"
@@ -85,11 +86,75 @@ type Bundle struct {
 // ExecutionEvidence is the only execution metadata permitted in an artifact.
 // Transcript and output are deliberately stored in their dedicated members.
 type ExecutionEvidence struct {
+	// The original generic process fields remain wire-compatible while Tasks
+	// 10-11 migrate independent artifact fixtures. code-change@v1 now also
+	// binds these fields to the exact portable runtime evidence below.
 	ExitCode  int     `json:"exit_code"`
 	Duration  float64 `json:"duration"`
 	Started   bool    `json:"started"`
 	Completed bool    `json:"completed"`
 	Truncated bool    `json:"truncated"`
+
+	Profile                     *WorkerProfileEvidence `json:"profile,omitempty"`
+	Runtime                     *RuntimeEvidence       `json:"runtime,omitempty"`
+	Harness                     *HarnessEvidence       `json:"harness,omitempty"`
+	Tools                       *ToolEvidenceList      `json:"tools,omitempty"`
+	Attempts                    *AttemptEvidenceList   `json:"attempts,omitempty"`
+	AgentEnvironmentKeys        *EnvironmentKeyList    `json:"agent_environment_keys,omitempty"`
+	VerificationEnvironmentKeys *EnvironmentKeyList    `json:"verification_environment_keys,omitempty"`
+}
+
+// Pointer-backed named lists preserve ExecutionEvidence comparability for
+// legacy callers while retaining array-shaped portable JSON evidence.
+type ToolEvidenceList []ToolEvidence
+type AttemptEvidenceList []AttemptEvidence
+type EnvironmentKeyList []string
+
+// WorkerProfileEvidence binds execution to one immutable operator profile.
+type WorkerProfileEvidence struct {
+	Name     string `json:"name"`
+	Revision uint64 `json:"revision"`
+	Digest   string `json:"digest"`
+}
+
+// RuntimeEvidence contains only provider-neutral facts. ImageDigest excludes
+// the repository name and any registry/provider metadata.
+type RuntimeEvidence struct {
+	Kind        string `json:"kind"`
+	ImageDigest string `json:"image_digest,omitempty"`
+	Platform    string `json:"platform,omitempty"`
+	Isolated    bool   `json:"isolated"`
+	Certified   bool   `json:"certified"`
+}
+
+type HarnessEvidence struct {
+	ID              string `json:"id"`
+	DeclaredVersion string `json:"declared_version"`
+	ProbedVersion   string `json:"probed_version"`
+	ProbePassed     bool   `json:"probe_passed"`
+	Sequence        int    `json:"sequence"`
+}
+
+type ToolEvidence struct {
+	Name            string `json:"name"`
+	DeclaredVersion string `json:"declared_version"`
+	ProbedVersion   string `json:"probed_version"`
+	ProbePassed     bool   `json:"probe_passed"`
+	Sequence        int    `json:"sequence"`
+}
+
+// AttemptEvidence records bounded lifecycle metadata without output,
+// provider handles, host paths, or raw diagnostics.
+type AttemptEvidence struct {
+	ID        executor.AttemptID `json:"id"`
+	Created   bool               `json:"created"`
+	Started   bool               `json:"started"`
+	Completed bool               `json:"completed"`
+	Canceled  bool               `json:"canceled"`
+	Destroyed bool               `json:"destroyed"`
+	ExitCode  int                `json:"exit_code"`
+	Duration  float64            `json:"duration"`
+	Truncated bool               `json:"truncated"`
 }
 
 // ExecutionEvidenceFrom converts Task 1's safe process outcome into artifact
@@ -618,6 +683,9 @@ func canonicalExecutionMetadata(raw []byte) ([]byte, error) {
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("multiple JSON values")
 	}
+	if err := validateExecutionEvidence(value); err != nil {
+		return nil, err
+	}
 	canonical, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
@@ -631,6 +699,115 @@ func canonicalExecutionMetadata(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("execution metadata is not canonical")
 	}
 	return canonical, nil
+}
+
+var (
+	evidenceNamePattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	evidenceVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
+	evidenceEnvKeyPattern  = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
+	evidencePlatform       = regexp.MustCompile(`^linux/[a-z0-9][a-z0-9_-]{0,31}$`)
+)
+
+func validateExecutionEvidence(value ExecutionEvidence) error {
+	portable := value.Profile != nil || value.Runtime != nil || value.Harness != nil ||
+		value.Tools != nil || value.Attempts != nil ||
+		value.AgentEnvironmentKeys != nil || value.VerificationEnvironmentKeys != nil
+	if !portable {
+		if value.Duration < 0 {
+			return errors.New("legacy execution duration is invalid")
+		}
+		return nil
+	}
+	if value.Profile == nil || value.Runtime == nil || value.Harness == nil {
+		return errors.New("portable execution identity is incomplete")
+	}
+	if !evidenceNamePattern.MatchString(value.Profile.Name) || value.Profile.Revision == 0 ||
+		!validDigest(value.Profile.Digest) {
+		return errors.New("portable worker profile evidence is invalid")
+	}
+	switch value.Runtime.Kind {
+	case "oci":
+		if !validDigest(value.Runtime.ImageDigest) || !evidencePlatform.MatchString(value.Runtime.Platform) ||
+			!value.Runtime.Isolated {
+			return errors.New("portable OCI runtime evidence is invalid")
+		}
+	case "host":
+		if value.Runtime.ImageDigest != "" || value.Runtime.Platform != "" ||
+			value.Runtime.Isolated || value.Runtime.Certified {
+			return errors.New("portable host runtime evidence is invalid")
+		}
+	default:
+		return errors.New("portable runtime kind is invalid")
+	}
+	if !evidenceNamePattern.MatchString(value.Harness.ID) ||
+		!evidenceVersionPattern.MatchString(value.Harness.DeclaredVersion) ||
+		value.Harness.DeclaredVersion != value.Harness.ProbedVersion ||
+		!value.Harness.ProbePassed || value.Harness.Sequence < 0 {
+		return errors.New("portable harness evidence is invalid")
+	}
+	var tools ToolEvidenceList
+	if value.Tools != nil {
+		tools = *value.Tools
+	}
+	toolNames := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		if !evidenceNamePattern.MatchString(tool.Name) ||
+			!evidenceVersionPattern.MatchString(tool.DeclaredVersion) ||
+			tool.DeclaredVersion != tool.ProbedVersion || !tool.ProbePassed || tool.Sequence < 0 {
+			return errors.New("portable tool evidence is invalid")
+		}
+		if _, duplicate := toolNames[tool.Name]; duplicate {
+			return errors.New("portable tool evidence is duplicated")
+		}
+		toolNames[tool.Name] = struct{}{}
+	}
+	var attemptList AttemptEvidenceList
+	if value.Attempts != nil {
+		attemptList = *value.Attempts
+	}
+	attempts := make(map[string]struct{}, len(attemptList))
+	agentFound := false
+	for _, attempt := range attemptList {
+		if err := attempt.ID.Validate(); err != nil || attempt.Duration < 0 ||
+			attempt.Started && !attempt.Created || attempt.Completed && !attempt.Started {
+			return errors.New("portable attempt evidence is invalid")
+		}
+		key := attempt.ID.Key()
+		if _, duplicate := attempts[key]; duplicate {
+			return errors.New("portable attempt evidence is duplicated")
+		}
+		attempts[key] = struct{}{}
+		if attempt.ID.Purpose == executor.PurposeAgent {
+			if agentFound || attempt.ID.Sequence != 0 {
+				return errors.New("portable agent attempt evidence is invalid")
+			}
+			agentFound = true
+			if value.ExitCode != attempt.ExitCode || value.Started != attempt.Started ||
+				value.Completed != attempt.Completed || value.Truncated != attempt.Truncated {
+				return errors.New("portable agent evidence does not match generic execution fields")
+			}
+		}
+	}
+	if !agentFound {
+		return errors.New("portable agent attempt evidence is missing")
+	}
+	var agentKeys, verificationKeys EnvironmentKeyList
+	if value.AgentEnvironmentKeys != nil {
+		agentKeys = *value.AgentEnvironmentKeys
+	}
+	if value.VerificationEnvironmentKeys != nil {
+		verificationKeys = *value.VerificationEnvironmentKeys
+	}
+	for _, keys := range []EnvironmentKeyList{agentKeys, verificationKeys} {
+		previous := ""
+		for _, key := range keys {
+			if !evidenceEnvKeyPattern.MatchString(key) || (previous != "" && key <= previous) {
+				return errors.New("portable environment key evidence is invalid")
+			}
+			previous = key
+		}
+	}
+	return nil
 }
 
 func writeJSON(out *bytes.Buffer, value any) error {

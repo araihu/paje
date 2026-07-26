@@ -22,6 +22,7 @@ const (
 	rulePrivateKey       = "secret-private-key"
 	ruleGitHubToken      = "secret-github-token"
 	ruleSecretAssignment = "secret-assignment"
+	ruleSecretCapability = "secret-capability"
 	ruleCanceled         = "evaluation-canceled"
 	policyPath           = ".paje-policy/unknown"
 )
@@ -54,6 +55,42 @@ type Decision struct {
 // Evaluator is the workflow port for built-in change policy.
 type Evaluator interface {
 	Evaluate(context.Context, gitcapture.Result) Decision
+}
+
+// SecretDetector is the narrow transient boundary needed to reject exact or
+// reversibly encoded leased secret material. Implementations must not expose
+// their retained patterns through durable evidence.
+type SecretDetector interface {
+	Scan([]byte) bool
+}
+
+// DetectSecretMaterial applies the transient lease detector to every captured
+// byte/string surface. Findings are generic and never contain matched bytes.
+func DetectSecretMaterial(ctx context.Context, result gitcapture.Result, detector SecretDetector) Decision {
+	if ctx.Err() != nil {
+		return canceledDecision()
+	}
+	if detector == nil {
+		return Decision{Allowed: true, Findings: []Finding{}}
+	}
+	values := [][]byte{result.Patch, []byte(result.TreeSHA)}
+	for _, change := range result.Changes {
+		values = append(values,
+			[]byte(change.Path), []byte(change.OldPath), []byte(change.Status),
+			[]byte(change.OldMode), []byte(change.NewMode),
+		)
+	}
+	for _, value := range values {
+		if ctx.Err() != nil {
+			return canceledDecision()
+		}
+		if detector.Scan(value) {
+			return Decision{Allowed: false, Findings: []Finding{{
+				RuleID: ruleSecretCapability, Path: policyPath,
+			}}}
+		}
+	}
+	return Decision{Allowed: true, Findings: []Finding{}}
 }
 
 // ChangePolicy implements the beta's fixed path, object, and secret rules.

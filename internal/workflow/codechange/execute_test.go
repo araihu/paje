@@ -19,6 +19,9 @@ import (
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	artifactmock "github.com/araihu/paje/internal/artifact/mock"
 	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/harness"
+	harnesscodex "github.com/araihu/paje/internal/harness/codex"
 	"github.com/araihu/paje/internal/memory"
 	"github.com/araihu/paje/internal/policy"
 	"github.com/araihu/paje/internal/publisher"
@@ -27,12 +30,1121 @@ import (
 	"github.com/araihu/paje/internal/run"
 	runmock "github.com/araihu/paje/internal/run/mock"
 	"github.com/araihu/paje/internal/runner"
+	"github.com/araihu/paje/internal/secret"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
 	"github.com/araihu/paje/internal/workspace"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 )
+
+func TestExecuteUsesDistinctSecretFreeAndAgentSandboxes(t *testing.T) {
+	fixture := newServiceFixture(t)
+	profile := resolvedWorkerProfile(t)
+	profile.Tools = []workerprofile.Tool{{
+		Name: "git", Version: "2.53.0",
+		Probe: workerprofile.Probe{
+			Executable: "git", Args: []string{"--version"}, OutputContains: "2.53.0",
+		},
+	}}
+	profile.Digest = ""
+	var err error
+	profile, err = workerprofile.Canonicalize(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.workerProfiles.Set(profile)
+	fixture.service.profiles["generic"] = &sandboxBackedProfile{}
+	type sandboxObservation struct {
+		purpose  executor.Purpose
+		secrets  int
+		writable bool
+	}
+	var observations []sandboxObservation
+	fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+		observations = append(observations, sandboxObservation{
+			purpose: request.Attempt.Purpose, secrets: len(request.Secrets), writable: request.Workspace.Writable,
+		})
+		stdout := []byte("ok")
+		switch request.Command.Executable {
+		case "codex":
+			if request.Attempt.Purpose == executor.PurposeProbe {
+				stdout = []byte("codex 0.144.5")
+			} else {
+				stdout = []byte("agent completed")
+			}
+		case "git":
+			if request.Attempt.Sequence == 1 {
+				stdout = []byte("git version 2.53.0")
+			}
+		}
+		fixture.executor.SetResult(request.Attempt, executor.Result{
+			Created: true, Started: true, Completed: true, Stdout: stdout,
+			SafeFacts: portableSafeFacts(request.Profile),
+		}, nil)
+	})
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "isolated")); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.Artifact == nil {
+		t.Fatal("Execute() artifact = nil")
+	}
+	requests := fixture.executor.Requests()
+	wantPurposes := []executor.Purpose{
+		executor.PurposeProbe,
+		executor.PurposeProbe,
+		executor.PurposeProbe,
+		executor.PurposeProbe,
+		executor.PurposeAgent,
+		executor.PurposeVerification,
+	}
+	if len(requests) != len(wantPurposes) {
+		t.Fatalf("executor requests = %d, want %d: %#v", len(requests), len(wantPurposes), requests)
+	}
+	seen := make(map[string]struct{}, len(requests))
+	for index, request := range requests {
+		if request.Attempt.Purpose != wantPurposes[index] {
+			t.Fatalf("request %d purpose = %q, want %q", index, request.Attempt.Purpose, wantPurposes[index])
+		}
+		if request.Attempt.RunID != "run-123" || request.Attempt.Stage != "execute" ||
+			request.Attempt.Attempt != 1 || !request.Attempt.StartedAt.Equal(time.Unix(100, 0).UTC()) {
+			t.Fatalf("request %d attempt = %#v", index, request.Attempt)
+		}
+		if _, duplicate := seen[request.Attempt.Key()]; duplicate {
+			t.Fatalf("duplicate deterministic attempt identity: %#v", request.Attempt)
+		}
+		seen[request.Attempt.Key()] = struct{}{}
+		observation := observations[index]
+		if observation.purpose == executor.PurposeAgent {
+			if observation.secrets != 1 || !observation.writable {
+				t.Fatalf("agent request secrets=%d writable=%t", observation.secrets, observation.writable)
+			}
+		} else if observation.secrets != 0 || observation.writable {
+			t.Fatalf("%s request received secrets or writable workspace", request.Attempt.Purpose)
+		}
+	}
+	acquisitions := fixture.secrets.Requests()
+	if len(acquisitions) != 1 || acquisitions[0].Capability != "harness.codex-auth" ||
+		acquisitions[0].Binding != 7 || acquisitions[0].Attempt != 1 ||
+		!acquisitions[0].StartedAt.Equal(time.Unix(100, 0).UTC()) {
+		t.Fatalf("secret acquisitions = %#v", acquisitions)
+	}
+	if got := fixture.secrets.Revocations(); !reflect.DeepEqual(got, []string{"fixture-codex-lease"}) {
+		t.Fatalf("secret revocations = %#v", got)
+	}
+}
+
+func TestExecuteDestroysAgentBeforeReverseLeaseRevocation(t *testing.T) {
+	fixture := newServiceFixture(t)
+	profile := resolvedWorkerProfile(t)
+	profile.Secrets = append(profile.Secrets, workerprofile.SecretRequirement{
+		Capability: "workload.api", BindingRevision: 9, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN", Required: true,
+	})
+	profile.Digest = ""
+	var err error
+	profile, err = workerprofile.Canonicalize(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.workerProfiles.Set(profile)
+	secondRef := secret.BindingRef{Capability: "workload.api", Revision: 9}
+	secondBinding, err := secret.NewBinding(secondRef, secret.Authorization{
+		ProfileID: profile.Metadata, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN",
+	}, "environment", "WORKLOAD_API_SOURCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.secretBindings = &multiSecretRegistry{bindings: map[secret.BindingRef]secret.Binding{
+		fixture.secretBindings.binding.Ref(): fixture.secretBindings.binding,
+		secondRef:                            secondBinding,
+	}}
+	secondMaterialization, err := secret.NewValueMaterialization(
+		workerprofile.DeliveryEnvironment, "WORKLOAD_TOKEN", []byte("second-secret"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLease, err := secret.NewLease(
+		"fixture-workload-lease", time.Unix(100, 0).UTC().Add(time.Hour), secondMaterialization,
+	)
+	secondMaterialization.Destroy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.secrets.SetAcquireResult("workload.api", secondLease, nil)
+	secondLease.Destroy()
+
+	var events []string
+	target := &eventExecutor{Executor: fixture.executor, events: &events}
+	registry, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.executors = registry
+	fixture.service.secrets = &eventBroker{Broker: fixture.secrets, events: &events}
+	fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+		stdout := []byte("agent completed")
+		if request.Attempt.Purpose == executor.PurposeProbe {
+			stdout = []byte("codex 0.144.5")
+		}
+		fixture.executor.SetResult(request.Attempt, executor.Result{
+			Created: true, Started: true, Completed: true, Stdout: stdout,
+			SafeFacts: portableSafeFacts(request.Profile),
+		}, nil)
+	})
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "cleanup-order")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.service.Execute(context.Background(), "run-123"); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	agentDestroy := slicesIndex(events, "destroy:agent:0")
+	secondRevoke := slicesIndex(events, "revoke:fixture-workload-lease")
+	firstRevoke := slicesIndex(events, "revoke:fixture-codex-lease")
+	if agentDestroy < 0 || secondRevoke <= agentDestroy || firstRevoke <= secondRevoke {
+		t.Fatalf("lifecycle events = %#v, want agent destroy then reverse lease revoke", events)
+	}
+}
+
+func TestExecuteRejectsExactLeasedSecretInOutputOrTransientPatch(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*serviceFixture)
+	}{
+		{
+			name: "agent output",
+			configure: func(fixture *serviceFixture) {
+				fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
+					return runner.ExecutionResult{Output: "leaked fixture-codex-auth", Started: true, Completed: true}, nil
+				}
+			},
+		},
+		{
+			name: "transient patch",
+			configure: func(fixture *serviceFixture) {
+				fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+					result := capturedChange()
+					result.Patch = []byte("+fixture-codex-auth")
+					return result, nil
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			test.configure(fixture)
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || result.Status != run.StatusFailed || result.FailureClass != run.FailurePolicy ||
+				result.Retryable || result.Artifact != nil || len(fixture.artifacts.Snapshot().Saves) != 0 {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			record, _ := fixture.runs.Load(context.Background(), "run-123")
+			encoded, _ := json.Marshal(record)
+			if bytes.Contains(encoded, []byte("fixture-codex-auth")) ||
+				record.Failure == nil || record.Failure.CauseCode != "secret_detected" {
+				t.Fatalf("durable secret failure = %s", encoded)
+			}
+			if got := fixture.secrets.Revocations(); !reflect.DeepEqual(got, []string{"fixture-codex-lease"}) {
+				t.Fatalf("secret revocations = %#v", got)
+			}
+		})
+	}
+}
+
+func TestExecuteCompensatesPartialSecretAcquisitionInReverse(t *testing.T) {
+	fixture := newServiceFixture(t)
+	profile := resolvedWorkerProfile(t)
+	profile.Secrets = append(profile.Secrets, workerprofile.SecretRequirement{
+		Capability: "workload.api", BindingRevision: 9, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN", Required: true,
+	})
+	profile.Digest = ""
+	var err error
+	profile, err = workerprofile.Canonicalize(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.workerProfiles.Set(profile)
+	secondRef := secret.BindingRef{Capability: "workload.api", Revision: 9}
+	secondBinding, err := secret.NewBinding(secondRef, secret.Authorization{
+		ProfileID: profile.Metadata, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN",
+	}, "environment", "WORKLOAD_API_SOURCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.secretBindings = &multiSecretRegistry{bindings: map[secret.BindingRef]secret.Binding{
+		fixture.secretBindings.binding.Ref(): fixture.secretBindings.binding, secondRef: secondBinding,
+	}}
+	fixture.secrets.SetAcquireResult("workload.api", secret.Lease{}, errors.New("source unavailable"))
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "partial-secret")); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err == nil || result.FailureClass != run.FailureEnvironment || !result.Retryable || result.Artifact != nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	if got := fixture.secrets.Revocations(); !reflect.DeepEqual(got, []string{"fixture-codex-lease"}) {
+		t.Fatalf("partial acquisition revocations = %#v", got)
+	}
+}
+
+func TestExecuteNormalizesPartialSecretRevocationFailure(t *testing.T) {
+	providerUnavailable := errors.New("second secret provider unavailable")
+	revokeFailure := errors.New("first lease revocation failed")
+	for _, test := range []struct {
+		name     string
+		cancel   bool
+		priorErr error
+	}{
+		{name: "caller canceled", cancel: true, priorErr: context.Canceled},
+		{name: "provider unavailable", priorErr: providerUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newServiceFixture(t)
+			configureSecondAgentSecret(t, fixture, "partial-secret-material")
+			fixture.secrets.SetAcquireResult("workload.api", secret.Lease{}, providerUnavailable)
+			fixture.secrets.SetRevokeError("fixture-codex-lease", revokeFailure)
+			if _, err := fixture.service.Resolve(
+				context.Background(), validRawInput("Change docs", "partial-secret-cleanup"),
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx := context.Background()
+			if test.cancel {
+				cancelCtx, cancel := context.WithCancel(ctx)
+				ctx = cancelCtx
+				fixture.service.secrets = &cancelingAcquireBroker{
+					Broker: fixture.secrets, capability: "workload.api", cancel: cancel,
+				}
+			}
+			result, executeErr := fixture.service.Execute(ctx, "run-123")
+			if executeErr == nil || !errors.Is(executeErr, test.priorErr) ||
+				!errors.Is(executeErr, revokeFailure) || result.Status != run.StatusFailed ||
+				result.FailureClass != run.FailureCleanup || result.Retryable {
+				t.Fatalf("Execute() result=%#v error=%v, want terminal cleanup failure preserving causes",
+					result, executeErr)
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if record.Status != run.StatusFailed || record.Failure == nil ||
+				record.Failure.Class != run.FailureCleanup ||
+				record.Failure.CauseCode != "cleanup_failed" || record.Failure.Retryable {
+				t.Fatalf("durable partial-acquisition cleanup failure = %#v", record)
+			}
+			if got := fixture.secrets.Revocations(); !reflect.DeepEqual(got, []string{"fixture-codex-lease"}) {
+				t.Fatalf("partial acquisition revocations = %#v", got)
+			}
+			assertRunDoesNotContain(t, fixture, "fixture-codex-auth", "partial-secret-material")
+		})
+	}
+}
+
+func configureSecondAgentSecret(t *testing.T, fixture *serviceFixture, value string) {
+	t.Helper()
+	profile := resolvedWorkerProfile(t)
+	profile.Secrets = append(profile.Secrets, workerprofile.SecretRequirement{
+		Capability: "workload.api", BindingRevision: 9, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN", Required: true,
+	})
+	profile.Digest = ""
+	var err error
+	profile, err = workerprofile.Canonicalize(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.workerProfiles.Set(profile)
+	secondRef := secret.BindingRef{Capability: "workload.api", Revision: 9}
+	secondBinding, err := secret.NewBinding(secondRef, secret.Authorization{
+		ProfileID: profile.Metadata, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN",
+	}, "environment", "WORKLOAD_API_SOURCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.secretBindings = &multiSecretRegistry{bindings: map[secret.BindingRef]secret.Binding{
+		fixture.secretBindings.binding.Ref(): fixture.secretBindings.binding, secondRef: secondBinding,
+	}}
+	materialization, err := secret.NewValueMaterialization(
+		workerprofile.DeliveryEnvironment, "WORKLOAD_TOKEN", []byte(value),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := secret.NewLease(
+		"fixture-workload-lease", time.Unix(100, 0).UTC().Add(time.Hour), materialization,
+	)
+	materialization.Destroy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.secrets.SetAcquireResult("workload.api", lease, nil)
+	lease.Destroy()
+}
+
+func assertRunDoesNotContain(t *testing.T, fixture *serviceFixture, values ...string) {
+	t.Helper()
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		if bytes.Contains(encoded, []byte(value)) {
+			t.Fatalf("durable run leaked secret material: %s", encoded)
+		}
+	}
+}
+
+func countPurposeRequests(requests []executor.Request, purpose executor.Purpose) int {
+	count := 0
+	for _, request := range requests {
+		if request.Attempt.Purpose == purpose {
+			count++
+		}
+	}
+	return count
+}
+
+func TestExecutePreservesExecutorAmbiguityAheadOfHarnessParsing(t *testing.T) {
+	providerDetail := errors.New("provider disconnected after start")
+	parseDetail := errors.New("strict harness rejected output")
+	tests := []struct {
+		name          string
+		execution     executor.Result
+		executorError error
+		parse         func(executor.Result) (string, error)
+		wantClass     run.FailureClass
+		wantCause     string
+		wantError     error
+	}{
+		{
+			name: "incomplete execution and executor error with strict adapter",
+			execution: executor.Result{
+				Created: true, Started: true, Stdout: []byte("partial"),
+			},
+			executorError: executor.WrapError("internal", "disconnect", providerDetail),
+			parse:         func(executor.Result) (string, error) { return "", parseDetail },
+			wantClass:     run.FailureInternal,
+			wantCause:     "ambiguous_attempt",
+			wantError:     providerDetail,
+		},
+		{
+			name: "completed execution and executor error with parse success",
+			execution: executor.Result{
+				Created: true, Started: true, Completed: true, Stdout: []byte("agent completed"),
+			},
+			executorError: executor.WrapError("internal", "checkpoint", providerDetail),
+			parse:         func(result executor.Result) (string, error) { return string(result.Stdout), nil },
+			wantClass:     run.FailureInternal,
+			wantCause:     "ambiguous_attempt",
+			wantError:     providerDetail,
+		},
+		{
+			name: "parse error without executor ambiguity",
+			execution: executor.Result{
+				Created: true, Started: true, Completed: true, Stdout: []byte("malformed"),
+			},
+			parse:     func(executor.Result) (string, error) { return "", parseDetail },
+			wantClass: run.FailureAgent,
+			wantCause: "agent_protocol",
+			wantError: parseDetail,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			fixture.harness.parse = test.parse
+			fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+				result := executor.Result{
+					Created: true, Started: true, Completed: true,
+					SafeFacts: portableSafeFacts(request.Profile),
+				}
+				var executeErr error
+				switch request.Attempt.Purpose {
+				case executor.PurposeProbe:
+					result.Stdout = []byte("codex 0.144.5")
+				case executor.PurposeAgent:
+					result = test.execution.Clone()
+					executeErr = test.executorError
+				}
+				fixture.executor.SetResult(request.Attempt, result, executeErr)
+			})
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || !errors.Is(err, test.wantError) ||
+				result.Status != run.StatusFailed || result.FailureClass != test.wantClass || result.Retryable {
+				t.Fatalf("Execute() result=%#v error=%v, want %s/%s preserving %v",
+					result, err, test.wantClass, test.wantCause, test.wantError)
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if record.Failure == nil || record.Failure.CauseCode != test.wantCause {
+				t.Fatalf("durable failure = %#v, want cause %q", record.Failure, test.wantCause)
+			}
+		})
+	}
+}
+
+func TestExecuteProviderAmbiguousNonStartIsTerminalAndCleanupWins(t *testing.T) {
+	providerDetail := errors.New("Docker start response was lost")
+	cleanupDetail := errors.New("ambiguous Docker attempt cleanup failed")
+	for _, test := range []struct {
+		name       string
+		cleanupErr error
+		wantClass  run.FailureClass
+		wantCause  string
+	}{
+		{
+			name:      "provider ambiguity is terminal",
+			wantClass: run.FailureInternal, wantCause: "ambiguous_attempt",
+		},
+		{
+			name:       "cleanup failure wins",
+			cleanupErr: cleanupDetail,
+			wantClass:  run.FailureCleanup, wantCause: "cleanup_failed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			parseCalled := false
+			fixture.harness.parse = func(executor.Result) (string, error) {
+				parseCalled = true
+				return "", errors.New("harness must not parse an ambiguous provider result")
+			}
+			fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+				result := executor.Result{
+					Created: true, Started: true, Completed: true,
+					SafeFacts: portableSafeFacts(request.Profile),
+				}
+				var executeErr error
+				switch request.Attempt.Purpose {
+				case executor.PurposeProbe:
+					result.Stdout = []byte("codex 0.144.5")
+				case executor.PurposeAgent:
+					result = executor.Result{Created: true, Started: false, Completed: false}
+					executeErr = executor.WrapError("internal", "ambiguous_attempt", providerDetail)
+				}
+				fixture.executor.SetResult(request.Attempt, result, executeErr)
+			})
+			if test.cleanupErr != nil {
+				target := &cleanupFailureExecutor{
+					Executor: fixture.executor, purpose: executor.PurposeAgent,
+					destroyErr: test.cleanupErr, state: executor.StateUnknown,
+				}
+				registry, err := executor.NewRegistry(executor.Registration{
+					RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.service.executors = registry
+			}
+
+			result, executeErr := fixture.service.Execute(context.Background(), "run-123")
+			if executeErr == nil || !errors.Is(executeErr, providerDetail) ||
+				test.cleanupErr != nil && !errors.Is(executeErr, test.cleanupErr) ||
+				result.Status != run.StatusFailed || result.FailureClass != test.wantClass ||
+				result.Retryable {
+				t.Fatalf("Execute() result=%#v error=%v, want terminal %s/%s",
+					result, executeErr, test.wantClass, test.wantCause)
+			}
+			if parseCalled {
+				t.Fatal("harness Parse was called for provider-reported ambiguous non-start")
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if record.Status != run.StatusFailed || record.Failure == nil ||
+				record.Failure.Class != test.wantClass ||
+				record.Failure.CauseCode != test.wantCause || record.Failure.Retryable {
+				t.Fatalf("durable provider ambiguity = %#v", record)
+			}
+			agentRequests := countPurposeRequests(fixture.executor.Requests(), executor.PurposeAgent)
+			again, _ := fixture.service.Execute(context.Background(), "run-123")
+			if again.Status != run.StatusFailed || again.Retryable ||
+				countPurposeRequests(fixture.executor.Requests(), executor.PurposeAgent) != agentRequests {
+				t.Fatalf("terminal replay duplicated agent execution: result=%#v requests=%#v",
+					again, fixture.executor.Requests())
+			}
+		})
+	}
+}
+
+func TestExecuteNeverMasksProbeVerificationOrAgentCleanupFailureAsCanceled(t *testing.T) {
+	cleanupFailure := errors.New("termination was not confirmed")
+	tests := []struct {
+		name         string
+		purpose      executor.Purpose
+		cancel       bool
+		verification bool
+		parseFailure bool
+		wantClass    run.FailureClass
+		wantCause    string
+	}{
+		{
+			name: "probe cleanup failure", purpose: executor.PurposeProbe, cancel: true,
+			wantClass: run.FailureCleanup, wantCause: "cleanup_failed",
+		},
+		{
+			name: "verification cleanup failure", purpose: executor.PurposeVerification, verification: true,
+			wantClass: run.FailureCleanup, wantCause: "cleanup_failed",
+		},
+		{
+			name: "cancellation during normal agent cleanup", purpose: executor.PurposeAgent, cancel: true,
+			wantClass: run.FailureCleanup, wantCause: "cleanup_failed",
+		},
+		{
+			name:    "primary failure and cancellation during normal agent cleanup",
+			purpose: executor.PurposeAgent, cancel: true, parseFailure: true,
+			wantClass: run.FailureCleanup, wantCause: "cleanup_failed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			if test.verification {
+				fixture.profile.result.Commands = []verification.Command{{
+					Name: "git status", Directory: ".", Executable: "git",
+					Args: []string{"status", "--short"}, Timeout: time.Minute, Required: true,
+				}}
+			}
+			if test.parseFailure {
+				fixture.harness.parse = func(executor.Result) (string, error) {
+					return "", errors.New("agent protocol failed before cleanup")
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			target := &cleanupFailureExecutor{
+				Executor: fixture.executor, purpose: test.purpose,
+				destroyErr: cleanupFailure, state: executor.StateUnknown,
+			}
+			if test.cancel {
+				target.beforeDestroy = cancel
+			}
+			registry, err := executor.NewRegistry(executor.Registration{
+				RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.service.executors = registry
+
+			result, executeErr := fixture.service.Execute(ctx, "run-123")
+			if executeErr == nil || result.Status != run.StatusFailed ||
+				result.FailureClass != test.wantClass || result.Retryable {
+				t.Fatalf("Execute() result=%#v error=%v, want terminal %s failure",
+					result, executeErr, test.wantClass)
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if record.Failure == nil || record.Failure.CauseCode != test.wantCause ||
+				record.Status == run.StatusCanceled {
+				t.Fatalf("durable cleanup failure = %#v", record)
+			}
+		})
+	}
+}
+
+func TestExecuteBoundsBlockingDestroyAndStillRevokesAgentLease(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.service.cleanupTimeout = 20 * time.Millisecond
+	target := &blockingDestroyExecutor{
+		Executor: fixture.executor, purpose: executor.PurposeAgent,
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	registry, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.executors = registry
+
+	type response struct {
+		result PhaseResult
+		err    error
+	}
+	done := make(chan response, 1)
+	go func() {
+		result, err := fixture.service.Execute(context.Background(), "run-123")
+		done <- response{result: result, err: err}
+	}()
+	<-target.started
+	var completed response
+	select {
+	case completed = <-done:
+	case <-time.After(500 * time.Millisecond):
+		close(target.release)
+		<-done
+		t.Fatal("Execute() did not bound blocking executor Destroy")
+	}
+	close(target.release)
+
+	if completed.err == nil || completed.result.Status != run.StatusFailed ||
+		completed.result.FailureClass != run.FailureCleanup || completed.result.Retryable {
+		t.Fatalf("Execute() result=%#v error=%v, want bounded cleanup failure", completed.result, completed.err)
+	}
+	if got := fixture.secrets.Revocations(); !reflect.DeepEqual(got, []string{"fixture-codex-lease"}) {
+		t.Fatalf("revocations after blocking Destroy = %#v", got)
+	}
+	assertRunDoesNotContain(t, fixture, "fixture-codex-auth")
+}
+
+func TestExecuteBoundsEachReverseBrokerRevocationAndAttemptsAll(t *testing.T) {
+	fixture := newServiceFixture(t)
+	configureSecondAgentSecret(t, fixture, "bounded-second-secret")
+	fixture.service.cleanupTimeout = 20 * time.Millisecond
+	blocking := &blockingRevokeBroker{
+		Broker: fixture.secrets, release: make(chan struct{}), started: make(chan struct{}, 2),
+	}
+	fixture.service.secrets = blocking
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "bounded-revoke")); err != nil {
+		t.Fatal(err)
+	}
+
+	type response struct {
+		result PhaseResult
+		err    error
+	}
+	done := make(chan response, 1)
+	go func() {
+		result, err := fixture.service.Execute(context.Background(), "run-123")
+		done <- response{result: result, err: err}
+	}()
+	<-blocking.started
+	var completed response
+	select {
+	case completed = <-done:
+	case <-time.After(500 * time.Millisecond):
+		close(blocking.release)
+		<-done
+		t.Fatal("Execute() did not bound broker Revoke")
+	}
+	close(blocking.release)
+
+	if completed.err == nil || completed.result.Status != run.StatusFailed ||
+		completed.result.FailureClass != run.FailureCleanup || completed.result.Retryable {
+		t.Fatalf("Execute() result=%#v error=%v, want bounded cleanup failure", completed.result, completed.err)
+	}
+	if got := blocking.Calls(); !reflect.DeepEqual(got, []string{"fixture-workload-lease", "fixture-codex-lease"}) {
+		t.Fatalf("bounded reverse revocations = %#v", got)
+	}
+	assertRunDoesNotContain(t, fixture, "fixture-codex-auth", "bounded-second-secret")
+}
+
+func TestExecuteCancellationRequiresConfirmedDescendantTermination(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		confirmed bool
+		status    run.Status
+		class     run.FailureClass
+		cause     string
+	}{
+		{name: "confirmed", confirmed: true, status: run.StatusCanceled, class: run.FailureCanceled, cause: "caller_canceled"},
+		{name: "unknown", confirmed: false, status: run.StatusFailed, class: run.FailureInternal, cause: "ambiguous_attempt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			var once sync.Once
+			agentStarted := make(chan struct{})
+			announce := func() { once.Do(func() { close(agentStarted) }) }
+			fixture.agent.run = func(ctx context.Context, _ runner.RunRequest) (runner.ExecutionResult, error) {
+				announce()
+				<-ctx.Done()
+				return runner.ExecutionResult{Started: true}, ctx.Err()
+			}
+			target := &cancellationExecutor{
+				confirmed: test.confirmed, agentStarted: announce,
+				state: executor.StateAbsent,
+			}
+			registry, err := executor.NewRegistry(executor.Registration{
+				RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.service.executors = registry
+
+			ctx, cancel := context.WithCancel(context.Background())
+			type response struct {
+				result PhaseResult
+				err    error
+			}
+			done := make(chan response, 1)
+			go func() {
+				result, err := fixture.service.Execute(ctx, "run-123")
+				done <- response{result: result, err: err}
+			}()
+			<-agentStarted
+			cancel()
+			completed := <-done
+			if completed.err == nil || completed.result.Status != test.status ||
+				completed.result.FailureClass != test.class || completed.result.Retryable {
+				t.Fatalf("Execute(canceled) result=%#v error=%v", completed.result, completed.err)
+			}
+			record, _ := fixture.runs.Load(context.Background(), "run-123")
+			if record.Failure == nil || record.Failure.CauseCode != test.cause {
+				t.Fatalf("cancellation failure = %#v", record.Failure)
+			}
+			if slicesIndex(target.Events(), "cancel:agent:0") < 0 ||
+				slicesIndex(target.Events(), "inspect:agent:0") < 0 ||
+				slicesIndex(target.Events(), "destroy:agent:0") < 0 {
+				t.Fatalf("cancellation lifecycle events = %#v", target.Events())
+			}
+			if !test.confirmed && target.State() != executor.StateUnknown {
+				t.Fatalf("unknown cancellation state = %q, want unknown", target.State())
+			}
+			eventsBeforeRestart := target.Events()
+			restarted, restartErr := fixture.service.Execute(context.Background(), "run-123")
+			if restarted.Status != test.status {
+				t.Fatalf("Execute(restart) result=%#v error=%v", restarted, restartErr)
+			}
+			if !reflect.DeepEqual(target.Events(), eventsBeforeRestart) {
+				t.Fatalf("terminal cancellation reran executor: before=%#v after=%#v",
+					eventsBeforeRestart, target.Events())
+			}
+		})
+	}
+}
+
+func TestExecuteNormalizesWorkspaceCleanupFailureAfterCancellation(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	workspaceCleanup := errors.New("workspace cleanup failed after cancellation")
+	fixture.service.workspaces = &fakeWorkspaceManager{prepare: func(context.Context, string, string) (workspace.Workspace, error) {
+		return &fakeWorkspace{path: "/tmp/workspace", cleanup: func(context.Context) error {
+			return workspaceCleanup
+		}}, nil
+	}}
+	started := make(chan struct{})
+	var once sync.Once
+	target := &cancellationExecutor{
+		confirmed: true, state: executor.StateAbsent,
+		agentStarted: func() { once.Do(func() { close(started) }) },
+	}
+	registry, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.executors = registry
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type response struct {
+		result PhaseResult
+		err    error
+	}
+	done := make(chan response, 1)
+	go func() {
+		result, executeErr := fixture.service.Execute(ctx, "run-123")
+		done <- response{result: result, err: executeErr}
+	}()
+	<-started
+	cancel()
+	completed := <-done
+	if completed.err == nil || !errors.Is(completed.err, context.Canceled) ||
+		!errors.Is(completed.err, workspaceCleanup) || completed.result.Status != run.StatusFailed ||
+		completed.result.FailureClass != run.FailureCleanup || completed.result.Retryable {
+		t.Fatalf("Execute() result=%#v error=%v, want cancellation normalized to cleanup failure",
+			completed.result, completed.err)
+	}
+	record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if record.Status != run.StatusFailed || record.Failure == nil ||
+		record.Failure.Class != run.FailureCleanup ||
+		record.Failure.CauseCode != "cleanup_failed" || record.Failure.Retryable {
+		t.Fatalf("durable canceled cleanup failure = %#v", record)
+	}
+}
+
+type sandboxBackedProfile struct{}
+
+func (*sandboxBackedProfile) Name() string { return "generic" }
+
+func (*sandboxBackedProfile) Inspect(ctx context.Context, request repository.ProfileRequest) (repository.ProfileResult, error) {
+	if request.Commands == nil {
+		return repository.ProfileResult{}, errors.New("sandbox command runner is required")
+	}
+	for _, command := range []verification.Command{
+		{Name: "preflight-git", Directory: ".", Executable: "git", Args: []string{"status"}, Timeout: time.Minute, Required: true},
+		{Name: "preflight-tool", Directory: ".", Executable: "go", Args: []string{"env", "GOMOD"}, Timeout: time.Minute, Required: true},
+	} {
+		if result := request.Commands.Run(ctx, command); !result.Passed {
+			return repository.ProfileResult{}, &repository.EnvironmentError{Operation: command.Name}
+		}
+	}
+	return repository.ProfileResult{
+		Facts: map[string]string{"base_sha": "0123456789012345678901234567890123456789"},
+		Commands: []verification.Command{{
+			Name: "verify", Directory: ".", Executable: "go", Args: []string{"test", "./..."},
+			Timeout: time.Minute, Required: true,
+		}},
+	}, nil
+}
+
+var _ repository.Profile = (*sandboxBackedProfile)(nil)
+
+type multiSecretRegistry struct {
+	bindings map[secret.BindingRef]secret.Binding
+}
+
+func (registry *multiSecretRegistry) Resolve(ctx context.Context, request secret.ResolveRequest) (secret.Binding, error) {
+	if err := ctx.Err(); err != nil {
+		return secret.Binding{}, err
+	}
+	binding, ok := registry.bindings[request.Ref]
+	if !ok {
+		return secret.Binding{}, secret.ErrBindingNotFound
+	}
+	if !binding.Authorizes(request) {
+		return secret.Binding{}, secret.ErrBindingUnauthorized
+	}
+	return binding, nil
+}
+
+type eventExecutor struct {
+	executor.Executor
+	events *[]string
+}
+
+func (target *eventExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
+	*target.events = append(*target.events, "destroy:"+string(attempt.Purpose)+":"+strconv.Itoa(attempt.Sequence))
+	return target.Executor.Destroy(ctx, attempt)
+}
+
+type eventBroker struct {
+	secret.Broker
+	events *[]string
+}
+
+type cancelingAcquireBroker struct {
+	secret.Broker
+	capability string
+	cancel     context.CancelFunc
+}
+
+func (broker *cancelingAcquireBroker) Acquire(ctx context.Context, request secret.AcquireRequest) (secret.Lease, error) {
+	if request.Capability == broker.capability {
+		broker.cancel()
+		return secret.Lease{}, context.Canceled
+	}
+	return broker.Broker.Acquire(ctx, request)
+}
+
+type cleanupFailureExecutor struct {
+	executor.Executor
+	purpose       executor.Purpose
+	destroyErr    error
+	state         executor.State
+	beforeDestroy func()
+}
+
+func (target *cleanupFailureExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
+	if attempt.Purpose != target.purpose {
+		return target.Executor.Destroy(ctx, attempt)
+	}
+	if target.beforeDestroy != nil {
+		target.beforeDestroy()
+	}
+	return target.destroyErr
+}
+
+func (target *cleanupFailureExecutor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {
+	if attempt.Purpose == target.purpose {
+		if err := ctx.Err(); err != nil {
+			return executor.StateUnknown, err
+		}
+		return target.state, nil
+	}
+	return target.Executor.Inspect(ctx, attempt)
+}
+
+type blockingDestroyExecutor struct {
+	executor.Executor
+	purpose executor.Purpose
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (target *blockingDestroyExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
+	if attempt.Purpose != target.purpose {
+		return target.Executor.Destroy(ctx, attempt)
+	}
+	target.once.Do(func() { close(target.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-target.release:
+		return errors.New("blocking Destroy released by test")
+	}
+}
+
+func (target *blockingDestroyExecutor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {
+	if attempt.Purpose == target.purpose {
+		if err := ctx.Err(); err != nil {
+			return executor.StateUnknown, err
+		}
+		return executor.StateUnknown, nil
+	}
+	return target.Executor.Inspect(ctx, attempt)
+}
+
+type blockingRevokeBroker struct {
+	secret.Broker
+	mu      sync.Mutex
+	release chan struct{}
+	started chan struct{}
+	calls   []string
+}
+
+func (broker *blockingRevokeBroker) Revoke(ctx context.Context, id string) error {
+	broker.mu.Lock()
+	broker.calls = append(broker.calls, id)
+	broker.mu.Unlock()
+	broker.started <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-broker.release:
+		return errors.New("blocking Revoke released by test")
+	}
+}
+
+func (broker *blockingRevokeBroker) Calls() []string {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	return append([]string(nil), broker.calls...)
+}
+
+type cancellationExecutor struct {
+	mu           sync.Mutex
+	confirmed    bool
+	agentStarted func()
+	state        executor.State
+	events       []string
+}
+
+func (target *cancellationExecutor) Execute(ctx context.Context, request executor.Request) (executor.Result, error) {
+	if err := request.Validate(); err != nil {
+		return executor.Result{}, err
+	}
+	if request.Attempt.Purpose == executor.PurposeProbe {
+		return executor.Result{
+			Created: true, Started: true, Completed: true, Stdout: []byte("codex 0.144.5"),
+			SafeFacts: portableSafeFacts(request.Profile),
+		}, nil
+	}
+	if request.Attempt.Purpose != executor.PurposeAgent {
+		return executor.Result{Created: true, Started: true, Completed: true}, nil
+	}
+	target.agentStarted()
+	<-ctx.Done()
+	target.mu.Lock()
+	target.state = executor.StateRunning
+	target.mu.Unlock()
+	return executor.Result{Created: true, Started: true}, ctx.Err()
+}
+
+func (target *cancellationExecutor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {
+	if err := ctx.Err(); err != nil {
+		return executor.StateUnknown, err
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	target.events = append(target.events, "inspect:"+string(attempt.Purpose)+":"+strconv.Itoa(attempt.Sequence))
+	return target.state, nil
+}
+
+func (target *cancellationExecutor) Cancel(ctx context.Context, attempt executor.AttemptID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	target.events = append(target.events, "cancel:"+string(attempt.Purpose)+":"+strconv.Itoa(attempt.Sequence))
+	if target.confirmed {
+		target.state = executor.StateCompleted
+	} else {
+		target.state = executor.StateUnknown
+	}
+	return nil
+}
+
+func (target *cancellationExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	target.events = append(target.events, "destroy:"+string(attempt.Purpose)+":"+strconv.Itoa(attempt.Sequence))
+	if target.confirmed {
+		target.state = executor.StateDestroyed
+	}
+	return nil
+}
+
+func (target *cancellationExecutor) State() executor.State {
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	return target.state
+}
+
+func (target *cancellationExecutor) Events() []string {
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	return append([]string(nil), target.events...)
+}
+
+func (broker *eventBroker) Revoke(ctx context.Context, id string) error {
+	*broker.events = append(*broker.events, "revoke:"+id)
+	return broker.Broker.Revoke(ctx, id)
+}
+
+func slicesIndex(values []string, target string) int {
+	for index, value := range values {
+		if value == target {
+			return index
+		}
+	}
+	return -1
+}
 
 func TestExecuteUsesFreshRealWorktreeAndPersistsCompleteArtifact(t *testing.T) {
 	source, baseSHA := createGitSource(t)
@@ -70,14 +1182,15 @@ func TestExecuteUsesFreshRealWorktreeAndPersistsCompleteArtifact(t *testing.T) {
 	mem := &recordingMemory{result: []memory.Memory{{ID: "memory-1", Content: "Keep the public API stable"}}}
 	runs := runmock.NewStore()
 	artifacts := artifactmock.NewStore()
-	workerProfiles, secretBindings, executors, harnesses, _, _ := portableRuntimeDependencies(t)
+	workerProfiles, secretBindings, executors, harnesses, targetExecutor, _ := portableRuntimeDependencies(t)
+	configurePortableExecutor(targetExecutor, agent, verifier)
 	service, err := New(Dependencies{
 		Templates: registry, Runs: runs, Memory: mem, Resolver: manager,
 		Workspaces: manager, Profiles: map[string]repository.Profile{
 			"generic": profile, "go": &fakeProfile{name: "go"},
 		},
 		WorkerProfiles: workerProfiles, SecretBindings: secretBindings,
-		Executors: executors, Harnesses: harnesses,
+		Secrets: configuredSecretBroker(t), Executors: executors, Harnesses: harnesses,
 		Environments: envPolicy, Agent: agent, Verifier: verifier,
 		Capturer: capturer, Policy: changePolicy, Artifacts: artifacts,
 		Publisher: publishermock.NewPublisher(structPublisherResult(), nil),
@@ -115,8 +1228,10 @@ func TestExecuteUsesFreshRealWorktreeAndPersistsCompleteArtifact(t *testing.T) {
 			t.Errorf("agent prompt does not contain %q:\n%s", value, requests[0].TaskDescription)
 		}
 	}
-	if requests[0].Env["CODEX_HOME"] == "" {
-		t.Error("agent environment lacks CODEX_HOME")
+	for _, key := range []string{"PATH", "HOME", "TMPDIR"} {
+		if requests[0].Env[key] == "" {
+			t.Errorf("agent environment lacks %s", key)
+		}
 	}
 	for _, denied := range []string{"HATCHET_CLIENT_TOKEN", "MEM0_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"} {
 		if _, exists := requests[0].Env[denied]; exists {
@@ -183,11 +1298,16 @@ func TestExecuteUsesFreshRealWorktreeAndPersistsCompleteArtifact(t *testing.T) {
 	}
 }
 
-func TestExecuteCompletedAgentFailureRetainsSafeArtifact(t *testing.T) {
+func TestExecuteCompletedNonzeroAgentRetainsArtifactWithoutParsing(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
+	parseCalled := false
+	fixture.harness.parse = func(executor.Result) (string, error) {
+		parseCalled = true
+		return "parsed nonzero output", nil
+	}
 	fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
 		return runner.ExecutionResult{
-			Output: "agent failed safely", Transcript: `{"type":"item.completed"}`,
+			Output: "untrusted nonzero output", Transcript: `{"type":"item.completed"}`,
 			ExitCode: 7, Started: true, Completed: true,
 		}, nil
 	}
@@ -204,8 +1324,42 @@ func TestExecuteCompletedAgentFailureRetainsSafeArtifact(t *testing.T) {
 		t.Fatalf("Execute() result = %#v", result)
 	}
 	bundle := fixture.artifacts.Snapshot().Bundles[result.Artifact.Digest]
-	if string(bundle.AgentOutput) != "agent failed safely" {
-		t.Fatalf("artifact agent output = %q", bundle.AgentOutput)
+	if parseCalled || len(bundle.AgentOutput) != 0 {
+		t.Fatalf("nonzero result was parsed: called=%v artifact output=%q", parseCalled, bundle.AgentOutput)
+	}
+}
+
+func TestExecuteClassifiesNonzeroBeforeRealCodexAdapterParsing(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	adapter, err := harnesscodex.New(harnesscodex.SupportedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := harness.NewRegistry(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.harnesses = registry
+	fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
+		return runner.ExecutionResult{
+			Output: "not valid Codex JSONL", ExitCode: 23, Started: true, Completed: true,
+		}, nil
+	}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, executeErr := fixture.service.Execute(context.Background(), "run-123")
+	if executeErr == nil || result.Status != run.StatusFailed ||
+		result.FailureClass != run.FailureAgent || result.Retryable || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, executeErr)
+	}
+	record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if record.Failure == nil || record.Failure.CauseCode != "nonzero_exit" {
+		t.Fatalf("real Codex nonzero failure = %#v, want nonzero_exit", record.Failure)
 	}
 }
 
@@ -366,15 +1520,16 @@ func TestExhaustRejectsRunBindingMismatch(t *testing.T) {
 	}
 }
 
-func TestExecuteEnvironmentPolicyDenialPersistsNoPatchOrSecret(t *testing.T) {
+func TestExecuteDoesNotConsultAmbientEnvironmentBuilder(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
+	called := false
 	fixture.env.build = func(context.Context, environment.Request) (environment.Result, error) {
+		called = true
 		return environment.Result{}, errors.New("requested GITHUB_TOKEN value super-secret is denied")
 	}
 
 	result, err := fixture.service.Execute(context.Background(), "run-123")
-	if err == nil || result.FailureClass != run.FailurePolicy || result.Retryable ||
-		result.Artifact != nil || len(fixture.artifacts.Snapshot().Saves) != 0 {
+	if err != nil || result.Artifact == nil || called {
 		t.Fatalf("Execute() result=%#v error=%v", result, err)
 	}
 	record, _ := fixture.runs.Load(context.Background(), "run-123")
@@ -503,9 +1658,11 @@ func TestExecuteRejectsEphemeralAbsolutePathInPatchWithoutArtifact(t *testing.T)
 	}
 }
 
-func TestExecuteDoesNotDeriveBroadCommonRuntimePrefix(t *testing.T) {
+func TestExecuteDoesNotConsultAmbientRuntimePrefixes(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
+	called := false
 	fixture.env.build = func(_ context.Context, request environment.Request) (environment.Result, error) {
+		called = true
 		root := "/agent"
 		if request.Stage == environment.StageVerification {
 			root = "/verification"
@@ -531,16 +1688,18 @@ func TestExecuteDoesNotDeriveBroadCommonRuntimePrefix(t *testing.T) {
 	}
 	output := string(fixture.artifacts.Snapshot().Bundles[result.Artifact.Digest].AgentOutput)
 	if !strings.Contains(output, "/repository/path") ||
-		strings.Contains(output, "/agent/home") {
+		!strings.Contains(output, "/agent/home") || called {
 		t.Fatalf("boundary scrubbed output = %q", output)
 	}
 }
 
-func TestExecuteRejectsUnsafeEphemeralScrubPrefixes(t *testing.T) {
+func TestExecuteIgnoresLegacyAmbientScrubPrefixes(t *testing.T) {
 	for _, prefix := range []string{"/", "/tmp", "relative/home"} {
 		t.Run(prefix, func(t *testing.T) {
 			fixture := resolvedServiceFixture(t)
+			called := false
 			fixture.env.build = func(context.Context, environment.Request) (environment.Result, error) {
+				called = true
 				return environment.Result{Values: map[string]string{
 					"PATH": "/bin", "HOME": prefix, "TMPDIR": "/safe/runtime/tmp",
 					"TMP": "/safe/runtime/tmp", "TEMP": "/safe/runtime/tmp", "CODEX_HOME": "/safe/codex/home",
@@ -551,12 +1710,8 @@ func TestExecuteRejectsUnsafeEphemeralScrubPrefixes(t *testing.T) {
 			}
 
 			result, err := fixture.service.Execute(context.Background(), "run-123")
-			if err == nil || result.FailureClass != run.FailureInternal ||
-				result.Retryable || result.Artifact != nil {
+			if err != nil || result.Artifact == nil || called {
 				t.Fatalf("Execute() result=%#v error=%v", result, err)
-			}
-			if saves := fixture.artifacts.Snapshot().Saves; len(saves) != 0 {
-				t.Fatalf("unsafe prefix reached artifact store: %#v", saves)
 			}
 		})
 	}
@@ -585,7 +1740,7 @@ func TestExecuteRejectsDurableEvidenceKeyCollision(t *testing.T) {
 func TestExecuteCancellationCleansWithNonCanceledContext(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
 	cleanWorkspace := false
-	cleanRuntime := false
+	ambientCleanupCalled := false
 	fixture.service.workspaces = &fakeWorkspaceManager{prepare: func(context.Context, string, string) (workspace.Workspace, error) {
 		return &fakeWorkspace{path: "/tmp/workspace", cleanup: func(ctx context.Context) error {
 			if ctx.Err() != nil {
@@ -596,18 +1751,22 @@ func TestExecuteCancellationCleansWithNonCanceledContext(t *testing.T) {
 		}}, nil
 	}}
 	fixture.env.cleanup = func(ctx context.Context, _ string) error {
-		if ctx.Err() != nil {
-			t.Fatalf("runtime cleanup context canceled: %v", ctx.Err())
-		}
-		cleanRuntime = true
+		ambientCleanupCalled = true
 		return nil
 	}
 	started := make(chan struct{})
-	fixture.agent.run = func(ctx context.Context, _ runner.RunRequest) (runner.ExecutionResult, error) {
-		close(started)
-		<-ctx.Done()
-		return runner.ExecutionResult{Started: true}, ctx.Err()
+	var once sync.Once
+	target := &cancellationExecutor{
+		confirmed: true, state: executor.StateAbsent,
+		agentStarted: func() { once.Do(func() { close(started) }) },
 	}
+	registry, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.executors = registry
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-started
@@ -619,8 +1778,8 @@ func TestExecuteCancellationCleansWithNonCanceledContext(t *testing.T) {
 		result.FailureClass != run.FailureCanceled || result.Retryable {
 		t.Fatalf("Execute() result=%#v error=%v", result, err)
 	}
-	if !cleanWorkspace || !cleanRuntime {
-		t.Fatalf("cleanup workspace=%t runtime=%t", cleanWorkspace, cleanRuntime)
+	if !cleanWorkspace || ambientCleanupCalled {
+		t.Fatalf("cleanup workspace=%t ambient=%t", cleanWorkspace, ambientCleanupCalled)
 	}
 }
 
@@ -664,10 +1823,12 @@ func TestExecuteCancellationAfterArtifactSaveCheckpointsArtifact(t *testing.T) {
 	}
 }
 
-func TestExecuteCancellationDuringCleanupPersistsTerminalCanceled(t *testing.T) {
+func TestExecuteDoesNotRunAmbientCleanup(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	called := false
 	fixture.env.cleanup = func(context.Context, string) error {
+		called = true
 		cancel()
 		return nil
 	}
@@ -676,8 +1837,7 @@ func TestExecuteCancellationDuringCleanupPersistsTerminalCanceled(t *testing.T) 
 	}
 
 	result, err := fixture.service.Execute(ctx, "run-123")
-	if !errors.Is(err, context.Canceled) || result.Status != run.StatusCanceled ||
-		result.FailureClass != run.FailureCanceled || result.Retryable || result.Artifact == nil {
+	if err != nil || result.Artifact == nil || called || ctx.Err() != nil {
 		t.Fatalf("Execute() result=%#v error=%v", result, err)
 	}
 }
@@ -687,7 +1847,7 @@ func TestExecuteCancellationAtFinalSaveIsCompensatedDurably(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.runs.saveCalls = 0
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 4 {
+		if call == 5 {
 			cancel()
 		}
 	}
@@ -712,11 +1872,11 @@ func TestExecuteCancellationWithFinalSaveErrorStillCompensates(t *testing.T) {
 	fixture.runs.saveCalls = 0
 	finalSaveErr := errors.New("final save unavailable")
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 4 {
+		if call == 5 {
 			cancel()
 		}
 	}
-	fixture.runs.saveErrors = map[int]error{4: finalSaveErr}
+	fixture.runs.saveErrors = map[int]error{5: finalSaveErr}
 	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
 		return capturedChange(), nil
 	}
@@ -741,14 +1901,14 @@ func TestExecuteCancellationAfterExhaustedFinalCASStillCompensates(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.runs.saveCalls = 0
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 4 {
+		if call == 5 {
 			cancel()
 		}
 	}
 	fixture.runs.saveErrors = map[int]error{
-		4: run.ErrVersionConflict,
 		5: run.ErrVersionConflict,
 		6: run.ErrVersionConflict,
+		7: run.ErrVersionConflict,
 	}
 	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
 		return capturedChange(), nil
@@ -776,11 +1936,11 @@ func TestExecuteCancellationJoinsFinalAndCompensationSaveErrors(t *testing.T) {
 	finalSaveErr := errors.New("final save unavailable")
 	compensationErr := errors.New("compensation save unavailable")
 	fixture.runs.saveHook = func(call int, _ run.Record) {
-		if call == 4 {
+		if call == 5 {
 			cancel()
 		}
 	}
-	fixture.runs.saveErrors = map[int]error{4: finalSaveErr, 5: compensationErr}
+	fixture.runs.saveErrors = map[int]error{5: finalSaveErr, 6: compensationErr}
 	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
 		return capturedChange(), nil
 	}
@@ -796,10 +1956,11 @@ func TestExecuteLateCancellationAfterPersistedFailureWinsDurably(t *testing.T) {
 	tests := []struct {
 		name         string
 		failureClass run.FailureClass
+		cancelWins   bool
 		configure    func(*serviceFixture)
 	}{
 		{
-			name: "nonretryable agent failure", failureClass: run.FailureAgent,
+			name: "nonretryable agent failure", failureClass: run.FailureAgent, cancelWins: true,
 			configure: func(fixture *serviceFixture) {
 				fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
 					return runner.ExecutionResult{ExitCode: 7, Started: true, Completed: true}, nil
@@ -807,7 +1968,7 @@ func TestExecuteLateCancellationAfterPersistedFailureWinsDurably(t *testing.T) {
 			},
 		},
 		{
-			name: "verification failure", failureClass: run.FailureVerification,
+			name: "verification failure", failureClass: run.FailureVerification, cancelWins: true,
 			configure: func(fixture *serviceFixture) {
 				fixture.profile.result.Commands = []verification.Command{{
 					Name: "test", Directory: "/tmp/workspace", Executable: "go",
@@ -857,10 +2018,6 @@ func TestExecuteLateCancellationAfterPersistedFailureWinsDurably(t *testing.T) {
 			}
 
 			result, err := fixture.service.Execute(ctx, "run-123")
-			if !errors.Is(err, context.Canceled) || result.Status != run.StatusCanceled ||
-				result.FailureClass != run.FailureCanceled || result.Retryable {
-				t.Fatalf("Execute() result=%#v error=%v", result, err)
-			}
 			if persistedFailure.Status != run.StatusFailed ||
 				persistedFailure.Failure == nil ||
 				persistedFailure.Failure.Class != test.failureClass {
@@ -870,6 +2027,26 @@ func TestExecuteLateCancellationAfterPersistedFailureWinsDurably(t *testing.T) {
 			record, loadErr := fixture.runs.Store.Load(context.Background(), "run-123")
 			if loadErr != nil {
 				t.Fatal(loadErr)
+			}
+			if !test.cancelWins {
+				if result.Status != run.StatusFailed ||
+					result.FailureClass != run.FailureCleanup || result.Retryable ||
+					record.Status != run.StatusFailed || record.Failure == nil ||
+					record.Failure.Class != run.FailureCleanup ||
+					record.Failure.CauseCode != "cleanup_failed" {
+					t.Fatalf("cleanup failure was masked by late cancellation: result=%#v error=%v record=%#v",
+						result, err, record)
+				}
+				for _, stage := range record.Stages {
+					if stage.Name == run.ExecuteCancellationStage {
+						t.Fatalf("cleanup failure gained false cancellation evidence: %#v", stage)
+					}
+				}
+				return
+			}
+			if !errors.Is(err, context.Canceled) || result.Status != run.StatusCanceled ||
+				result.FailureClass != run.FailureCanceled || result.Retryable {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
 			}
 			if record.Status != run.StatusCanceled || record.Failure == nil ||
 				record.Failure.Class != run.FailureCanceled ||
@@ -895,7 +2072,7 @@ func TestExecuteLateCancellationAfterPersistedFailureWinsDurably(t *testing.T) {
 	}
 }
 
-func TestExecuteCleanupFailureJoinsPrimaryWithoutReplacingClass(t *testing.T) {
+func TestExecuteCleanupFailureNormalizesPrimaryClass(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
 	primary := errors.New("agent transport failed")
 	cleanup := errors.New("workspace cleanup failed")
@@ -910,24 +2087,24 @@ func TestExecuteCleanupFailureJoinsPrimaryWithoutReplacingClass(t *testing.T) {
 	if !errors.Is(err, primary) || !errors.Is(err, cleanup) {
 		t.Fatalf("Execute() error = %v, want joined primary and cleanup", err)
 	}
-	if result.FailureClass != run.FailureAgent {
-		t.Fatalf("Execute() failure class = %q, want agent", result.FailureClass)
+	if result.Status != run.StatusFailed || result.FailureClass != run.FailureCleanup {
+		t.Fatalf("Execute() result = %#v, want terminal cleanup failure", result)
 	}
 	if result.Retryable {
 		t.Fatal("cleanup failure left primary failure retryable")
 	}
 }
 
-func TestExecuteCleanupUsesIndependentBudgetsAndAlwaysAttemptsBoth(t *testing.T) {
+func TestExecuteWorkspaceCleanupUsesIndependentBudgetWithoutAmbientCleanup(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
 	fixture.service.cleanupTimeout = 20 * time.Millisecond
 	fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
 		return runner.ExecutionResult{}, errors.New("agent unavailable")
 	}
-	runtimeAttempted := false
+	ambientAttempted := false
 	workspaceAttempted := false
 	fixture.env.cleanup = func(ctx context.Context, _ string) error {
-		runtimeAttempted = true
+		ambientAttempted = true
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -942,18 +2119,18 @@ func TestExecuteCleanupUsesIndependentBudgetsAndAlwaysAttemptsBoth(t *testing.T)
 	}}
 
 	result, err := fixture.service.Execute(context.Background(), "run-123")
-	if err == nil || result.FailureClass != run.FailureAgent || result.Retryable {
+	if err == nil || result.FailureClass != run.FailureAgent || !result.Retryable {
 		t.Fatalf("Execute() result=%#v error=%v", result, err)
 	}
-	if !runtimeAttempted || !workspaceAttempted {
-		t.Fatalf("cleanup attempts runtime=%t workspace=%t", runtimeAttempted, workspaceAttempted)
+	if ambientAttempted || !workspaceAttempted {
+		t.Fatalf("cleanup attempts ambient=%t workspace=%t", ambientAttempted, workspaceAttempted)
 	}
 	if strings.Contains(err.Error(), "starved") {
 		t.Fatalf("workspace cleanup reused expired runtime budget: %v", err)
 	}
 }
 
-func TestExecutePartialRuntimeCleanupStillCleansWorktree(t *testing.T) {
+func TestExecuteIgnoresAmbientCleanupFailureAndCleansWorktree(t *testing.T) {
 	fixture := resolvedServiceFixture(t)
 	runtimeErr := errors.New("partial runtime cleanup")
 	worktreeCleaned := false
@@ -969,7 +2146,7 @@ func TestExecutePartialRuntimeCleanupStillCleansWorktree(t *testing.T) {
 	}
 
 	result, err := fixture.service.Execute(context.Background(), "run-123")
-	if !errors.Is(err, runtimeErr) || result.FailureClass != run.FailureCleanup || result.Retryable {
+	if err != nil || result.Artifact == nil {
 		t.Fatalf("Execute() result=%#v error=%v", result, err)
 	}
 	if !worktreeCleaned {
@@ -1009,6 +2186,10 @@ func TestExecuteFinalizesExpiredRunningAttemptWithoutRerunningAgent(t *testing.T
 	if _, started, err := fixture.service.beginStage(context.Background(), "run-123", "execute", run.StatusExecuting); err != nil || !started {
 		t.Fatalf("beginStage() started=%t error=%v", started, err)
 	}
+	fixture.executor.SetState(executor.AttemptID{
+		RunID: "run-123", Stage: "execute", Attempt: 1,
+		StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
+	}, executor.StateRunning)
 	clock.Advance(2 * time.Minute)
 	agentCalls := 0
 	fixture.agent.run = func(context.Context, runner.RunRequest) (runner.ExecutionResult, error) {
@@ -1027,6 +2208,117 @@ func TestExecuteFinalizesExpiredRunningAttemptWithoutRerunningAgent(t *testing.T
 	if record.Failure == nil || record.Failure.CauseCode != "ambiguous_attempt" ||
 		record.Stages[len(record.Stages)-1].Status != run.StageFailed {
 		t.Fatalf("recovery record = %#v", record)
+	}
+}
+
+func TestExecuteRecoveryRetriesOnlyConclusiveNonStart(t *testing.T) {
+	for _, state := range []executor.State{executor.StateAbsent, executor.StateCreated} {
+		t.Run(string(state), func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			clock := newMutableClock(time.Unix(100, 0).UTC())
+			fixture.service.clock = clock.Now
+			fixture.service.executeLease = time.Minute
+			if _, started, err := fixture.service.beginStage(
+				context.Background(), "run-123", "execute", run.StatusExecuting,
+			); err != nil || !started {
+				t.Fatalf("beginStage() started=%t error=%v", started, err)
+			}
+			priorAgent := executor.AttemptID{
+				RunID: "run-123", Stage: "execute", Attempt: 1,
+				StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
+			}
+			if state != executor.StateAbsent {
+				fixture.executor.SetState(priorAgent, state)
+			}
+			fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+				stdout := []byte("agent completed")
+				if request.Attempt.Purpose == executor.PurposeProbe {
+					stdout = []byte("codex 0.144.5")
+				}
+				fixture.executor.SetResult(request.Attempt, executor.Result{
+					Created: true, Started: true, Completed: true, Stdout: stdout,
+					SafeFacts: portableSafeFacts(request.Profile),
+				}, nil)
+			})
+			fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+				return capturedChange(), nil
+			}
+			clock.Advance(2 * time.Minute)
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err != nil || result.Artifact == nil || result.Status != run.StatusExecuting {
+				t.Fatalf("Execute(recovery) result=%#v error=%v", result, err)
+			}
+			requests := fixture.executor.Requests()
+			if len(requests) == 0 || requests[len(requests)-1].Attempt.Purpose != executor.PurposeAgent ||
+				requests[len(requests)-1].Attempt.Attempt != 2 {
+				t.Fatalf("recovery executor requests = %#v", requests)
+			}
+			inspected, err := fixture.executor.Inspect(context.Background(), priorAgent)
+			if err != nil || inspected != executor.StateDestroyed {
+				t.Fatalf("prior agent state = %q, %v, want destroyed", inspected, err)
+			}
+		})
+	}
+}
+
+func TestExecuteRecoveryTreatsPostStartAndUnknownAsAmbiguous(t *testing.T) {
+	tests := []struct {
+		name         string
+		state        executor.State
+		durableStart bool
+	}{
+		{name: "running", state: executor.StateRunning},
+		{name: "completed", state: executor.StateCompleted},
+		{name: "unknown", state: executor.StateUnknown},
+		{name: "missing after durable start", state: executor.StateAbsent, durableStart: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			clock := newMutableClock(time.Unix(100, 0).UTC())
+			fixture.service.clock = clock.Now
+			fixture.service.executeLease = time.Minute
+			if _, started, err := fixture.service.beginStage(
+				context.Background(), "run-123", "execute", run.StatusExecuting,
+			); err != nil || !started {
+				t.Fatalf("beginStage() started=%t error=%v", started, err)
+			}
+			priorAgent := executor.AttemptID{
+				RunID: "run-123", Stage: "execute", Attempt: 1,
+				StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
+			}
+			if test.state != executor.StateAbsent {
+				fixture.executor.SetState(priorAgent, test.state)
+			}
+			if test.durableStart {
+				record, err := fixture.runs.Store.Load(context.Background(), "run-123")
+				if err != nil {
+					t.Fatal(err)
+				}
+				latest, _ := latestStage(record, "execute")
+				latest.Evidence = map[string]string{"agent_started": "true"}
+				record, err = run.UpsertStage(record, latest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				record.UpdatedAt = clock.Now()
+				if _, err := fixture.runs.Store.Save(context.Background(), record, record.Version); err != nil {
+					t.Fatal(err)
+				}
+			}
+			clock.Advance(2 * time.Minute)
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || result.Status != run.StatusFailed || result.Retryable {
+				t.Fatalf("Execute(recovery) result=%#v error=%v", result, err)
+			}
+			record, _ := fixture.runs.Store.Load(context.Background(), "run-123")
+			if record.Failure == nil || record.Failure.CauseCode != "ambiguous_attempt" ||
+				len(fixture.executor.Requests()) != 0 {
+				t.Fatalf("ambiguous recovery record=%#v requests=%#v", record, fixture.executor.Requests())
+			}
+		})
 	}
 }
 
@@ -1050,8 +2342,13 @@ func TestExecuteExpiredRunningAttemptPreservesCheckpointedArtifact(t *testing.T)
 	clock.Advance(2 * time.Minute)
 
 	result, err := fixture.service.Execute(context.Background(), "run-123")
-	if err == nil || result.Status != run.StatusFailed || result.Artifact == nil || *result.Artifact != reference {
+	if err != nil || result.Status != run.StatusExecuting || result.Artifact == nil || *result.Artifact != reference {
 		t.Fatalf("Execute(recovery) result=%#v error=%v", result, err)
+	}
+	recovered, _ := fixture.runs.Load(context.Background(), "run-123")
+	latest, _ := latestStage(recovered, "execute")
+	if latest.Status != run.StageSucceeded || recovered.Failure != nil || len(fixture.executor.Requests()) != 0 {
+		t.Fatalf("checkpoint recovery record=%#v requests=%#v", recovered, fixture.executor.Requests())
 	}
 }
 
@@ -1070,7 +2367,7 @@ func TestExecuteArtifactCheckpointSurvivesFinalPersistenceCrash(t *testing.T) {
 	}
 	fixture.runs.saveCalls = 0
 	finalPersistErr := errors.New("worker lost before final run persistence")
-	fixture.runs.saveErrors = map[int]error{4: finalPersistErr}
+	fixture.runs.saveErrors = map[int]error{5: finalPersistErr}
 
 	result, err := fixture.service.Execute(context.Background(), "run-123")
 	if !errors.Is(err, finalPersistErr) {
@@ -1086,7 +2383,7 @@ func TestExecuteArtifactCheckpointSurvivesFinalPersistenceCrash(t *testing.T) {
 	clock.Advance(2 * time.Minute)
 	recovered := *fixture.service
 	recovery, err := recovered.Execute(context.Background(), "run-123")
-	if err == nil || recovery.Status != run.StatusFailed || recovery.Artifact == nil ||
+	if err != nil || recovery.Status != run.StatusExecuting || recovery.Artifact == nil ||
 		*recovery.Artifact != checkpoint || agentCalls != 1 {
 		t.Fatalf("Execute(recovery) result=%#v error=%v agentCalls=%d", recovery, err, agentCalls)
 	}
@@ -1354,9 +2651,9 @@ func (*workspaceProfile) Inspect(_ context.Context, request repository.ProfileRe
 	return repository.ProfileResult{
 		Facts: map[string]string{
 			"zeta": "last", "alpha": "first",
-			"workspace": request.Workspace, "runtime_home": request.Environment["HOME"],
+			"workspace": request.Workspace,
 		},
-		Warnings: []string{"optional dependency unavailable at " + request.Environment["TMPDIR"]},
+		Warnings: []string{"optional dependency unavailable"},
 		Modules:  []string{"module-a", "module-b"},
 		Commands: []verification.Command{
 			{Name: "module-a", Directory: filepath.Join(request.Workspace, "module-a"), Executable: "git", Args: []string{"status", "--short"}, Timeout: time.Minute, Required: true},

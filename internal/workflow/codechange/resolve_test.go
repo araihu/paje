@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	runmock "github.com/araihu/paje/internal/run/mock"
 	"github.com/araihu/paje/internal/runner"
 	"github.com/araihu/paje/internal/secret"
+	secretmock "github.com/araihu/paje/internal/secret/mock"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
@@ -567,6 +569,7 @@ func TestNewRejectsMissingDependenciesAndCopiesProfiles(t *testing.T) {
 			},
 			WorkerProfiles: fixture.service.workerProfiles,
 			SecretBindings: fixture.service.secretBindings,
+			Secrets:        fixture.service.secrets,
 			Executors:      fixture.service.executors,
 			Harnesses:      fixture.service.harnesses,
 			Environments:   fixture.service.environments, Agent: fixture.service.agent,
@@ -589,6 +592,7 @@ func TestNewRejectsMissingDependenciesAndCopiesProfiles(t *testing.T) {
 		{"go profile", func(d *Dependencies) { delete(d.Profiles, "go") }},
 		{"worker profiles", func(d *Dependencies) { d.WorkerProfiles = nil }},
 		{"secret bindings", func(d *Dependencies) { d.SecretBindings = nil }},
+		{"secret broker", func(d *Dependencies) { d.Secrets = nil }},
 		{"executors", func(d *Dependencies) { d.Executors = nil }},
 		{"harnesses", func(d *Dependencies) { d.Harnesses = nil }},
 		{"environments", func(d *Dependencies) { d.Environments = nil }},
@@ -673,6 +677,7 @@ type serviceFixture struct {
 	profile        *fakeProfile
 	workerProfiles *workerprofilemock.Registry
 	secretBindings *recordingSecretRegistry
+	secrets        *secretmock.Broker
 	executor       *executormock.Executor
 	harness        *recordingHarness
 	env            *fakeEnvironment
@@ -693,6 +698,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 	profile := &fakeProfile{name: "generic"}
 	workerProfiles, secretBindings, executorRegistry, harnessRegistry, targetExecutor, targetHarness :=
 		portableRuntimeDependencies(t)
+	secrets := configuredSecretBroker(t)
 	fixture := &serviceFixture{
 		runs: &recordingRunStore{Store: runmock.NewStore()},
 		resolver: &recordingResolver{revision: repository.Revision{
@@ -704,6 +710,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		profile:        profile,
 		workerProfiles: workerProfiles,
 		secretBindings: secretBindings,
+		secrets:        secrets,
 		executor:       targetExecutor,
 		harness:        targetHarness,
 		env:            &fakeEnvironment{},
@@ -714,6 +721,59 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		artifacts:      artifactmock.NewStore(),
 		workspaces:     &fakeWorkspaceManager{},
 	}
+	targetExecutor.SetBeforeExecute(func(ctx context.Context, request executor.Request) {
+		result := executor.Result{Created: true, Started: true, Completed: true, SafeFacts: portableSafeFacts(request.Profile)}
+		var executeErr error
+		switch request.Attempt.Purpose {
+		case executor.PurposeProbe:
+			if request.Command.Executable == "codex" {
+				result.Stdout = []byte("codex 0.144.5")
+			} else {
+				result.Stdout = []byte("ok")
+			}
+		case executor.PurposeAgent:
+			prompt := ""
+			if len(request.Command.Args) != 0 {
+				prompt = request.Command.Args[len(request.Command.Args)-1]
+			}
+			legacy, err := fixture.agent.Run(ctx, runner.RunRequest{
+				TaskDescription: prompt, WorkspacePath: request.Workspace.HostPath,
+				Env: cloneStringMap(request.Environment),
+			})
+			result = executor.Result{
+				Created: legacy.Started || legacy.Completed, Started: legacy.Started, Completed: legacy.Completed,
+				ExitCode: legacy.ExitCode, Stdout: []byte(legacy.Output),
+				Duration:        time.Duration(legacy.Duration * float64(time.Second)),
+				StdoutTruncated: legacy.Truncated,
+			}
+			executeErr = err
+		case executor.PurposeVerification:
+			index := request.Attempt.Sequence - 1
+			command := verification.Command{
+				Name: request.Command.Executable, Directory: request.Command.Directory,
+				Executable: request.Command.Executable, Args: append([]string(nil), request.Command.Args...),
+				Environment: cloneStringMap(request.Command.Environment), Timeout: request.Timeout, Required: true,
+			}
+			if index >= 0 && index < len(fixture.profile.result.Commands) {
+				command = fixture.profile.result.Commands[index]
+			}
+			legacy := fixture.verifier.Run(ctx, command, cloneStringMap(request.Environment))
+			result.ExitCode = legacy.ExitCode
+			if !legacy.Passed && result.ExitCode == 0 {
+				result.ExitCode = 1
+			}
+			result.Stdout = []byte(legacy.Output)
+			result.Duration = legacy.Duration
+			result.StdoutTruncated = legacy.Truncated
+			if !legacy.Passed && legacy.FailureClass != "" && legacy.FailureClass != "verification" {
+				executeErr = executor.WrapError(
+					safeCauseCode(legacy.FailureClass, "internal"),
+					safeCauseCode(legacy.CauseCode, "execute"), errors.New("fixture verification failure"),
+				)
+			}
+		}
+		targetExecutor.SetResult(request.Attempt, result, executeErr)
+	})
 	fixture.service, err = New(Dependencies{
 		Templates:      registry,
 		Runs:           fixture.runs,
@@ -723,6 +783,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		Profiles:       map[string]repository.Profile{"generic": profile, "go": &fakeProfile{name: "go"}},
 		WorkerProfiles: workerProfiles,
 		SecretBindings: secretBindings,
+		Secrets:        secrets,
 		Executors:      executorRegistry,
 		Harnesses:      harnessRegistry,
 		Environments:   fixture.env,
@@ -739,6 +800,99 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		t.Fatalf("New() error = %v", err)
 	}
 	return fixture
+}
+
+func configuredSecretBroker(t *testing.T) *secretmock.Broker {
+	t.Helper()
+	broker := secretmock.NewBroker()
+	secretFile, err := secret.NewFile("auth.json", 0o400, []byte("fixture-codex-auth"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialization, err := secret.NewDirectoryMaterialization(
+		"/run/paje/secrets/codex", []secret.File{secretFile},
+	)
+	secretFile.Zero()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := secret.NewLease(
+		"fixture-codex-lease", time.Unix(100, 0).UTC().Add(time.Hour), materialization,
+	)
+	materialization.Destroy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.SetAcquireResult("harness.codex-auth", lease, nil)
+	lease.Destroy()
+	return broker
+}
+
+func configurePortableExecutor(target *executormock.Executor, agent runner.Runner, verifier verification.Runner) {
+	target.SetBeforeExecute(func(ctx context.Context, request executor.Request) {
+		result := executor.Result{Created: true, Started: true, Completed: true, SafeFacts: portableSafeFacts(request.Profile)}
+		var executeErr error
+		switch request.Attempt.Purpose {
+		case executor.PurposeProbe:
+			if request.Command.Executable == "codex" {
+				result.Stdout = []byte("codex 0.144.5")
+			} else {
+				result.Stdout = []byte("ok")
+			}
+		case executor.PurposeAgent:
+			prompt := ""
+			if len(request.Command.Args) != 0 {
+				prompt = request.Command.Args[len(request.Command.Args)-1]
+			}
+			legacy, err := agent.Run(ctx, runner.RunRequest{
+				TaskDescription: prompt, WorkspacePath: request.Workspace.HostPath,
+				Env: cloneStringMap(request.Environment),
+			})
+			result = executor.Result{
+				Created: legacy.Started || legacy.Completed, Started: legacy.Started, Completed: legacy.Completed,
+				ExitCode: legacy.ExitCode, Stdout: []byte(legacy.Output),
+				Duration: time.Duration(legacy.Duration * float64(time.Second)), StdoutTruncated: legacy.Truncated,
+			}
+			executeErr = err
+		case executor.PurposeVerification:
+			relative := strings.TrimPrefix(request.Command.Directory, executor.SandboxWorkspaceRoot)
+			relative = strings.TrimPrefix(relative, "/")
+			directory := request.Workspace.HostPath
+			if relative != "" {
+				directory = filepath.Join(directory, filepath.FromSlash(relative))
+			}
+			command := verification.Command{
+				Name: request.Command.Executable, Directory: directory,
+				Executable: request.Command.Executable, Args: append([]string(nil), request.Command.Args...),
+				Environment: cloneStringMap(request.Command.Environment), Timeout: request.Timeout, Required: true,
+			}
+			legacy := verifier.Run(ctx, command, cloneStringMap(request.Environment))
+			result.ExitCode = legacy.ExitCode
+			if !legacy.Passed && result.ExitCode == 0 {
+				result.ExitCode = 1
+			}
+			result.Stdout = []byte(legacy.Output)
+			result.Duration = legacy.Duration
+			result.StdoutTruncated = legacy.Truncated
+			if !legacy.Passed && legacy.FailureClass != "" && legacy.FailureClass != "verification" {
+				executeErr = executor.WrapError(
+					safeCauseCode(legacy.FailureClass, "internal"),
+					safeCauseCode(legacy.CauseCode, "execute"), errors.New("fixture verification failure"),
+				)
+			}
+		}
+		target.SetResult(request.Attempt, result, executeErr)
+	})
+}
+
+func portableSafeFacts(profile workerprofile.Snapshot) map[string]string {
+	if profile.Runtime.Kind == workerprofile.RuntimeHost {
+		return map[string]string{"runtime_kind": "host", "isolated": "false", "certified": "false"}
+	}
+	return map[string]string{
+		"runtime_kind": "oci", "image": profile.Runtime.Image,
+		"platform": profile.Runtime.Platform, "isolated": "true", "certified": "true",
+	}
 }
 
 type recordingRunStore struct {
@@ -864,6 +1018,7 @@ type recordingHarness struct {
 	probeCalls int
 	agentCalls int
 	parseCalls int
+	parse      func(executor.Result) (string, error)
 }
 
 func (*recordingHarness) ID() string      { return "codex" }
@@ -872,19 +1027,29 @@ func (adapter *recordingHarness) Probe() executor.Command {
 	adapter.mu.Lock()
 	adapter.probeCalls++
 	adapter.mu.Unlock()
-	return executor.Command{}
+	return executor.Command{
+		Executable: "codex", Args: []string{"--version"},
+		Directory: executor.SandboxWorkspaceRoot,
+	}
 }
-func (adapter *recordingHarness) AgentCommand(string) (executor.Command, error) {
+func (adapter *recordingHarness) AgentCommand(prompt string) (executor.Command, error) {
 	adapter.mu.Lock()
 	adapter.agentCalls++
 	adapter.mu.Unlock()
-	return executor.Command{}, nil
+	return executor.Command{
+		Executable: "codex", Args: []string{"exec", prompt},
+		Directory: executor.SandboxWorkspaceRoot,
+	}, nil
 }
-func (adapter *recordingHarness) Parse(executor.Result) (string, error) {
+func (adapter *recordingHarness) Parse(result executor.Result) (string, error) {
 	adapter.mu.Lock()
 	adapter.parseCalls++
+	parse := adapter.parse
 	adapter.mu.Unlock()
-	return "", nil
+	if parse != nil {
+		return parse(result)
+	}
+	return string(result.Stdout), nil
 }
 func (*recordingHarness) AcceptsCapability(capability string) bool {
 	return capability == "harness.codex-auth"

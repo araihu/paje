@@ -3,6 +3,7 @@ package acceptance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,10 @@ import (
 	artifactfilesystem "github.com/araihu/paje/internal/artifact/filesystem"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	"github.com/araihu/paje/internal/environment"
+	"github.com/araihu/paje/internal/executor"
+	executormock "github.com/araihu/paje/internal/executor/mock"
+	"github.com/araihu/paje/internal/harness"
+	harnesscodex "github.com/araihu/paje/internal/harness/codex"
 	"github.com/araihu/paje/internal/memory"
 	memorymock "github.com/araihu/paje/internal/memory/mock"
 	"github.com/araihu/paje/internal/policy"
@@ -25,10 +30,15 @@ import (
 	"github.com/araihu/paje/internal/repository"
 	"github.com/araihu/paje/internal/run"
 	runfilesystem "github.com/araihu/paje/internal/run/filesystem"
+	"github.com/araihu/paje/internal/runner"
 	codexrunner "github.com/araihu/paje/internal/runner/codex"
+	"github.com/araihu/paje/internal/secret"
+	secretmock "github.com/araihu/paje/internal/secret/mock"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
+	"github.com/araihu/paje/internal/workerprofile"
+	workerprofilemock "github.com/araihu/paje/internal/workerprofile/mock"
 	"github.com/araihu/paje/internal/workflow/codechange"
 	"github.com/araihu/paje/internal/workspace/gitworktree"
 )
@@ -37,6 +47,87 @@ const (
 	codexAcceptanceRunID  = "paje-beta-codex-acceptance"
 	codexAcceptanceMarker = "PAJE_BETA_CODEX_ACCEPTANCE_TERMINAL_20260725"
 )
+
+func TestCodexAcceptancePortableCompositionReachesResolve(t *testing.T) {
+	sourceRepository, _ := newCodexAcceptanceRepository(t)
+	workspaces, err := gitworktree.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := runfilesystem.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := artifactfilesystem.New(t.TempDir(), 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = artifacts.Close() })
+	environments, err := environment.NewPolicy(environment.Config{
+		RuntimeRoot: t.TempDir(), Source: baselineEnvironment(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	genericProfile, err := repository.NewGenericProfile(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goProfile, err := repository.NewGoProfile(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := verification.NewExecutor(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changePolicy, err := policy.NewChangePolicy(policy.Config{Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	templates, err := template.NewRegistry(templatecodechange.Definition{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	portable := newCodexAcceptancePortableRuntime(t)
+	service, err := codechange.New(codechange.Dependencies{
+		Templates: templates, Runs: runs, Memory: memorymock.NewStore(nil),
+		Resolver: workspaces, Workspaces: workspaces,
+		Profiles:       map[string]repository.Profile{"generic": genericProfile, "go": goProfile},
+		WorkerProfiles: portable.workerProfiles, SecretBindings: portable.secretBindings,
+		Secrets: portable.secrets, Executors: portable.executors, Harnesses: portable.harnesses,
+		Environments: environments, Agent: &recordingRunner{}, Verifier: verifier,
+		Capturer: capturer, Policy: changePolicy, Artifacts: artifacts,
+		Publisher: publishermock.NewPublisher(publisher.Result{}, nil),
+		Clock:     time.Now, NewID: func() string { return "portable-codex-construction" },
+	})
+	if err != nil {
+		t.Fatalf("portable acceptance composition failed before Resolve: %v", err)
+	}
+	raw, err := json.Marshal(templatecodechange.Input{
+		IdempotencyKey: "portable-codex-construction", TaskDescription: "prove portable Resolve",
+		RepositoryURI: sourceRepository, BaseRef: "main", Profile: "go",
+		WorkerProfile: "codex-go@1", Tags: map[string]string{"user_id": "acceptance", "app_id": "portable"},
+		Publication: templatecodechange.Publication{Mode: "artifact"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := service.Resolve(context.Background(), raw)
+	if err != nil || resolved.RunID != "portable-codex-construction" {
+		t.Fatalf("portable acceptance Resolve() result=%#v error=%v", resolved, err)
+	}
+	record, err := runs.Load(context.Background(), resolved.RunID)
+	if err != nil || record.WorkerProfile == nil ||
+		record.WorkerProfile.Metadata != portable.profile.Metadata ||
+		len(record.SecretBindings) != 1 || record.SecretBindings[0].Revision != 1 {
+		t.Fatalf("portable acceptance resolved binding=%#v error=%v", record, err)
+	}
+}
 
 func TestCodexArtifactAcceptance(t *testing.T) {
 	requireOptIn(t, "PAJE_CODEX_INTEGRATION", "the authenticated Codex artifact acceptance test")
@@ -129,6 +220,10 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 		t.Fatalf("create Codex runner: %v", err)
 	}
 	agent := &recordingRunner{delegate: codexDelegate}
+	portable := newCodexAcceptancePortableRuntime(t)
+	configureCodexAcceptanceExecutor(
+		portable.target, environments, agent, verifierDelegate, verifier,
+	)
 	capturer, err := gitcapture.New()
 	if err != nil {
 		t.Fatalf("create Git capture adapter: %v", err)
@@ -151,7 +246,9 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 	service, err := codechange.New(codechange.Dependencies{
 		Templates: registry, Runs: runs, Memory: memoryStore,
 		Resolver: workspaces, Workspaces: workspaces,
-		Profiles:     map[string]repository.Profile{"generic": genericProfile, "go": goProfile},
+		Profiles:       map[string]repository.Profile{"generic": genericProfile, "go": goProfile},
+		WorkerProfiles: portable.workerProfiles, SecretBindings: portable.secretBindings,
+		Secrets: portable.secrets, Executors: portable.executors, Harnesses: portable.harnesses,
 		Environments: environments, Agent: agent, Verifier: verifier,
 		Capturer: capturer, Policy: changePolicy, Artifacts: artifacts,
 		Publisher: publicationProvider, Clock: time.Now,
@@ -170,7 +267,7 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 		MemoryLimit:     1,
 		Tags:            map[string]string{"user_id": "paje-beta", "app_id": "acceptance"},
 		Profile:         "go",
-		EnvironmentKeys: []string{"PAJE_ACCEPTANCE_PID_FILE"},
+		WorkerProfile:   portable.profile.Metadata.String(),
 		Publication:     templatecodechange.Publication{Mode: "artifact"},
 	}
 	rawInput, err := json.Marshal(input)
@@ -211,6 +308,19 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 	}
 	if requests[0].Env["CODEX_HOME"] == "" {
 		t.Fatal("Codex environment omitted explicit CODEX_HOME")
+	}
+	if got := portable.workerProfiles.Requests(); !reflect.DeepEqual(
+		got, []workerprofile.ProfileID{portable.profile.Metadata},
+	) {
+		t.Fatalf("portable worker profile resolutions = %#v", got)
+	}
+	leaseRequests := portable.secrets.Requests()
+	if len(leaseRequests) != 1 ||
+		leaseRequests[0].ProfileID != portable.profile.Metadata ||
+		leaseRequests[0].Binding != 1 ||
+		!reflect.DeepEqual(portable.secrets.Revocations(), []string{"codex-acceptance-lease"}) {
+		t.Fatalf("portable exact lease lifecycle = requests %#v revocations %#v",
+			leaseRequests, portable.secrets.Revocations())
 	}
 	pidData, err := os.ReadFile(agentPIDFile)
 	if err != nil {
@@ -354,6 +464,225 @@ func TestCodexArtifactAcceptance(t *testing.T) {
 		!strings.Contains(memories[1].Content, result.Artifact.Digest) {
 		t.Fatalf("durable outcome memory = %#v", memories)
 	}
+}
+
+type codexAcceptancePortableRuntime struct {
+	profile        workerprofile.Snapshot
+	workerProfiles *workerprofilemock.Registry
+	secretBindings *codexAcceptanceSecretRegistry
+	secrets        *secretmock.Broker
+	executors      *executor.Registry
+	harnesses      *harness.Registry
+	target         *executormock.Executor
+}
+
+func newCodexAcceptancePortableRuntime(t *testing.T) codexAcceptancePortableRuntime {
+	t.Helper()
+	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
+		APIVersion: workerprofile.APIVersionV1Alpha1,
+		Kind:       workerprofile.KindWorkerProfile,
+		Metadata:   workerprofile.ProfileID{Name: "codex-go", Revision: 1},
+		Runtime: workerprofile.Runtime{
+			Kind: workerprofile.RuntimeOCI, Image: "example.invalid/paje-codex@sha256:" + strings.Repeat("a", 64),
+			Platform: "linux/amd64", Network: workerprofile.NetworkOutbound, ReadOnlyRoot: true,
+		},
+		Resources: workerprofile.Resources{CPUMillis: 4000, MemoryBytes: 8 << 30, PIDs: 512},
+		Harness:   workerprofile.Harness{ID: harnesscodex.ID, Version: harnesscodex.SupportedVersion},
+		Secrets: []workerprofile.SecretRequirement{{
+			Capability: "harness.codex-auth", BindingRevision: 1, Stage: workerprofile.StageAgent,
+			Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex", Required: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("canonicalize Codex acceptance worker profile: %v", err)
+	}
+	bindingRef := secret.BindingRef{Capability: "harness.codex-auth", Revision: 1}
+	binding, err := secret.NewBinding(bindingRef, secret.Authorization{
+		ProfileID: profile.Metadata, Stage: workerprofile.StageAgent,
+		Delivery: workerprofile.DeliveryDirectory, Target: "/run/paje/secrets/codex",
+	}, "filesystem", "/acceptance/codex-auth")
+	if err != nil {
+		t.Fatalf("create Codex acceptance secret binding: %v", err)
+	}
+	authFile, err := secret.NewFile(
+		"auth.json", 0o600,
+		[]byte("paje-codex-acceptance-secret-material-5e2ad1ab"),
+	)
+	if err != nil {
+		t.Fatalf("create Codex acceptance secret file: %v", err)
+	}
+	materialization, err := secret.NewDirectoryMaterialization(
+		"/run/paje/secrets/codex", []secret.File{authFile},
+	)
+	authFile.Zero()
+	if err != nil {
+		t.Fatalf("create Codex acceptance secret materialization: %v", err)
+	}
+	lease, err := secret.NewLease("codex-acceptance-lease", time.Now().Add(time.Hour), materialization)
+	materialization.Destroy()
+	if err != nil {
+		t.Fatalf("create Codex acceptance secret lease: %v", err)
+	}
+	broker := secretmock.NewBroker()
+	broker.SetAcquireResult(bindingRef.Capability, lease, nil)
+	lease.Destroy()
+
+	target := executormock.New()
+	executors, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+	})
+	if err != nil {
+		t.Fatalf("create Codex acceptance executor registry: %v", err)
+	}
+	adapter, err := harnesscodex.New(harnesscodex.SupportedVersion)
+	if err != nil {
+		t.Fatalf("create Codex acceptance harness: %v", err)
+	}
+	harnesses, err := harness.NewRegistry(adapter)
+	if err != nil {
+		t.Fatalf("create Codex acceptance harness registry: %v", err)
+	}
+	return codexAcceptancePortableRuntime{
+		profile: profile, workerProfiles: workerprofilemock.NewRegistry(profile),
+		secretBindings: &codexAcceptanceSecretRegistry{binding: binding},
+		secrets:        broker, executors: executors, harnesses: harnesses, target: target,
+	}
+}
+
+type codexAcceptanceSecretRegistry struct {
+	binding secret.Binding
+}
+
+func (registry *codexAcceptanceSecretRegistry) Resolve(
+	ctx context.Context,
+	request secret.ResolveRequest,
+) (secret.Binding, error) {
+	if err := ctx.Err(); err != nil {
+		return secret.Binding{}, err
+	}
+	if registry == nil || !registry.binding.Authorizes(request) {
+		return secret.Binding{}, secret.ErrBindingUnauthorized
+	}
+	return registry.binding, nil
+}
+
+func configureCodexAcceptanceExecutor(
+	target *executormock.Executor,
+	environments environment.Builder,
+	agent runner.Runner,
+	preflight verification.Runner,
+	verifier verification.Runner,
+) {
+	target.SetBeforeExecute(func(ctx context.Context, request executor.Request) {
+		result, err := executeCodexAcceptanceRequest(
+			ctx, request, environments, agent, preflight, verifier,
+		)
+		target.SetResult(request.Attempt, result, err)
+		result.Destroy()
+	})
+}
+
+func executeCodexAcceptanceRequest(
+	ctx context.Context,
+	request executor.Request,
+	environments environment.Builder,
+	agent runner.Runner,
+	preflight verification.Runner,
+	verifier verification.Runner,
+) (executor.Result, error) {
+	stage := environment.StageVerification
+	requestedKeys := []string(nil)
+	if request.Attempt.Purpose == executor.PurposeAgent {
+		stage = environment.StageAgent
+		requestedKeys = []string{"PAJE_ACCEPTANCE_PID_FILE"}
+	}
+	built, err := environments.Build(ctx, environment.Request{
+		RunID: request.Attempt.RunID, Stage: stage, RequestedKeys: requestedKeys,
+	})
+	if err != nil {
+		return executor.Result{}, err
+	}
+	var execution executor.Result
+	var executeErr error
+	switch request.Attempt.Purpose {
+	case executor.PurposeAgent:
+		if len(request.Command.Args) == 0 {
+			executeErr = errors.New("Codex acceptance agent prompt is missing")
+			break
+		}
+		legacy, runErr := agent.Run(ctx, runner.RunRequest{
+			TaskDescription: request.Command.Args[len(request.Command.Args)-1],
+			WorkspacePath:   request.Workspace.HostPath,
+			Env:             built.Values,
+		})
+		execution = executor.Result{
+			Created: legacy.Started, Started: legacy.Started, Completed: legacy.Completed,
+			ExitCode: legacy.ExitCode, Stdout: []byte(legacy.Transcript),
+			Duration:        time.Duration(legacy.Duration * float64(time.Second)),
+			StdoutTruncated: legacy.Truncated,
+		}
+		executeErr = runErr
+	case executor.PurposeProbe, executor.PurposeVerification:
+		directory, directoryErr := codexAcceptanceHostDirectory(
+			request.Workspace.HostPath, request.Command.Directory,
+		)
+		if directoryErr != nil {
+			executeErr = directoryErr
+			break
+		}
+		command := verification.Command{
+			Name: request.Command.Executable, Directory: directory,
+			Executable: request.Command.Executable, Args: append([]string(nil), request.Command.Args...),
+			Environment: cloneMap(request.Command.Environment),
+			Timeout:     request.Timeout, Required: true,
+		}
+		delegate := preflight
+		if request.Attempt.Purpose == executor.PurposeVerification {
+			delegate = verifier
+		}
+		verified := delegate.Run(ctx, command, built.Values)
+		execution = executor.Result{
+			Created: true, Started: true, Completed: true,
+			ExitCode: verified.ExitCode, Stdout: []byte(verified.Output), Duration: verified.Duration,
+			StdoutTruncated: verified.Truncated,
+		}
+		if !verified.Passed && execution.ExitCode == 0 {
+			execution.ExitCode = 1
+		}
+		if request.Attempt.Purpose == executor.PurposeProbe && request.Attempt.Sequence == 0 {
+			execution.SafeFacts = map[string]string{
+				"runtime_kind": workerprofile.RuntimeOCI,
+				"image":        request.Profile.Runtime.Image,
+				"platform":     request.Profile.Runtime.Platform,
+				"isolated":     "true",
+				"certified":    "false",
+			}
+		}
+	default:
+		executeErr = errors.New("unsupported Codex acceptance executor purpose")
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	cleanupErr := environments.Cleanup(cleanupCtx, request.Attempt.RunID)
+	cancel()
+	return execution, errors.Join(executeErr, cleanupErr)
+}
+
+func codexAcceptanceHostDirectory(workspacePath, sandboxDirectory string) (string, error) {
+	const root = executor.SandboxWorkspaceRoot
+	relative := "."
+	switch {
+	case sandboxDirectory == root:
+	case strings.HasPrefix(sandboxDirectory, root+"/"):
+		relative = strings.TrimPrefix(sandboxDirectory, root+"/")
+	default:
+		return "", errors.New("Codex acceptance sandbox directory is outside the workspace")
+	}
+	directory := filepath.Clean(filepath.Join(workspacePath, filepath.FromSlash(relative)))
+	contained, err := filepath.Rel(filepath.Clean(workspacePath), directory)
+	if err != nil || contained == ".." || strings.HasPrefix(contained, ".."+string(filepath.Separator)) {
+		return "", errors.New("Codex acceptance host directory escapes the workspace")
+	}
+	return directory, nil
 }
 
 func newCodexAcceptanceRepository(t *testing.T) (string, string) {

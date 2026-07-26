@@ -10,7 +10,33 @@ import (
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/artifact/gitcapture"
 	"github.com/araihu/paje/internal/policy"
+	"github.com/araihu/paje/internal/secret"
+	"github.com/araihu/paje/internal/workerprofile"
 )
+
+func TestChangePolicyDetectsTransientExactSecretWithoutPersistingIt(t *testing.T) {
+	materialization, err := secret.NewValueMaterialization(
+		workerprofile.DeliveryEnvironment, "WORKLOAD_TOKEN", []byte("exact-transient-secret"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detector := secret.NewDetector(materialization)
+	materialization.Destroy()
+	defer detector.Destroy()
+	result := gitcapture.Result{
+		Patch:   []byte("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+exact-transient-secret\n"),
+		Changes: []artifact.Change{{Path: "x", Status: "A", NewMode: "100644"}},
+	}
+
+	decision := policy.DetectSecretMaterial(context.Background(), result, detector)
+	if decision.Allowed || !hasRule(decision, "secret-capability") {
+		t.Fatalf("DetectSecretMaterial() = %#v, want generic denial", decision)
+	}
+	if strings.Contains(fmt.Sprint(decision.Findings), "exact-transient-secret") {
+		t.Fatalf("secret finding leaked exact value: %#v", decision.Findings)
+	}
+}
 
 func TestChangePolicyDeniesUnsafePathsModesAndCredentialFiles(t *testing.T) {
 	evaluator, err := policy.NewChangePolicy(policy.Config{})

@@ -12,16 +12,22 @@ import (
 var errPromptTooLarge = errors.New("agent prompt exceeds configured limit")
 
 type promptInput struct {
-	Task    string
-	BaseSHA string
-	Profile string
-	Facts   map[string]string
-	Memory  []memory.Memory
+	Task                string
+	BaseSHA             string
+	Profile             string
+	WorkerProfile       string
+	WorkerProfileDigest string
+	Facts               map[string]string
+	Memory              []memory.Memory
 }
 
 func buildPrompt(input promptInput, limit int) (string, error) {
 	var prompt strings.Builder
-	fmt.Fprintf(&prompt, "Task\n%s\n\nRepository\nBase SHA: %s\nProfile: %s\n\n", input.Task, input.BaseSHA, input.Profile)
+	fmt.Fprintf(&prompt, "Task\n%s\n\nRepository\nBase SHA: %s\nProfile: %s\n", input.Task, input.BaseSHA, input.Profile)
+	if input.WorkerProfile != "" {
+		fmt.Fprintf(&prompt, "Worker profile: %s\nWorker profile digest: %s\n", input.WorkerProfile, input.WorkerProfileDigest)
+	}
+	prompt.WriteString("\n")
 	prompt.WriteString("Constraints\n")
 	prompt.WriteString("- Work only inside the current workspace.\n")
 	prompt.WriteString("- Do not publish, push, merge, tag, or read external credentials.\n")
