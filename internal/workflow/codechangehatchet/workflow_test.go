@@ -21,7 +21,7 @@ import (
 func TestNewNamesWorkflow(t *testing.T) {
 	factory := &recordingWorkflowFactory{declaration: &recordingDeclaration{}}
 	buildWorkflow(factory, &fakeService{})
-	if factory.name != "paje-code-change-v1" {
+	if WorkflowName != "paje-code-change-v1" || factory.name != WorkflowName {
 		t.Fatalf("workflow name = %q", factory.name)
 	}
 	if factory.options.idempotency == nil ||
@@ -55,7 +55,7 @@ func TestNewProducesSDKDeclarationWithoutServer(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	dump, handlers, durableHandlers, _ := got.Dump()
-	if dump.GetName() != "paje-code-change-v1" {
+	if dump.GetName() != WorkflowName {
 		t.Fatalf("workflow name = %q", dump.GetName())
 	}
 	if len(dump.GetTasks()) != 5 || len(handlers) != 4 || len(durableHandlers) != 1 {

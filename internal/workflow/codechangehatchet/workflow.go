@@ -12,7 +12,9 @@ import (
 )
 
 const (
-	workflowName           = "paje-code-change-v1"
+	// WorkflowName is shared by the declaration and provider trigger adapter so
+	// the durable workflow binding cannot drift.
+	WorkflowName           = "paje-code-change-v1"
 	workflowIdempotencyTTL = 30 * 24 * time.Hour
 )
 
@@ -61,7 +63,7 @@ func New(client *hatchet.Client, service *codechange.Service) (*hatchet.Workflow
 }
 
 func buildWorkflow(factory workflowFactory, service phaseService) {
-	declareWorkflow(factory.newWorkflow(workflowName, workflowOptions{
+	declareWorkflow(factory.newWorkflow(WorkflowName, workflowOptions{
 		idempotency: &hatchet.IdempotencyConfig{
 			Expression: "input.run_id",
 			Method:     hatchet.IdempotencyMethodStatus,

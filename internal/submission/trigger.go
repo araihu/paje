@@ -14,7 +14,9 @@ type TriggerRequest struct {
 	Input json.RawMessage
 }
 
-// TriggerState is a provider-neutral provider observation.
+// TriggerState is a provider-neutral provider observation. Terminal states
+// must include a Result with the same run and terminal status; nonterminal
+// states must not include one.
 type TriggerState struct {
 	Status Status
 	Result *templatecodechange.Result
