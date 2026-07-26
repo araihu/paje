@@ -1,0 +1,13 @@
+api_version: paje.araihu.com/v1alpha1
+kind: SecretBindings
+bindings:
+  harness.codex-auth:
+    revision: 1
+    authorize:
+      profile: codex-go@1
+      stage: agent
+      delivery: directory
+      target: /run/paje/secrets/codex
+    source:
+      provider: filesystem
+      reference: /etc/paje/secrets/codex

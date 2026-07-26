@@ -1,0 +1,43 @@
+api_version: paje.araihu.com/v1alpha1
+kind: WorkerProfile
+metadata:
+  name: codex-go
+  revision: 1
+runtime:
+  kind: oci
+  image: ${IMAGE_REFERENCE}@${IMAGE_DIGEST}
+  platform: ${PLATFORM}
+  network: outbound
+  read_only_root: true
+resources:
+  cpu_millis: 2000
+  memory_bytes: 4294967296
+  pids: 256
+harness:
+  id: codex
+  version: 0.144.5
+tools:
+  - name: git
+    version: 2.49.1
+    probe:
+      executable: git
+      args: ["--version"]
+      output_contains: git version 2.49.1
+  - name: go
+    version: 1.26.1
+    probe:
+      executable: go
+      args: ["version"]
+      output_contains: go1.26.1
+  - name: node
+    version: 24.4.1
+    probe:
+      executable: node
+      args: ["--version"]
+      output_contains: v24.4.1
+secrets:
+  - capability: harness.codex-auth
+    stage: agent
+    delivery: directory
+    target: /run/paje/secrets/codex
+    required: true
