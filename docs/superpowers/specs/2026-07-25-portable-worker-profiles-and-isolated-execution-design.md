@@ -9,6 +9,12 @@ the approved
 [`agent-piloted submission and harness`](./2026-07-25-agent-piloted-submission-and-harness-support-design.md)
 design.
 
+The agent-piloted design now defines a provider-neutral durable Agent Control
+Plane above this substrate. This portable runtime remains an approved required
+foundation; the correction does not delete or redesign its worker-profile,
+secret-broker, executor, sandbox, artifact, approval, or publisher security
+boundaries.
+
 The current implementation remains authoritative until this design has an
 approved implementation plan and its acceptance gates pass. The user confirmed
 that `code-change@v1` has no external consumers or production run records, so
@@ -44,9 +50,67 @@ Pajé therefore needs a provider-neutral worker contract that declares an exact
 runtime, toolchain, harness, and logical secret set while keeping secret values
 and backend-specific objects out of workflow input and durable records.
 
+## Relationship to the Agent Control Plane
+
+This design proves isolated execution of one leaf command or
+`code-change@v1` attempt. Fixed workflow phases and a single Codex process are
+not sufficient agent-facing orchestration. They do not own a durable
+`ControlRun`, `TaskGraph`, `Task`, `ProjectRef`, ownership,
+`PlacementAttempt`, persistent `AgentSession`, mailbox/event cursor, evidence,
+disposition, or close state.
+
+The Agent Control Plane decides which ready task should run and which
+parallelism primitive should own it. A persistent agent session may invoke
+leaf workflows that use the worker profile, secret broker, and executor in this
+design. Ephemeral subagents and harness-native bounded fan-out may perform
+eligible coordination work without becoming executor commands. Local/sequential
+work remains in the control agent. Each choice creates a durable
+`PlacementAttempt`; only the persistent choice creates an `AgentSession`. The
+agent-work lifecycle never gains an arbitrary command API; repository commands
+continue through `Executor`.
+
+Every control-plane task that reaches this layer has already recorded
+`execution_placement`, `parallelism_primitive`, `placement_rationale`,
+`capability_requirements`, `lifecycle_owner`, and `fallback`. The exact
+provider-neutral primitive values are `persistent_session`,
+`ephemeral_subagent`, `harness_native_parallel`, and `local_sequential`. The
+placement decision considers
+duration/complexity, filesystem/branch/project isolation, ownership
+independence, shared context, restart survival, communication/steering/
+monitoring, creation cost, concurrency limits, conflict risk, and handoff/audit.
+
+For Codex:
+
+- long, restartable, mutating, isolated, cross-project, or audit-heavy work
+  prefers a persistent user-visible worktree-backed session;
+- short read-only investigation/review with strongly shared context and no
+  ownership conflict may use an ephemeral subagent;
+- another advertised Codex bounded fan-out may be used for homogeneous work
+  only after capability, limit, cancellation, and result semantics are
+  verified; and
+- dependent, overlapping, integration-owned, or uneconomic work remains
+  local/sequential.
+
+Placement is re-evaluated when the work or capability set changes. A growing
+subagent is checkpointed and promoted to a persistent session with an explicit
+handoff and lifecycle-owner transfer. Missing capabilities use the recorded
+safe fallback; isolation-required work may block rather than downgrade.
+Ephemeral subagents are read-only by default, and no two placements may mutate
+overlapping ownership. These requirements are part of Agent Control Plane
+acceptance even though their scheduler is outside this portable-runtime slice.
+
+Primitive closure is equally capability-aware: persistent sessions require the
+runtime-ID handshake, callback plus cursor-aware polling, and archive receipt;
+ephemeral subagents use optional identity/ack/send/callback only when advertised
+and require wait/read terminal plus runtime-close evidence; native fan-out
+requires bounded deterministic aggregation or cancel evidence without synthetic
+session identity; local/sequential work creates no child and must be inactive.
+The control run closes only when every field of its typed pending-work gate is
+zero.
+
 ## Goals
 
-- Separate Pajé orchestration from agent and repository toolchains.
+- Separate Pajé coordination services from agent and repository toolchains.
 - Make the execution environment an explicit, immutable input to each run.
 - Let operators define versioned worker profiles without embedding secret
   values in those profiles.
@@ -83,7 +147,7 @@ and backend-specific objects out of workflow input and durable records.
 
 ### Coordinator
 
-The trusted Pajé process that owns workflow orchestration, durable state,
+The trusted Pajé process that owns leaf-workflow coordination, durable state,
 memory access, workspace preparation, policy, artifact capture, approval, and
 publication. It may contain infrastructure Git tooling, but it contains no
 agent harness or repository language runtime.
@@ -158,7 +222,9 @@ domain boundary.
 
 ```mermaid
 flowchart LR
-    Trigger["Hatchet or future trigger"] --> Coordinator["Pajé coordinator"]
+    ControlPlane["Durable Agent Control Plane"] --> AgentHarness["Capability-aware AgentHarness"]
+    ControlPlane --> Trigger["Leaf workflow trigger"]
+    Trigger --> Coordinator["Pajé coordinator"]
     Coordinator --> ProfileRegistry["Worker profile registry"]
     Coordinator --> SecretBroker["Secret broker"]
     Coordinator --> Executor["Executor port"]
@@ -180,6 +246,10 @@ flowchart LR
     Coordinator --> ArtifactStore["Run and artifact stores"]
     Coordinator --> Publisher["Isolated publisher"]
 ```
+
+`AgentHarness` is shown only to locate the boundary; its lifecycle is
+specified in the Agent Control Plane design. This document owns the path from a
+leaf trigger through the coordinator and executor.
 
 The coordinator has no dependency on Docker request or response types. The
 executor port accepts only validated domain values and returns bounded,
@@ -273,6 +343,13 @@ declared version must exactly match the probed executable version. The harness
 adapter owns the deterministic executable and argument vector, machine-readable
 completion protocol, and final-result parser. A profile cannot replace those
 arguments with arbitrary commands.
+
+This is the execution-harness contract. The Agent Control Plane has a separate
+provider-neutral `AgentHarness` for capability-aware dispatch, observe, send,
+wait, interrupt/cancel, and primitive-specific close. `AgentSession` is only
+its persistent-session specialization. Expanding that boundary does not add
+command execution to it and does not weaken this execution-harness/executor
+isolation.
 
 Tools are operator assertions verified by bounded, shell-free probes before
 secret materialization. A probe has one executable, an argument array, a
@@ -882,6 +959,15 @@ This design is implemented only when evidence proves all of the following:
     conformance and live acceptance.
 15. Existing durable workflow, approval, publisher, memory, artifact, race,
     vet, cross-build, chart, image, and live acceptance gates remain green.
+16. Agent Control Plane acceptance proves every task records its execution
+    placement, primitive, rationale, capability requirements, lifecycle owner,
+    and fallback; the concrete Codex mapping, promotion, missing-capability
+    fallback, concurrency limits, and overlapping-subagent mutation denial all
+    pass.
+17. Portable executor acceptance remains a lower-layer gate and is never used
+    as evidence that placement-attempt lifecycle, persistent-session archive,
+    ephemeral runtime close, native fan-out aggregation, multi-project
+    orchestration, or typed zero-pending-work closure is complete.
 
 ## Future Extensions
 

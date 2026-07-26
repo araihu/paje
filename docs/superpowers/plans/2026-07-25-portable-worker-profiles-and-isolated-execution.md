@@ -14,6 +14,8 @@ secret-broker, and executor ports. Each probe, agent invocation, verification,
 and publisher re-verification runs in a distinct sandbox; the Docker adapter
 materializes commands and agent-only secrets in private container `tmpfs`
 storage, while the host adapter is explicit, secret-free, and development-only.
+This is the isolated leaf-execution foundation beneath the separate durable
+Agent Control Plane; it is not itself multi-agent session orchestration.
 
 **Tech Stack:** Go 1.26.1, `gopkg.in/yaml.v3` strict decoding,
 `github.com/moby/moby/client` v0.5.0, Docker Engine through a local Unix socket,
@@ -67,21 +69,37 @@ regression suite.
 - Existing artifact, approval, publication, memory, fencing, cancellation,
   race, vet, cross-build, chart, image, and opt-in GitHub gates must remain
   green.
+- The higher-level Agent Control Plane owns capability negotiation and records
+  each task's execution placement, parallelism primitive, rationale, capability
+  requirements, lifecycle owner, and fallback plus one durable
+  `PlacementAttempt` before invoking this layer.
+- Execution placement never weakens the worker-profile, secret-broker,
+  executor, sandbox, or publisher boundary. Agent-harness lifecycle and
+  subagent coordination do not gain arbitrary command execution.
 
 ---
 
-## Control-Plane Execution Model
+## Implementation Coordination Model (Not Product Runtime)
 
-This control task owns the integration branch and dispatches five disposable
-worktree-backed Codex tasks in dependency order:
+This historical implementation control task owns the integration branch and
+dispatches five disposable worktree-backed Codex tasks in dependency order. It
+is a development-session coordination plan, not the Pajé Agent Control Plane
+runtime:
 
-| Worker session | Plan tasks | Integrated deliverable |
-| --- | --- | --- |
-| `contracts` | 1-2 | Worker-profile and secret-binding contracts and registries |
-| `execution-core` | 3-5 | Executor conformance, harness protocol, sandbox init, and host adapter |
-| `docker-runtime` | 6-7 | Docker adapter, secure materialization, split images, and profile fixture |
-| `workflow` | 8-10 | Durable resolution, execute/recovery flow, and publisher re-verification |
-| `product` | 11-12 | Composition, configuration, adversarial/live gates, docs, site, and Helm |
+| Worker session | Plan tasks | Placement | Rationale | Integrated deliverable |
+| --- | --- | --- | --- | --- |
+| `contracts` | 1-2 | `persistent_session` | Long, mutating contract work with independent review and restart value | Worker-profile and secret-binding contracts and registries |
+| `execution-core` | 3-5 | `persistent_session` | Long isolated implementation over exclusive packages | Executor conformance, harness protocol, sandbox init, and host adapter |
+| `docker-runtime` | 6-7 | `persistent_session` | Runtime isolation, Docker side effects, and standalone proof | Docker adapter, secure materialization, split images, and profile fixture |
+| `workflow` | 8-10 | `persistent_session` | Durable-state mutation and restart-heavy acceptance | Durable resolution, execute/recovery flow, and publisher re-verification |
+| `product` | 11-12 | `persistent_session` | Broad but exclusively owned integration slice with live gates | Composition, configuration, adversarial/live gates, docs, site, and Helm |
+
+Each row's durable dispatch record also contains
+`execution_placement=worktree_backed`, `parallelism_primitive`,
+`placement_rationale`, `capability_requirements`, `lifecycle_owner`,
+`fallback`, exact ownership, and concurrency budget. These five cuts
+prefer persistent sessions because they are long, mutating, independently
+testable, worktree-isolated, and restart/audit worthy.
 
 For each session the control task:
 
@@ -101,6 +119,62 @@ For each session the control task:
 No worker task receives release, GitHub, Hatchet, Mem0, registry, or publisher
 credentials. The final product session may run local Docker acceptance but may
 not push images, branches, or releases.
+
+## Agent Control Plane Placement Contract
+
+The production Agent Control Plane must not copy the fixed five-session layout.
+For every task it negotiates the current harness capability set and selects
+exactly one provider-neutral primitive:
+
+- `persistent_session` for long, restartable, mutating, isolated,
+  independently owned, cross-project, steering-heavy, or audit-critical work;
+- `ephemeral_subagent` for short investigation/review, normally read-only,
+  strongly shared context, and no conflicting ownership;
+- `harness_native_parallel` for homogeneous bounded fan-out whose advertised
+  limits, cancellation, identity, and results are verified; or
+- `local_sequential` for dependencies, shared files, integration ownership,
+  uncertain cuts, high conflict risk, or work too small to repay coordination.
+
+For Codex, these map respectively to a user-visible worktree-backed task/thread,
+a local same-session subagent, another discovered bounded Codex parallel
+capability, and the current control agent. The choice must evaluate duration/
+complexity, filesystem/branch/project isolation, ownership independence,
+shared context, restart survival, communication/steering/monitoring, creation
+cost, concurrency limits, conflict risk, and handoff/audit needs.
+
+Every task record requires `execution_placement`, `parallelism_primitive`,
+`placement_rationale`, `capability_requirements`, `lifecycle_owner`, and
+`fallback`.
+Capability absence follows that fallback: isolation-required or cross-project
+mutation blocks rather than silently becoming a subagent; bounded fan-out falls
+back to persistent or sequential work; absent subagents fall back to
+sequential; exhausted concurrency queues deterministically.
+
+Placement is re-evaluated after scope or capability changes. A growing
+subagent is stopped at a safe checkpoint and promoted to a persistent session
+through an explicit evidence handoff and lifecycle-owner transfer. Ephemeral
+subagents are read-only by default; a mutating one requires exclusive
+ownership, and no two subagents or mixed placements may mutate the same files
+or resources. Placement records, Codex mapping, promotion, fallback,
+concurrency, and overlap denial are mandatory acceptance gates.
+
+Every selection also creates a durable `PlacementAttempt` with the capability
+snapshot, actual runtime IDs returned, lifecycle actions, terminal evidence,
+disposition, and primitive-specific close evidence. The capability-aware
+`AgentHarness` contract is:
+
+- persistent session: exact runtime-ID registration/acknowledgement,
+  send/read/wait/interrupt, callback plus cursor polling, and archive receipt;
+- ephemeral subagent: optional returned runtime ID and capability-gated
+  ack/send/callback, but mandatory wait/read terminal and runtime-close evidence
+  without archive;
+- native parallel: bounded deterministic dispatch, exact aggregation, and
+  defined cancel semantics without invented child/session identity; and
+- local sequential: no child creation and an explicit inactive-local marker.
+
+Closure requires every persistent session archived, every ephemeral runtime
+closed, every native fan-out terminally aggregated or canceled, no local work
+active, and every field of the typed pending-work gate zero.
 
 ## File Map
 
@@ -573,6 +647,10 @@ git commit -m "feat: define isolated executor lifecycle"
 - Produces: `harness.Adapter`, `harness.Registry`, `codex.New`, and the exact
   `sandboxinit.Document` archive protocol.
 - Consumed by: Tasks 6, 8, 9, and 11.
+- This is the execution-harness command/parser contract. The separate Agent
+  Control Plane `AgentHarness` owns capability-aware dispatch/observe/send/wait/
+  interrupt-or-cancel/close, with `AgentSession` only for persistent sessions,
+  and does not execute commands.
 
 - [ ] **Step 1: Write deterministic command/parser and protocol tests**
 
@@ -1365,7 +1443,7 @@ git commit -m "docs: publish portable worker support"
 
 ---
 
-## Final Control-Plane Verification
+## Final Portable-Runtime Control-Task Verification
 
 After integrating and archiving all five worker sessions, the control task must:
 
@@ -1374,7 +1452,7 @@ After integrating and archiving all five worker sessions, the control task must:
 3. inspect Docker for any Pajé-labeled containers, networks, or volumes left by
    acceptance and remove only exact test-owned resources after confirming their
    labels;
-4. review the implementation bidirectionally against all fifteen design
+4. review the implementation bidirectionally against all seventeen design
    acceptance criteria;
 5. run a fresh security-focused diff review of profile, secret, executor,
    workflow, publisher, image, and chart boundaries;
@@ -1382,5 +1460,13 @@ After integrating and archiving all five worker sessions, the control task must:
    never as passing;
 7. use `superpowers:finishing-a-development-branch` to present integration
    options only after all required local gates pass; and
-8. mark the control-plane goal complete only when the specification is fully
-   implemented, no worker task remains active, and no required work remains.
+8. verify the consumer Agent Control Plane tests every required placement
+   field, the concrete Codex primitive mapping, subagent-to-session promotion,
+   missing-capability fallback, concurrency limits, and overlapping mutable
+   subagent denial, plus durable attempts and primitive-specific close evidence
+   for persistent sessions, ephemeral subagents, native fan-out, and local
+   sequential work; and
+9. mark this portable-runtime implementation goal complete only when the
+   specification is fully implemented, no worker task remains active, and no
+   required work remains. Do not present this lower-layer completion as proof
+   that the separate Agent Control Plane runtime is complete.
