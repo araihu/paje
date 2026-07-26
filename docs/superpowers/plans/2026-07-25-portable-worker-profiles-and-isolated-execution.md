@@ -122,8 +122,8 @@ not push images, branches, or releases.
   leases, and non-serializability guards.
 - `internal/secret/registry.go`: strict operator binding and authorization
   contract.
-- `internal/secret/filesystem/registry.go`: atomic binding-file registry that
-  retains previously loaded revisions.
+- `internal/secret/filesystem/registry.go`: atomic strict-YAML binding-directory
+  registry that retains previously loaded revisions.
 - `internal/secret/provider.go`: bounded source-provider port.
 - `internal/secret/provider/filesystem.go`: descriptor-anchored regular-file and
   symlink-free directory reads.
@@ -393,27 +393,35 @@ and overwrite broker-owned bytes during revocation.
 
 - [ ] **Step 4: Implement the strict binding registry and bounded providers**
 
-The binding YAML authorizes one exact tuple:
+Each operator-owned `.yaml` or `.yml` file uses the approved versioned wrapper.
+The `bindings` map may contain multiple capabilities, with one revision of each
+capability per file. Additional immutable revisions use additional files in the
+same configured directory; the registry aggregates the directory and rejects a
+duplicate `(capability, revision)` pair.
 
 ```yaml
-capability: harness.codex-auth
-revision: 1
-authorize:
-  profile: codex-go@1
-  stage: agent
-  delivery: directory
-  target: /run/paje/secrets/codex
-source:
-  provider: filesystem
-  reference: /etc/paje/secrets/codex
+api_version: paje.araihu.com/v1alpha1
+kind: SecretBindings
+bindings:
+  harness.codex-auth:
+    revision: 1
+    authorize:
+      profile: codex-go@1
+      stage: agent
+      delivery: directory
+      target: /run/paje/secrets/codex
+    source:
+      provider: filesystem
+      reference: /etc/paje/secrets/codex
 ```
 
 Reject reserved capability namespaces, duplicate revisions, optional secrets,
 non-agent stages, target mismatch, symlinks, devices, sockets, oversized values,
 oversized trees, unsafe modes/owners, path escapes, and environment source keys
-outside the operator allowlist. Reload atomically and retain every previously
-loaded revision in the in-memory catalog so active runs survive file removal
-until process restart.
+outside the operator allowlist. Require exactly one strict wrapper document and
+EOF per file, reject symlinked entries, build the complete directory snapshot
+before swapping it, and retain every previously loaded revision in the in-memory
+catalog so active runs survive file removal until process restart.
 
 - [ ] **Step 5: Implement acquisition, revocation, and exact/reversible detection**
 
@@ -1210,7 +1218,7 @@ Expected: FAIL because composition still selects a global code-change runner.
 
 - [ ] **Step 3: Replace code-change composition inputs**
 
-Load explicit profile directory, binding file, environment-secret source
+Load explicit profile directory, binding directory, environment-secret source
 allowlist, environment-delivery target allowlist, provider byte/tree limits,
 executor kind, Unix endpoint, registry-auth file, host-enabled flag, and
 production-only flag. Construct worker-profile and binding registries, secret
