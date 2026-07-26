@@ -325,6 +325,15 @@ type ProfileID struct {
     Revision uint64 `json:"revision" yaml:"revision"`
 }
 
+type SecretRequirement struct {
+    Capability      string `json:"capability" yaml:"capability"`
+    BindingRevision uint64 `json:"binding_revision" yaml:"binding_revision"`
+    Stage           string `json:"stage" yaml:"stage"`
+    Delivery        string `json:"delivery" yaml:"delivery"`
+    Target          string `json:"target" yaml:"target"`
+    Required        bool   `json:"required" yaml:"required"`
+}
+
 type Snapshot struct {
     APIVersion string              `json:"api_version" yaml:"api_version"`
     Kind       string              `json:"kind" yaml:"kind"`
@@ -1068,7 +1077,8 @@ type Record struct {
 
 Deep-clone both fields. Require them together once Resolve succeeds, bind the
 snapshot ID to canonical input, require the digest to match canonical content,
-require one exact binding per declared capability, forbid provider/source
+require one exact binding per declared capability and its independently pinned
+positive `SecretRequirement.BindingRevision`, forbid provider/source
 fields by type construction, and make the fields write-once across every CAS
 transition and filesystem round trip.
 
@@ -1077,7 +1087,8 @@ transition and filesystem round trip.
 Extend `codechange.Dependencies` with `WorkerProfiles`, `SecretBindings`,
 `Executors`, and `Harnesses`. During Resolve: parse exact ID, resolve snapshot,
 select and validate executor/harness, resolve every exact binding authorization,
-then persist snapshot/digest/capability/binding evidence before memory lookup.
+using only the profile requirement's exact `BindingRevision` (never the profile
+revision), then persist snapshot/digest/capability/binding evidence before memory lookup.
 Tests must prove no broker acquire, image pull, probe, or executor call occurs.
 
 - [ ] **Step 6: Run, format, and commit Task 8**

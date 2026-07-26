@@ -317,6 +317,7 @@ tools:
 
 secrets:
   - capability: harness.codex-auth
+    binding_revision: 1
     stage: agent
     delivery: directory
     target: /run/paje/secrets/codex
@@ -424,8 +425,12 @@ The initial broker supports:
   operator-controlled environment.
 
 A change to provider, reference, authorization, or delivery policy requires a
-new binding revision. Resolve persists only capability name and binding
-revision. The registry retains revisions referenced by nonterminal runs.
+new binding revision. Every operator-owned profile secret requirement pins its
+exact positive `binding_revision`; it is independent of the worker-profile
+revision and participates in the canonical profile digest. Resolve never
+infers one revision from the other. It validates the exact capability and
+binding revision against operator policy, then persists only that safe
+`BindingRef`. The registry retains revisions referenced by nonterminal runs.
 Rotating the secret value behind an unchanged source is allowed and does not
 require a run migration.
 
@@ -590,8 +595,8 @@ with these additions:
 1. Strictly decode the changed `code-change@v1` input.
 2. Resolve the exact worker profile ID.
 3. Validate the profile against the selected executor and harness registries.
-4. Validate every secret capability and exact binding revision against
-   operator policy.
+4. Validate every secret capability and its profile-pinned exact binding
+   revision against operator policy; never select it from the profile revision.
 5. Persist the normalized safe profile snapshot, profile digest, capability
    names, and binding revisions in the run record.
 6. Bind those fields bidirectionally to the run's canonical input and status.
