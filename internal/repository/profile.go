@@ -16,7 +16,10 @@ const profileCommandTimeout = time.Minute
 
 // ProfileRequest is the bounded input to repository inspection.
 type ProfileRequest struct {
-	Workspace        string
+	Workspace string
+	Commands  CommandRunner
+	// Environment remains only so the pre-migration workflow compiles. Profiles
+	// never read it; all execution environment is owned by Commands.
 	Environment      map[string]string
 	Checks           []verification.CommandSpec
 	ModuleExclusions []ModuleExclusion
@@ -42,8 +45,7 @@ func (e *EnvironmentError) Error() string {
 
 // GenericProfile records Git preflight facts and compiles explicit checks.
 type GenericProfile struct {
-	limits   verification.Limits
-	executor verification.Runner
+	limits verification.Limits
 }
 
 // GoProfile adds tracked Go module discovery and GOWORK-off commands.
@@ -51,16 +53,12 @@ type GoProfile struct {
 	generic *GenericProfile
 }
 
-// NewGenericProfile constructs a generic profile using Task 4's bounded executor.
+// NewGenericProfile constructs a generic repository profile.
 func NewGenericProfile(limits verification.Limits) (*GenericProfile, error) {
 	if limits.MaxCommands <= 0 {
 		return nil, fmt.Errorf("create generic repository profile: command limit must be positive")
 	}
-	executor, err := verification.NewExecutor(limits)
-	if err != nil {
-		return nil, fmt.Errorf("create generic repository profile: %w", err)
-	}
-	return &GenericProfile{limits: limits, executor: executor}, nil
+	return &GenericProfile{limits: limits}, nil
 }
 
 // NewGoProfile constructs a Go profile using Task 4's bounded executor.
@@ -86,16 +84,16 @@ func (p *GenericProfile) Inspect(ctx context.Context, request ProfileRequest) (P
 	if len(request.Checks) > p.limits.MaxCommands {
 		return ProfileResult{}, fmt.Errorf("inspect generic repository profile: too many checks")
 	}
-	result, err := p.inspectGit(ctx, workspace, request.Environment)
+	if request.Commands == nil {
+		return ProfileResult{}, fmt.Errorf("inspect generic repository profile: sandbox command runner is required")
+	}
+	result, err := p.inspectGit(ctx, request.Commands)
 	if err != nil {
 		return ProfileResult{}, err
 	}
-	result.Commands, err = compileChecks(request.Checks, workspace, p.limits)
+	result.Commands, err = compileChecks(request.Checks, workspace, ".", p.limits)
 	if err != nil {
 		return ProfileResult{}, err
-	}
-	for _, command := range result.Commands {
-		result.Facts["tool:"+command.Executable] = toolAvailability(command, request.Environment)
 	}
 	return result, nil
 }
@@ -109,18 +107,21 @@ func (p *GoProfile) Inspect(ctx context.Context, request ProfileRequest) (Profil
 	if err != nil {
 		return ProfileResult{}, err
 	}
-	result, err := p.generic.inspectGit(ctx, workspace, request.Environment)
+	if request.Commands == nil {
+		return ProfileResult{}, fmt.Errorf("inspect Go repository profile: sandbox command runner is required")
+	}
+	result, err := p.generic.inspectGit(ctx, request.Commands)
 	if err != nil {
 		return ProfileResult{}, err
 	}
-	goWork, err := p.generic.profileOutput(ctx, workspace, request.Environment, "go env GOWORK", "go", "env", "GOWORK")
+	goWork, err := p.generic.profileOutput(ctx, request.Commands, ".", nil, "go env GOWORK", "go", "env", "GOWORK")
 	if err != nil {
 		return ProfileResult{}, err
 	}
 	result.Facts["go_work"] = strings.TrimSpace(goWork)
 	result.Facts["go_available"] = "available"
 
-	modules, err := p.generic.discoverModules(ctx, workspace, request.Environment)
+	modules, err := p.generic.discoverModules(ctx, workspace, request.Commands)
 	if err != nil {
 		return ProfileResult{}, err
 	}
@@ -131,14 +132,11 @@ func (p *GoProfile) Inspect(ctx context.Context, request ProfileRequest) (Profil
 	result.Modules = selected
 	result.Warnings = warnings
 
-	goEnvironment := copyEnvironment(request.Environment)
-	goEnvironment["GOWORK"] = "off"
 	for _, module := range selected {
-		moduleDirectory, err := containedModuleDirectory(workspace, module)
-		if err != nil {
+		if _, err := containedModuleDirectory(workspace, module); err != nil {
 			return ProfileResult{}, err
 		}
-		output, err := p.generic.profileOutput(ctx, moduleDirectory, goEnvironment, "go list -m -json", "go", "list", "-m", "-json")
+		output, err := p.generic.profileOutput(ctx, request.Commands, module, map[string]string{"GOWORK": "off"}, "go list -m -json", "go", "list", "-m", "-json")
 		if err != nil {
 			return ProfileResult{}, err
 		}
@@ -153,8 +151,7 @@ func (p *GoProfile) Inspect(ctx context.Context, request ProfileRequest) (Profil
 		return ProfileResult{}, fmt.Errorf("inspect Go repository profile: too many generated checks")
 	}
 	for _, module := range selected {
-		moduleDirectory, err := containedModuleDirectory(workspace, module)
-		if err != nil {
+		if _, err := containedModuleDirectory(workspace, module); err != nil {
 			return ProfileResult{}, err
 		}
 		checks := request.Checks
@@ -168,7 +165,7 @@ func (p *GoProfile) Inspect(ctx context.Context, request ProfileRequest) (Profil
 				Required:   true,
 			}}
 		}
-		commands, err := compileChecks(checks, moduleDirectory, p.generic.limits)
+		commands, err := compileChecks(checks, workspace, module, p.generic.limits)
 		if err != nil {
 			return ProfileResult{}, err
 		}
@@ -180,12 +177,12 @@ func (p *GoProfile) Inspect(ctx context.Context, request ProfileRequest) (Profil
 	return result, nil
 }
 
-func (p *GenericProfile) inspectGit(ctx context.Context, workspace string, environment map[string]string) (ProfileResult, error) {
-	baseSHA, err := p.profileOutput(ctx, workspace, environment, "git rev-parse HEAD", "git", "rev-parse", "HEAD")
+func (p *GenericProfile) inspectGit(ctx context.Context, commands CommandRunner) (ProfileResult, error) {
+	baseSHA, err := p.profileOutput(ctx, commands, ".", nil, "git rev-parse HEAD", "git", "rev-parse", "HEAD")
 	if err != nil {
 		return ProfileResult{}, err
 	}
-	status, err := p.profileOutput(ctx, workspace, environment, "git status", "git", "status", "--porcelain=v1")
+	status, err := p.profileOutput(ctx, commands, ".", nil, "git status", "git", "status", "--porcelain=v1")
 	if err != nil {
 		return ProfileResult{}, err
 	}
@@ -196,8 +193,8 @@ func (p *GenericProfile) inspectGit(ctx context.Context, workspace string, envir
 	}}, nil
 }
 
-func (p *GenericProfile) discoverModules(ctx context.Context, workspace string, environment map[string]string) ([]string, error) {
-	output, err := p.profileOutput(ctx, workspace, environment, "git ls-files go.mod", "git", "ls-files", "-z", "--", "go.mod", "**/go.mod")
+func (p *GenericProfile) discoverModules(ctx context.Context, workspace string, commands CommandRunner) ([]string, error) {
+	output, err := p.profileOutput(ctx, commands, ".", nil, "git ls-files go.mod", "git", "ls-files", "-z", "--", "go.mod", "**/go.mod")
 	if err != nil {
 		return nil, err
 	}
@@ -234,15 +231,16 @@ func (p *GenericProfile) discoverModules(ctx context.Context, workspace string, 
 	return modules, nil
 }
 
-func (p *GenericProfile) profileOutput(ctx context.Context, directory string, environment map[string]string, operation, executable string, args ...string) (string, error) {
-	result := p.executor.Run(ctx, verification.Command{
-		Name:       operation,
-		Directory:  directory,
-		Executable: executable,
-		Args:       args,
-		Timeout:    profileCommandTimeout,
-		Required:   true,
-	}, environment)
+func (p *GenericProfile) profileOutput(ctx context.Context, commands CommandRunner, directory string, environment map[string]string, operation, executable string, args ...string) (string, error) {
+	result := commands.Run(ctx, verification.Command{
+		Name:        operation,
+		Directory:   directory,
+		Executable:  executable,
+		Args:        args,
+		Environment: environment,
+		Timeout:     profileCommandTimeout,
+		Required:    true,
+	})
 	if result.Passed {
 		return result.Output, nil
 	}
@@ -252,14 +250,19 @@ func (p *GenericProfile) profileOutput(ctx context.Context, directory string, en
 	return "", fmt.Errorf("inspect repository profile: %s failed (%s): %s", operation, result.CauseCode, strings.TrimSpace(result.Output))
 }
 
-func compileChecks(checks []verification.CommandSpec, workspace string, limits verification.Limits) ([]verification.Command, error) {
+func compileChecks(checks []verification.CommandSpec, workspace, base string, limits verification.Limits) ([]verification.Command, error) {
 	commands := make([]verification.Command, 0, len(checks))
 	for index, check := range checks {
+		directory := strings.TrimSpace(check.Directory)
+		if directory == "" {
+			directory = "."
+		}
+		if base != "." {
+			directory = filepath.ToSlash(filepath.Join(filepath.FromSlash(base), filepath.FromSlash(directory)))
+		}
+		check.Directory = directory
 		command, err := verification.Compile(check, workspace, limits)
 		if err != nil {
-			return nil, fmt.Errorf("compile repository profile check %d: %w", index, err)
-		}
-		if err := ensureDirectoryContained(workspace, command.Directory); err != nil {
 			return nil, fmt.Errorf("compile repository profile check %d: %w", index, err)
 		}
 		commands = append(commands, command)
@@ -336,21 +339,6 @@ func containedModuleDirectory(workspace, module string) (string, error) {
 	return realDirectory, nil
 }
 
-func ensureDirectoryContained(root, directory string) error {
-	realDirectory, err := filepath.EvalSymlinks(directory)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("resolve check directory: %w", err)
-	}
-	relative, err := filepath.Rel(root, realDirectory)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("directory escapes workspace")
-	}
-	return nil
-}
-
 func containsParent(path string) bool {
 	for _, component := range strings.FieldsFunc(filepath.ToSlash(path), func(r rune) bool { return r == '/' }) {
 		if component == ".." {
@@ -358,19 +346,4 @@ func containsParent(path string) bool {
 		}
 	}
 	return false
-}
-
-func copyEnvironment(values map[string]string) map[string]string {
-	copy := make(map[string]string, len(values)+1)
-	for key, value := range values {
-		copy[key] = value
-	}
-	return copy
-}
-
-func toolAvailability(command verification.Command, environment map[string]string) string {
-	if _, err := verification.ResolveExecutable(command.Executable, command.Directory, environment); err == nil {
-		return "available"
-	}
-	return "unavailable"
 }

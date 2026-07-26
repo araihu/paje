@@ -1,7 +1,11 @@
 // Package repository defines immutable revision resolution and repository profiles.
 package repository
 
-import "context"
+import (
+	"context"
+
+	"github.com/araihu/paje/internal/verification"
+)
 
 // Revision records the requested reference and the immutable commit it resolved to.
 type Revision struct {
@@ -20,4 +24,9 @@ type Resolver interface {
 type Profile interface {
 	Name() string
 	Inspect(context.Context, ProfileRequest) (ProfileResult, error)
+}
+
+// CommandRunner executes one repository-relative command in a sandbox.
+type CommandRunner interface {
+	Run(context.Context, verification.Command) verification.Result
 }

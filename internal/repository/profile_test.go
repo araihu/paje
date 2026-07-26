@@ -22,8 +22,8 @@ func TestGenericProfileCompilesOnlyConfiguredCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace:   workspace,
-		Environment: goEnvironment(workspace),
+		Workspace: workspace,
+		Commands:  newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 		Checks: []verification.CommandSpec{{
 			Name: "configured", Directory: "site", Executable: "go", Args: []string{"test", "./..."}, Timeout: "1m", Required: true,
 		}},
@@ -31,18 +31,60 @@ func TestGenericProfileCompilesOnlyConfiguredCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect() error = %v", err)
 	}
-	resolvedWorkspace, err := filepath.EvalSymlinks(workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Commands) != 1 || result.Commands[0].Directory != filepath.Join(resolvedWorkspace, "site") {
+	if len(result.Commands) != 1 || result.Commands[0].Directory != "site" {
 		t.Fatalf("Commands = %#v", result.Commands)
 	}
-	for _, key := range []string{"base_sha", "git_status", "git_available", "tool:go"} {
+	for _, key := range []string{"base_sha", "git_status", "git_available"} {
 		if _, ok := result.Facts[key]; !ok {
 			t.Errorf("Facts is missing %q: %#v", key, result.Facts)
 		}
 	}
+}
+
+func TestRepositoryProfileUsesInjectedSandboxRunner(t *testing.T) {
+	workspace := t.TempDir()
+	runner := &scriptedCommandRunner{outputs: map[string]string{
+		"git rev-parse HEAD":  "abc123\n",
+		"git status":          "",
+		"go env GOWORK":       "/workspace/go.work\n",
+		"git ls-files go.mod": "go.mod\x00",
+		"go list -m -json":    `{"Path":"example.test/root"}`,
+	}}
+	profile, err := repository.NewGoProfile(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := profile.Inspect(context.Background(), repository.ProfileRequest{
+		Workspace: workspace, Commands: runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 5 || len(result.Commands) != 1 || result.Commands[0].Directory != "." {
+		t.Fatalf("commands/result = %#v / %#v", runner.commands, result)
+	}
+	for _, command := range runner.commands {
+		if filepath.IsAbs(command.Directory) {
+			t.Fatalf("profile passed transient absolute directory to runner: %#v", command)
+		}
+		if command.Name == "go list -m -json" && command.Environment["GOWORK"] != "off" {
+			t.Fatalf("module probe inherited ambient Go workspace: %#v", command)
+		}
+	}
+}
+
+type scriptedCommandRunner struct {
+	outputs  map[string]string
+	commands []verification.Command
+}
+
+func (runner *scriptedCommandRunner) Run(_ context.Context, command verification.Command) verification.Result {
+	runner.commands = append(runner.commands, command)
+	output, ok := runner.outputs[command.Name]
+	if !ok {
+		return verification.Result{Command: command, FailureClass: "internal", CauseCode: "unexpected_command"}
+	}
+	return verification.Result{Command: command, Output: output, ExitCode: 0, Passed: true}
 }
 
 func TestGoProfileDiscoversModulesAndBuildsExactCommands(t *testing.T) {
@@ -52,7 +94,7 @@ func TestGoProfileDiscoversModulesAndBuildsExactCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace: workspace, Environment: goEnvironment(workspace),
+		Workspace: workspace, Commands: newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 	})
 	if err != nil {
 		t.Fatalf("Inspect() error = %v", err)
@@ -64,12 +106,8 @@ func TestGoProfileDiscoversModulesAndBuildsExactCommands(t *testing.T) {
 	if len(result.Commands) != len(wantModules) {
 		t.Fatalf("Commands = %#v", result.Commands)
 	}
-	resolvedWorkspace, err := filepath.EvalSymlinks(workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
 	for index, command := range result.Commands {
-		if command.Name != "go test "+wantModules[index] || command.Executable != "go" || !reflect.DeepEqual(command.Args, []string{"test", "./..."}) || command.Directory != filepath.Join(resolvedWorkspace, wantModules[index]) || command.Environment["GOWORK"] != "off" || !command.Required {
+		if command.Name != "go test "+wantModules[index] || command.Executable != "go" || !reflect.DeepEqual(command.Args, []string{"test", "./..."}) || command.Directory != wantModules[index] || command.Environment["GOWORK"] != "off" || !command.Required {
 			t.Errorf("Commands[%d] = %#v", index, command)
 		}
 	}
@@ -95,7 +133,7 @@ func TestGoProfileExcludesOnlyDeclaredModuleAndPreservesReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace: workspace, Environment: goEnvironment(workspace),
+		Workspace: workspace, Commands: newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 		ModuleExclusions: []repository.ModuleExclusion{{Path: "tools", Reason: "generator-only module"}},
 	})
 	if err != nil {
@@ -108,7 +146,7 @@ func TestGoProfileExcludesOnlyDeclaredModuleAndPreservesReason(t *testing.T) {
 		t.Fatalf("Warnings = %#v", result.Warnings)
 	}
 	if _, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace: workspace, Environment: goEnvironment(workspace),
+		Workspace: workspace, Commands: newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 		ModuleExclusions: []repository.ModuleExclusion{{Path: "missing", Reason: "not present"}},
 	}); err == nil {
 		t.Fatal("Inspect() accepted exclusion for undiscovered module")
@@ -122,7 +160,7 @@ func TestGoProfileAppliesConfiguredChecksInsideEveryModule(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace: workspace, Environment: goEnvironment(workspace),
+		Workspace: workspace, Commands: newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 		Checks: []verification.CommandSpec{{Name: "custom", Directory: ".", Executable: "go", Args: []string{"vet", "./..."}, Timeout: "1m", Required: true}},
 	})
 	if err != nil {
@@ -137,7 +175,7 @@ func TestGoProfileAppliesConfiguredChecksInsideEveryModule(t *testing.T) {
 		}
 	}
 	if _, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace: workspace, Environment: goEnvironment(workspace),
+		Workspace: workspace, Commands: newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 		Checks: []verification.CommandSpec{{Name: "escape", Directory: "../outside", Executable: "go", Timeout: "1m"}},
 	}); err == nil {
 		t.Fatal("Inspect() accepted a check directory escaping its module")
@@ -147,7 +185,7 @@ func TestGoProfileAppliesConfiguredChecksInsideEveryModule(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace: workspace, Environment: goEnvironment(workspace),
+		Workspace: workspace, Commands: newLocalCommandRunner(t, workspace, goEnvironment(workspace)),
 		Checks: []verification.CommandSpec{{Name: "symlink escape", Directory: "escape", Executable: "go", Timeout: "1m"}},
 	}); err == nil {
 		t.Fatal("Inspect() accepted a check directory escaping its module through a symlink")
@@ -161,8 +199,10 @@ func TestGoProfileClassifiesMissingGoAsEnvironmentFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = profile.Inspect(context.Background(), repository.ProfileRequest{
-		Workspace:   workspace,
-		Environment: map[string]string{"PATH": t.TempDir(), "GOWORK": filepath.Join(workspace, "go.work")},
+		Workspace: workspace,
+		Commands: newLocalCommandRunner(t, workspace, map[string]string{
+			"PATH": t.TempDir(), "GOWORK": filepath.Join(workspace, "go.work"),
+		}),
 	})
 	var environmentErr *repository.EnvironmentError
 	if !errors.As(err, &environmentErr) {
@@ -206,6 +246,32 @@ func newModuleRepository(t *testing.T) string {
 
 func goEnvironment(workspace string) map[string]string {
 	return map[string]string{"PATH": os.Getenv("PATH"), "GOWORK": filepath.Join(workspace, "go.work")}
+}
+
+type localCommandRunner struct {
+	workspace   string
+	environment map[string]string
+	delegate    verification.Runner
+}
+
+func newLocalCommandRunner(t *testing.T, workspace string, environment map[string]string) *localCommandRunner {
+	t.Helper()
+	delegate, err := verification.NewExecutor(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &localCommandRunner{workspace: workspace, environment: environment, delegate: delegate}
+}
+
+func (runner *localCommandRunner) Run(ctx context.Context, command verification.Command) verification.Result {
+	evidence := command
+	evidence.Args = append([]string(nil), command.Args...)
+	evidence.Environment = nil
+	resolved := command
+	resolved.Directory = filepath.Join(runner.workspace, filepath.FromSlash(command.Directory))
+	result := runner.delegate.Run(ctx, resolved, runner.environment)
+	result.Command = evidence
+	return result
 }
 
 func run(t *testing.T, directory, executable string, args ...string) {

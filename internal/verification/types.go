@@ -2,7 +2,9 @@
 package verification
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -34,7 +36,7 @@ type CommandSpec struct {
 	Required   bool     `json:"required"`
 }
 
-// Command is a fully validated command ready for execution.
+// Command is a fully validated command with a repository-relative directory.
 type Command struct {
 	Name       string
 	Directory  string
@@ -61,7 +63,8 @@ type Result struct {
 	CauseCode    string        `json:"cause_code,omitempty"`
 }
 
-// Compile validates spec and resolves its relative directory under workspace.
+// Compile validates spec against workspace while preserving a normalized
+// repository-relative directory in durable command evidence.
 func Compile(spec CommandSpec, workspace string, limits Limits) (Command, error) {
 	if err := validateLimits(limits); err != nil {
 		return Command{}, err
@@ -77,6 +80,10 @@ func Compile(spec CommandSpec, workspace string, limits Limits) (Command, error)
 	if err != nil {
 		return Command{}, fmt.Errorf("compile verification command: resolve workspace: %w", err)
 	}
+	workspace, err = filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return Command{}, fmt.Errorf("compile verification command: resolve workspace: %w", err)
+	}
 
 	if containsNUL(spec.Name) || strings.TrimSpace(spec.Name) == "" {
 		return Command{}, fmt.Errorf("compile verification command: name is required")
@@ -88,19 +95,13 @@ func Compile(spec CommandSpec, workspace string, limits Limits) (Command, error)
 	if containsParentDirectory(spec.Directory) {
 		return Command{}, fmt.Errorf("compile verification command %q: directory must not contain ..", spec.Name)
 	}
-	directory := spec.Directory
-	if directory == "" {
-		directory = "."
+	relativeDirectory := spec.Directory
+	if relativeDirectory == "" {
+		relativeDirectory = "."
 	}
-	directory, err = filepath.Abs(filepath.Join(workspace, directory))
-	if err != nil {
-		return Command{}, fmt.Errorf("compile verification command %q: resolve directory: %w", spec.Name, err)
-	}
-	relative, err := filepath.Rel(workspace, directory)
-	if err != nil {
-		return Command{}, fmt.Errorf("compile verification command %q: check directory: %w", spec.Name, err)
-	}
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	relativeDirectory = filepath.Clean(relativeDirectory)
+	directory := filepath.Join(workspace, relativeDirectory)
+	if err := ensureContainedDirectory(workspace, directory); err != nil {
 		return Command{}, fmt.Errorf("compile verification command %q: directory escapes workspace", spec.Name)
 	}
 
@@ -126,12 +127,51 @@ func Compile(spec CommandSpec, workspace string, limits Limits) (Command, error)
 
 	return Command{
 		Name:       strings.TrimSpace(spec.Name),
-		Directory:  directory,
+		Directory:  filepath.ToSlash(relativeDirectory),
 		Executable: executable,
 		Args:       append([]string(nil), spec.Args...),
 		Timeout:    timeout,
 		Required:   spec.Required,
 	}, nil
+}
+
+func ensureContainedDirectory(workspace, directory string) error {
+	realDirectory, err := resolveFromExistingAncestor(directory)
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(workspace, realDirectory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("directory escapes workspace")
+	}
+	return nil
+}
+
+func resolveFromExistingAncestor(directory string) (string, error) {
+	candidate := filepath.Clean(directory)
+	var unresolved []string
+	for {
+		_, err := os.Lstat(candidate)
+		if err == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(candidate)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			for index := len(unresolved) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, unresolved[index])
+			}
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", err
+		}
+		unresolved = append(unresolved, filepath.Base(candidate))
+		candidate = parent
+	}
 }
 
 func validateLimits(limits Limits) error {

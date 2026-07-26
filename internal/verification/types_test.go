@@ -1,12 +1,27 @@
 package verification_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/araihu/paje/internal/verification"
 )
+
+func TestCompileRejectsNonexistentChildBelowEscapingSymlink(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(workspace, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	spec := verification.CommandSpec{
+		Name: "escape", Directory: "escape/not-created", Executable: "go", Timeout: "1s",
+	}
+	if _, err := verification.Compile(spec, workspace, verification.Limits{MaxArguments: 8, MaxTimeout: time.Minute}); err == nil {
+		t.Fatal("nonexistent child below escaping symlink accepted")
+	}
+}
 
 func TestCompile(t *testing.T) {
 	workspace := t.TempDir()
@@ -21,7 +36,7 @@ func TestCompile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Directory != filepath.Join(workspace, "module") {
+	if got.Directory != "module" {
 		t.Fatalf("Directory = %q", got.Directory)
 	}
 	if got.Timeout != 2*time.Minute || got.Executable != "go" || len(got.Args) != 2 || !got.Required {
