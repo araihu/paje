@@ -39,10 +39,12 @@ func TestCanonicalGoTestGetsExecutableDefaultBuildTempAndPrivateBootstrapTmpfs(t
 		len(options.HostConfig.Tmpfs) != 3 {
 		t.Fatalf("tmpfs wire config = %#v", options.HostConfig)
 	}
-	for _, target := range []string{"/run/paje", "/home/paje"} {
+	for target, size := range map[string]string{
+		"/run/paje": "67108864", "/home/paje": "268435456",
+	} {
 		value := options.HostConfig.Tmpfs[target]
 		for _, required := range []string{
-			"rw", "nosuid", "nodev", "noexec", "size=67108864",
+			"rw", "nosuid", "nodev", "noexec", "size=" + size,
 			"mode=0700", "uid=65532", "gid=65532",
 		} {
 			if !strings.Contains(value, required) {
@@ -51,7 +53,7 @@ func TestCanonicalGoTestGetsExecutableDefaultBuildTempAndPrivateBootstrapTmpfs(t
 		}
 	}
 	temporary := tmpfsOptionSet(options.HostConfig.Tmpfs["/tmp"])
-	if temporary["noexec"] || !temporary["exec"] {
+	if temporary["noexec"] || !temporary["exec"] || !temporary["size=268435456"] {
 		t.Fatalf("canonical go test cannot execute /tmp/go-build binaries: %q", options.HostConfig.Tmpfs["/tmp"])
 	}
 	encoded, err := json.Marshal(options.HostConfig)
@@ -64,6 +66,24 @@ func TestCanonicalGoTestGetsExecutableDefaultBuildTempAndPrivateBootstrapTmpfs(t
 	}
 	if len(decoded.Mounts) != 1 || len(decoded.Tmpfs) != 3 {
 		t.Fatalf("decoded Moby HostConfig = %#v", decoded)
+	}
+}
+
+func TestWorkingTmpfsSizeTracksProfileMemoryWithinBounds(t *testing.T) {
+	tests := map[string]struct {
+		memory int64
+		want   int64
+	}{
+		"small profile floor": {memory: 128 << 20, want: 64 << 20},
+		"one gibibyte":        {memory: 1 << 30, want: 256 << 20},
+		"large profile cap":   {memory: 8 << 30, want: 1 << 30},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := workingTmpfsSize(test.memory); got != test.want {
+				t.Fatalf("working tmpfs size = %d, want %d", got, test.want)
+			}
+		})
 	}
 }
 

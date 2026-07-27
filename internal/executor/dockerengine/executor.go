@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
@@ -22,9 +23,12 @@ import (
 )
 
 const (
-	destroyedHistoryLimit  = 1024
-	ambiguousCleanupWindow = 250 * time.Millisecond
-	cleanupPollInterval    = 10 * time.Millisecond
+	destroyedHistoryLimit   = 1024
+	ambiguousCleanupWindow  = 250 * time.Millisecond
+	cleanupPollInterval     = 10 * time.Millisecond
+	bootstrapTmpfsSize      = 64 << 20
+	minimumWorkingTmpfsSize = 64 << 20
+	maximumWorkingTmpfsSize = 1 << 30
 )
 
 type attemptRecord struct {
@@ -952,6 +956,7 @@ func containerOptions(request executor.Request, networkName string, labels map[s
 		return client.ContainerCreateOptions{}, err
 	}
 	readOnlyForce := !request.Workspace.Writable
+	workingTmpfs := workingTmpfsSize(request.Profile.Resources.MemoryBytes)
 	options := client.ContainerCreateOptions{
 		Config: &container.Config{
 			User:         "65532:65532",
@@ -976,9 +981,9 @@ func containerOptions(request executor.Request, networkName string, labels map[s
 			SecurityOpt:    []string{"no-new-privileges=true"},
 			NetworkMode:    "none",
 			Tmpfs: map[string]string{
-				"/run/paje":  privateTmpfsOptions(),
-				"/home/paje": privateTmpfsOptions(),
-				"/tmp":       temporaryTmpfsOptions(),
+				"/run/paje":  privateTmpfsOptions(bootstrapTmpfsSize),
+				"/home/paje": privateTmpfsOptions(workingTmpfs),
+				"/tmp":       temporaryTmpfsOptions(workingTmpfs),
 			},
 			Resources: container.Resources{
 				Memory:     request.Profile.Resources.MemoryBytes,
@@ -1013,12 +1018,23 @@ func containerOptions(request executor.Request, networkName string, labels map[s
 	return options, nil
 }
 
-func privateTmpfsOptions() string {
-	return "rw,nosuid,nodev,noexec,size=67108864,mode=0700,uid=65532,gid=65532"
+func workingTmpfsSize(memoryBytes int64) int64 {
+	size := memoryBytes / 4
+	if size < minimumWorkingTmpfsSize {
+		return minimumWorkingTmpfsSize
+	}
+	if size > maximumWorkingTmpfsSize {
+		return maximumWorkingTmpfsSize
+	}
+	return size
 }
 
-func temporaryTmpfsOptions() string {
-	return "rw,nosuid,nodev,exec,size=67108864,mode=0700,uid=65532,gid=65532"
+func privateTmpfsOptions(size int64) string {
+	return fmt.Sprintf("rw,nosuid,nodev,noexec,size=%d,mode=0700,uid=65532,gid=65532", size)
+}
+
+func temporaryTmpfsOptions(size int64) string {
+	return fmt.Sprintf("rw,nosuid,nodev,exec,size=%d,mode=0700,uid=65532,gid=65532", size)
 }
 
 func mapContainerState(state engineContainerState) (executor.State, bool) {
