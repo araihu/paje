@@ -142,92 +142,157 @@ func (s *Service) ScheduleRecovery(ctx context.Context, candidate RecoveryEntry)
 }
 
 func (s *Service) rebuildRecoveryJournal(ctx context.Context) (recoveryProjection, error) {
-	admissionSnapshot, err := s.rebuildJournal(ctx)
-	if err != nil {
-		return recoveryProjection{}, err
-	}
-	projection := newRecoveryProjection(admissionSnapshot)
+	projection := newRecoveryProjection(newSchedulerSnapshot())
 	cursor := journal.GlobalCursor{}
-	reservations := make(map[string]journal.Event)
+	admissionReservations := make(map[string]journal.Event)
+	schedulerReservations := make(map[string]journal.Event)
+	excluded := make(map[string]bool)
 	var wantPosition journal.JournalPosition = 1
-	runHeads := make(map[string]uint64)
 	for {
 		events, next, err := s.journal.Feed(ctx, cursor, 1000)
 		if err != nil {
 			return recoveryProjection{}, typedError(CodeAuthority, "recovery_feed", err)
 		}
-		if next.InstallationID != projection.installationID || next.SchemaVersion != journal.SchemaVersion {
+		if projection.installationID == "" {
+			projection.installationID = next.InstallationID
+			projection.admission.installationID = next.InstallationID
+		}
+		if !bounded(projection.installationID, 128) || next.InstallationID != projection.installationID ||
+			next.SchemaVersion != journal.SchemaVersion {
 			return recoveryProjection{}, typedError(CodeAuthority, "recovery_feed", ErrInvalidRecord)
 		}
 		for _, event := range events {
-			if event.JournalPosition != wantPosition || event.RunSequence != runHeads[event.ControlRunID]+1 {
+			if event.JournalPosition != wantPosition ||
+				event.RunSequence != projection.runHeads[event.ControlRunID]+1 {
 				return recoveryProjection{}, typedError(CodeAuthority, "recovery_feed", ErrInvalidRecord)
 			}
 			wantPosition++
-			runHeads[event.ControlRunID] = event.RunSequence
+			projection.runHeads[event.ControlRunID] = event.RunSequence
 			key := event.ControlRunID + "\x00" + event.ActionID
+			isAdmission := strings.HasPrefix(event.ActionID, admissionActionPrefix)
+			isScheduler := strings.HasPrefix(event.ActionID, schedulerRecoveryActionPrefix)
 			if event.Kind == journal.EventActionReserved {
-				if !strings.HasPrefix(event.ActionID, schedulerRecoveryActionPrefix) {
-					continue
+				switch {
+				case isAdmission:
+					if _, exists := admissionReservations[key]; exists {
+						return recoveryProjection{}, typedError(CodeAuthority, "recovery_reservation", ErrInvalidRecord)
+					}
+					admissionReservations[key] = event
+				case isScheduler:
+					if _, exists := schedulerReservations[key]; exists {
+						return recoveryProjection{}, typedError(CodeAuthority, "recovery_reservation", ErrInvalidRecord)
+					}
+					schedulerReservations[key] = event
 				}
-				reservations[key] = event
 				continue
 			}
-			if !journal.IsOutcome(event.Kind) {
-				continue
-			}
-			if !strings.HasPrefix(event.ActionID, schedulerRecoveryActionPrefix) {
+			if !journal.IsOutcome(event.Kind) || (!isAdmission && !isScheduler) {
 				continue
 			}
 			payload, err := s.journal.Payload(ctx, event.PayloadDigest)
 			if err != nil || journal.ValidatePayload(payload, event.PayloadDigest) != nil {
 				return recoveryProjection{}, typedError(CodeAuthority, "recovery_payload", ErrInvalidRecord)
 			}
-			var header struct {
-				Component string `json:"component"`
+			if isAdmission {
+				reservation, ok := admissionReservations[key]
+				if !ok {
+					return recoveryProjection{}, typedError(CodeAuthority, "recovery_membership", ErrInvalidRecord)
+				}
+				action, err := s.journal.Reservation(ctx, event.ControlRunID, event.ActionID)
+				if err != nil {
+					return recoveryProjection{}, typedError(CodeAuthority, "recovery_membership", err)
+				}
+				requestPayload, err := s.journal.Payload(ctx, action.CanonicalRequestDigest)
+				if err != nil || journal.ValidatePayload(requestPayload, action.CanonicalRequestDigest) != nil {
+					return recoveryProjection{}, typedError(CodeAuthority, "recovery_request", ErrInvalidRecord)
+				}
+				var request admissionRequestEnvelope
+				var outcome admissionOutcomeEnvelope
+				if journal.DecodeStrict(requestPayload, &request) != nil ||
+					journal.DecodeStrict(payload, &outcome) != nil ||
+					validateAdmissionMembership(
+						projection.installationID, action, reservation, event,
+						requestPayload, payload, request, outcome,
+					) != nil {
+					return recoveryProjection{}, typedError(CodeAuthority, "recovery_membership", ErrInvalidRecord)
+				}
+				if err := s.applyAdmissionOutcome(
+					&projection.admission, action, reservation, event, outcome, excluded,
+				); err != nil {
+					return recoveryProjection{}, err
+				}
+				delete(admissionReservations, key)
+				continue
 			}
-			if json.Unmarshal(payload, &header) != nil || header.Component != schedulerComponentName {
-				return recoveryProjection{}, typedError(CodeAuthority, "recovery_payload", ErrInvalidRecord)
-			}
-			reservation, ok := reservations[key]
+			reservation, ok := schedulerReservations[key]
 			if !ok {
 				return recoveryProjection{}, typedError(CodeAuthority, "recovery_membership", ErrInvalidRecord)
 			}
-			action, err := s.journal.Reservation(ctx, event.ControlRunID, event.ActionID)
-			if err != nil {
-				return recoveryProjection{}, typedError(CodeAuthority, "recovery_membership", err)
-			}
-			requestPayload, err := s.journal.Payload(ctx, action.CanonicalRequestDigest)
-			if err != nil || journal.ValidatePayload(requestPayload, action.CanonicalRequestDigest) != nil {
-				return recoveryProjection{}, typedError(CodeAuthority, "recovery_request", ErrInvalidRecord)
-			}
-			var request, outcome recoveryJournalEnvelope
-			if journal.DecodeStrict(requestPayload, &request) != nil || journal.DecodeStrict(payload, &outcome) != nil ||
-				!reflect.DeepEqual(request, outcome) ||
-				validateRecoveryJournalMembership(action, reservation, event, request) != nil {
+			action, envelope, err := recoveryJournalAction(reservation, event, payload)
+			if err != nil || validateRecoveryJournalMembership(action, reservation, event, envelope) != nil {
 				return recoveryProjection{}, typedError(CodeAuthority, "recovery_membership", ErrInvalidRecord)
 			}
-			if err := applyRecoveryEnvelope(&projection, request, uint64(event.JournalPosition)); err != nil {
+			if err := applyRecoveryEnvelope(&projection, envelope, uint64(event.JournalPosition)); err != nil {
 				return recoveryProjection{}, err
 			}
-			projection.records[request.OperationID] = schedulerJournalRecord{
-				RequestPayload: append([]byte(nil), requestPayload...),
+			projection.records[envelope.OperationID] = schedulerJournalRecord{
+				RequestPayload: append([]byte(nil), payload...),
 				OutcomePayload: append([]byte(nil), payload...),
 				Receipt:        journal.CommitReceipt{Action: action, Reservation: reservation, Outcome: event, Created: true},
 			}
-			delete(reservations, key)
+			delete(schedulerReservations, key)
 		}
 		cursor = next
 		projection.global = next
-		projection.runHeads = appendRunHeads(runHeads)
+		projection.admission.global = next
+		projection.admission.runHeads = appendRunHeads(projection.runHeads)
 		if len(events) == 0 {
 			break
 		}
 	}
-	if len(reservations) != 0 {
+	if len(admissionReservations) != 0 || len(schedulerReservations) != 0 {
 		return recoveryProjection{}, typedError(CodeAuthority, "recovery_reservation", ErrInvalidRecord)
 	}
 	return projection, nil
+}
+
+func recoveryJournalAction(
+	reservation journal.Event,
+	event journal.Event,
+	payload []byte,
+) (journal.Action, recoveryJournalEnvelope, error) {
+	var envelope recoveryJournalEnvelope
+	if journal.DecodeStrict(payload, &envelope) != nil {
+		return journal.Action{}, recoveryJournalEnvelope{}, ErrInvalidRecord
+	}
+	var runID string
+	var graphRevision uint64
+	switch envelope.Operation {
+	case operationRecoveryRegister:
+		if envelope.Registration == nil || validateRecoveryEntry(envelope.Registration.Entry) != nil {
+			return journal.Action{}, recoveryJournalEnvelope{}, ErrInvalidRecord
+		}
+		runID = envelope.Registration.Entry.ControlRunID
+		graphRevision = candidateGraphRevision(envelope.Registration.Entry)
+	case operationRecoveryCheckpoint:
+		if envelope.Checkpoint == nil {
+			return journal.Action{}, recoveryJournalEnvelope{}, ErrInvalidRecord
+		}
+		runID = schedulerRecoveryRunID
+		graphRevision = 1
+	default:
+		return journal.Action{}, recoveryJournalEnvelope{}, ErrInvalidRecord
+	}
+	expectedProjection := uint64(0)
+	if reservation.RunSequence > 0 {
+		expectedProjection = reservation.RunSequence - 1
+	}
+	return journal.Action{
+		ID: recoveryJournalActionID(envelope.OperationID), ControlRunID: runID, Kind: journal.KindObserve,
+		GraphRevision: graphRevision, ExpectedProjection: expectedProjection,
+		CanonicalRequestDigest: event.PayloadDigest,
+		IdempotencyKey:         recoveryJournalIdempotencyKey(envelope.OperationID),
+	}, envelope, nil
 }
 
 func (s *Service) advanceRecoveryProjection(

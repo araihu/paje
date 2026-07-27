@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,6 +94,72 @@ func TestRecoveryJournalCheckpointPersistsCompletedPrefixAndRestartsAtThird(t *t
 		if recovery.State != admission.RecoveryObservationStarted {
 			t.Fatalf("late callback mutated recovery to %s", recovery.State)
 		}
+	}
+}
+
+func TestRecoveryScanRebuildsAuthoritativeJournalOnce(t *testing.T) {
+	semanticNow := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	base, err := journal.NewMemoryStore("scheduler-single-replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := observerFunc(func(_ context.Context, identity admission.RecoveryIdentity) (admission.ProviderFact, error) {
+		return admission.ProviderFact{
+			Status: admission.ProviderAmbiguous, SubjectDigest: identity.SubjectDigest,
+		}, nil
+	})
+	authority := newRecoveryAuthority(t, base, func() time.Time { return semanticNow }, observer)
+	setup := newJournalScheduler(t, authority, base, func() time.Time { return semanticNow })
+	if _, err := setup.ScheduleRecovery(
+		ctx, observationEntry("single-replay", "run", semanticNow),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	singleReplay := &stallSecondReplayJournal{AuthoritativeStore: base}
+	service := newJournalScheduler(t, authority, singleReplay, func() time.Time { return semanticNow })
+	result, err := service.ScanRecovery(ctx)
+	if err != nil {
+		t.Fatalf("single-replay scan: %v", err)
+	}
+	if !result.Persisted || len(result.Results) != 1 || result.Results[0].EntryID != "single-replay" ||
+		result.Results[0].Outcome != OutcomeAmbiguous {
+		t.Fatalf("single-replay result = %#v", result)
+	}
+}
+
+func TestRecoveryScanReplaysDeterministicSchedulerMembershipWithoutLookup(t *testing.T) {
+	semanticNow := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	base, err := journal.NewMemoryStore("scheduler-event-membership")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := observerFunc(func(_ context.Context, identity admission.RecoveryIdentity) (admission.ProviderFact, error) {
+		return admission.ProviderFact{
+			Status: admission.ProviderAmbiguous, SubjectDigest: identity.SubjectDigest,
+		}, nil
+	})
+	authority := newRecoveryAuthority(t, base, func() time.Time { return semanticNow }, observer)
+	setup := newJournalScheduler(t, authority, base, func() time.Time { return semanticNow })
+	if _, err := setup.ScheduleRecovery(
+		ctx, observationEntry("event-membership", "run", semanticNow),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	journalWithBlockedLookup := &stallSchedulerReservationJournal{AuthoritativeStore: base}
+	service := newJournalScheduler(t, authority, journalWithBlockedLookup, func() time.Time { return semanticNow })
+	result, err := service.ScanRecovery(ctx)
+	if err != nil {
+		t.Fatalf("event-membership scan: %v", err)
+	}
+	if !result.Persisted || len(result.Results) != 1 || result.Results[0].EntryID != "event-membership" ||
+		result.Results[0].Outcome != OutcomeAmbiguous {
+		t.Fatalf("event-membership result = %#v", result)
 	}
 }
 
@@ -618,6 +685,46 @@ type blockingFeedJournal struct {
 	once    sync.Once
 	entered chan struct{}
 	release chan struct{}
+}
+
+type stallSecondReplayJournal struct {
+	journal.AuthoritativeStore
+	mu      sync.Mutex
+	replays int
+}
+
+type stallSchedulerReservationJournal struct {
+	journal.AuthoritativeStore
+}
+
+func (s *stallSchedulerReservationJournal) Reservation(
+	ctx context.Context,
+	controlRunID string,
+	actionID string,
+) (journal.Action, error) {
+	if strings.HasPrefix(actionID, schedulerRecoveryActionPrefix) {
+		<-ctx.Done()
+		return journal.Action{}, ctx.Err()
+	}
+	return s.AuthoritativeStore.Reservation(ctx, controlRunID, actionID)
+}
+
+func (s *stallSecondReplayJournal) Feed(
+	ctx context.Context,
+	cursor journal.GlobalCursor,
+	limit int,
+) ([]journal.Event, journal.GlobalCursor, error) {
+	if cursor.JournalPosition == 0 {
+		s.mu.Lock()
+		s.replays++
+		second := s.replays == 2
+		s.mu.Unlock()
+		if second {
+			<-ctx.Done()
+			return nil, cursor, ctx.Err()
+		}
+	}
+	return s.AuthoritativeStore.Feed(ctx, cursor, limit)
 }
 
 func (s *blockingFeedJournal) Feed(context.Context, journal.GlobalCursor, int) ([]journal.Event, journal.GlobalCursor, error) {
