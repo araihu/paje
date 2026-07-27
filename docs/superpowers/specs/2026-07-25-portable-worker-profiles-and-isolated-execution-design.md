@@ -357,6 +357,29 @@ adapter owns the deterministic executable and argument vector, machine-readable
 completion protocol, and final-result parser. A profile cannot replace those
 arguments with arbitrary commands.
 
+The execution-harness port also derives bounded non-secret agent environment
+declarations from the exact persisted secret requirements:
+
+```go
+type Adapter interface {
+    ID() string
+    Version() string
+    Probe() executor.Command
+    AgentCommand(string) (executor.Command, error)
+    AgentEnvironment([]workerprofile.SecretRequirement) (map[string]string, error)
+    Parse(executor.Result) (string, error)
+    AcceptsCapability(string) bool
+}
+```
+
+The registry gives the adapter an independent requirement slice and returns an
+independent environment map. The Codex adapter maps only the exact persisted
+`harness.codex-auth` agent-stage, required, directory requirement at
+`/run/paje/secrets/codex` to `CODEX_HOME` at that same target. It rejects
+malformed or duplicate requirements, unknown `harness.*` capabilities, target
+or delivery drift, and managed-environment collisions before any executor or
+secret-broker side effect.
+
 This is the execution-harness contract. The Agent Control Plane has a separate
 provider-neutral `AgentHarness` for capability-aware dispatch, observe, send,
 wait, interrupt/cancel, and primitive-specific close. `AgentSession` is only
@@ -619,6 +642,13 @@ to rerun. `Result` also preserves exact exit status, bounded stdout and stderr,
 duration, truncation, and generic safe runtime facts without persisting raw
 provider responses.
 
+Before mutating attempt or presented-key evidence, the workflow recomputes the
+receipt environment digest from the exact executor request: baseline values,
+command environment, and deterministic target-to-private-path declarations for
+environment secret materializations. A same-attempt, same-command receipt with
+an omitted or changed environment declaration is rebound and cannot claim a
+child start.
+
 ## Execution Lifecycle
 
 ### Resolve
@@ -701,6 +731,17 @@ The run record persists:
 - existing transcript, verification, capture, artifact, policy, approval,
   publication, and cleanup evidence under current size and safety limits.
 
+Confirmed-attempt state and presented-key unions are separate facts. Agent
+keys exist if and only if the exact agent child-start receipt was accepted.
+Verification with no confirmed child and a frozen zero-command plan records an
+explicit not-started state and an empty union. Each confirmed child records an
+authenticated, keys-only `EnvironmentKeys` command declaration in
+`verification.json`; that declaration may be explicitly empty, while the
+top-level union remains the sorted union of the canonical baseline and every
+declared key from confirmed attempts only. Publisher validation rejects
+missing, partial, extra, inverse, generation-drifted, and unconfirmed
+historical pairings.
+
 The run record, Hatchet payloads, artifacts, logs, metrics, errors, and outcome
 memory exclude:
 
@@ -717,19 +758,21 @@ immutable and write-once. A retry cannot observe a newer profile revision.
 Acquisition failure, bootstrap non-start, and skipped verification produce no
 presented-key evidence. Confirmed verification-attempt state is persisted or
 derived separately from the presented-key union and binds the exact child-start
-receipts. A confirmed secret-free verification child may legitimately present
-zero non-baseline keys, so an empty union does not imply that no child ran.
-Top-level agent and verification key sets remain exact derived unions of child-
-confirmed attempts only.
+receipts. A confirmed secret-free verification child may legitimately declare
+zero command-specific keys; its top-level union still contains the canonical
+baseline. Top-level agent and verification key sets remain exact derived unions
+of child-confirmed attempts only.
 
-Publisher validation binds both facts. No confirmed verification attempt
-requires an empty union and is valid only when the frozen verification plan
-requires zero attempts. One or more confirmed attempts require the exact union
-derived from their receipts, and that union may be empty. A required/scheduled
-attempt without confirmation is rejected, as are partial or extra keys, an
-inverse claim that contradicts attempt receipts, and any attempt/key drift. The
-mandatory matrix is: no attempt plus empty union; confirmed-empty; confirmed-
-nonempty; partial; extra; inverse; and drift.
+Publisher validation binds both facts. No confirmed verification attempt and
+an empty union is valid only when the frozen verification plan requires zero
+attempts. One or more confirmed attempts require the exact canonical baseline
+plus the authenticated command-specific `EnvironmentKeys` declarations. A
+required/scheduled attempt without confirmation is rejected, as are a stripped
+empty union, partial or extra keys, an inverse claim that contradicts attempt
+receipts, and any attempt/key drift. The mandatory matrix is: no attempt plus
+empty union; confirmed-empty declaration plus baseline; confirmed-nonempty
+declaration plus exact union; stripped-empty; partial; extra; inverse; and
+drift.
 
 ## Failure, Retry, Cancellation, and Recovery
 
@@ -901,11 +944,18 @@ a fixed session or criterion count.
 - `PW-PU01` — publisher validation MUST bind confirmed verification-attempt
   state separately from the exact presented-key union: no confirmed attempt
   requires an empty union and is valid only for a frozen zero-attempt plan,
-  while confirmed attempts require their exact union, which may itself be
-  empty. Missing required confirmation, partial, extra, inverse, and drift
-  pairings relative to per-attempt receipts fail closed; acceptance MUST cover
-  no attempt, confirmed-empty, confirmed-nonempty, partial, extra, inverse, and
-  drift.
+  while confirmed attempts require the canonical baseline plus their exact
+  authenticated command-specific `EnvironmentKeys` declaration. Missing
+  declaration or required confirmation, stripped-empty, partial, extra,
+  inverse, and drift
+  pairings relative to per-attempt receipts fail closed. The digest-verified
+  artifact's frozen verification plan is defensively copied across the
+  workflow/publisher boundary and bound through its exact `verification.json`
+  manifest member; scheduled count, sequence, generation, command, and
+  non-secret environment declaration must match the confirmed attempts before
+  publication side effects. Acceptance MUST cover no attempt, confirmed-empty
+  declaration, confirmed-nonempty declaration, stripped-empty, partial, extra,
+  inverse, and drift.
 - `PW-AC01` — live acceptance uses the standard rendered `codex-go@1`
   production profile with no acceptance-only command, image, path, secret, or
   runtime workaround; support/current claims wait for this evidence.

@@ -1014,11 +1014,13 @@ func (registry *recordingSecretRegistry) Requests() []secret.ResolveRequest {
 }
 
 type recordingHarness struct {
-	mu         sync.Mutex
-	probeCalls int
-	agentCalls int
-	parseCalls int
-	parse      func(executor.Result) (string, error)
+	mu                    sync.Mutex
+	probeCalls            int
+	agentCalls            int
+	parseCalls            int
+	agentEnvironmentCalls int
+	parse                 func(executor.Result) (string, error)
+	agentEnvironment      func([]workerprofile.SecretRequirement) (map[string]string, error)
 }
 
 func (*recordingHarness) ID() string      { return "codex" }
@@ -1053,6 +1055,16 @@ func (adapter *recordingHarness) Parse(result executor.Result) (string, error) {
 }
 func (*recordingHarness) AcceptsCapability(capability string) bool {
 	return capability == "harness.codex-auth"
+}
+func (adapter *recordingHarness) AgentEnvironment(requirements []workerprofile.SecretRequirement) (map[string]string, error) {
+	adapter.mu.Lock()
+	adapter.agentEnvironmentCalls++
+	build := adapter.agentEnvironment
+	adapter.mu.Unlock()
+	if build != nil {
+		return build(requirements)
+	}
+	return map[string]string{"CODEX_HOME": "/run/paje/secrets/codex"}, nil
 }
 func (adapter *recordingHarness) ExecutionCalls() (int, int, int) {
 	adapter.mu.Lock()

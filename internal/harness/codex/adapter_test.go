@@ -1,11 +1,13 @@
 package codex
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/workerprofile"
 )
 
 func TestAgentCommandIsExact(t *testing.T) {
@@ -94,5 +96,58 @@ func TestAcceptsOnlyCodexAuthCapability(t *testing.T) {
 	}
 	if !adapter.AcceptsCapability("harness.codex-auth") || adapter.AcceptsCapability("harness.other") || adapter.AcceptsCapability("workload.token") {
 		t.Fatal("Codex capability boundary is not exact")
+	}
+}
+
+func TestAgentEnvironmentBindsExactPersistedCodexAuthDirectory(t *testing.T) {
+	adapter, err := New(SupportedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements := []workerprofile.SecretRequirement{{
+		Capability: "harness.codex-auth", BindingRevision: 7,
+		Stage: workerprofile.StageAgent, Delivery: workerprofile.DeliveryDirectory,
+		Target: "/run/paje/secrets/codex", Required: true,
+	}, {
+		Capability: "workload.api", BindingRevision: 9,
+		Stage: workerprofile.StageAgent, Delivery: workerprofile.DeliveryEnvironment,
+		Target: "WORKLOAD_TOKEN", Required: true,
+	}}
+
+	environment, err := adapter.AgentEnvironment(requirements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"CODEX_HOME": "/run/paje/secrets/codex"}; !reflect.DeepEqual(environment, want) {
+		t.Fatalf("AgentEnvironment() = %#v, want %#v", environment, want)
+	}
+}
+
+func TestAgentEnvironmentRejectsMalformedUnsupportedDuplicateOrDriftedRequirements(t *testing.T) {
+	adapter, err := New(SupportedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact := workerprofile.SecretRequirement{
+		Capability: "harness.codex-auth", BindingRevision: 7,
+		Stage: workerprofile.StageAgent, Delivery: workerprofile.DeliveryDirectory,
+		Target: "/run/paje/secrets/codex", Required: true,
+	}
+	tests := map[string][]workerprofile.SecretRequirement{
+		"missing binding":      {{Capability: exact.Capability, Stage: exact.Stage, Delivery: exact.Delivery, Target: exact.Target, Required: true}},
+		"wrong stage":          {{Capability: exact.Capability, BindingRevision: 7, Stage: "verification", Delivery: exact.Delivery, Target: exact.Target, Required: true}},
+		"wrong delivery":       {{Capability: exact.Capability, BindingRevision: 7, Stage: exact.Stage, Delivery: workerprofile.DeliveryFile, Target: exact.Target, Required: true}},
+		"wrong target":         {{Capability: exact.Capability, BindingRevision: 7, Stage: exact.Stage, Delivery: exact.Delivery, Target: "/run/paje/secrets/other", Required: true}},
+		"optional":             {{Capability: exact.Capability, BindingRevision: 7, Stage: exact.Stage, Delivery: exact.Delivery, Target: exact.Target}},
+		"unsupported harness":  {{Capability: "harness.other", BindingRevision: 7, Stage: exact.Stage, Delivery: exact.Delivery, Target: exact.Target, Required: true}},
+		"duplicate capability": {exact, exact},
+		"malformed workload":   {exact, {Capability: "", BindingRevision: 9, Stage: workerprofile.StageAgent, Delivery: workerprofile.DeliveryEnvironment, Target: "WORKLOAD_TOKEN", Required: true}},
+	}
+	for name, requirements := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := adapter.AgentEnvironment(requirements); err == nil {
+				t.Fatal("AgentEnvironment() error = nil")
+			}
+		})
 	}
 }

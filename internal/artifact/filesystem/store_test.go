@@ -455,7 +455,7 @@ func TestMemberDigestsAreVerified(t *testing.T) {
 		{Name: "changes.patch", SHA256: "37ccc013b5e1b4412daf98cc7d0a2449d56ec4de799cd0408bb5b0429599e207", Size: 31},
 		{Name: "agent-output.txt", SHA256: "39d8ba2ada2b71567f9e0c8e3cf54e857a990a4a83aa9a03a102b9c44aba1bf7", Size: 12},
 		{Name: "execution.json", SHA256: "cd7500269fbe5eda26d71cc8a500fd0e560e210256f73bc303feb271291be2e2", Size: 80},
-		{Name: "verification.json", SHA256: "fc510c02ee052e21115aee395c8487ff258ae791635313b3f5ad37a021d4a0fb", Size: 235},
+		{Name: "verification.json", SHA256: "1d0f2275f12d4a8a068cd81373179f05bb8e8b1ac517184cfb15fa76c982d3ef", Size: 259},
 		{Name: "preflight.json", SHA256: "dbe343b13cce473846c0c82448552f060fe6d6d3a404a52fe1a529d9adbafe46", Size: 72},
 		{Name: "warnings.json", SHA256: "2cb92aff025886ffc3c3e9f5222a0bb23976430250379e5d0a11e2e035a5c807", Size: 25},
 	}

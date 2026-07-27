@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/araihu/paje/internal/executor"
@@ -48,10 +49,41 @@ func TestRegistryRejectsDuplicateAndInvalidAdapters(t *testing.T) {
 	}
 }
 
+func TestRegistryDerivesAgentEnvironmentFromDefensiveRequirementAndMapCopies(t *testing.T) {
+	returned := map[string]string{"CODEX_HOME": "/run/paje/secrets/codex"}
+	adapter := stubAdapter{
+		id: "codex", version: "0.144.5",
+		capabilities: map[string]bool{"harness.codex-auth": true},
+		agentEnvironment: func(requirements []workerprofile.SecretRequirement) (map[string]string, error) {
+			requirements[0].Target = "/run/paje/secrets/mutated"
+			return returned, nil
+		},
+	}
+	registry, err := NewRegistry(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := profileWithHarness(t, "codex", "0.144.5", "harness.codex-auth")
+	original := profile.Clone()
+
+	resolved, environment, err := registry.ResolveAgent(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	returned["CODEX_HOME"] = "/run/paje/secrets/drifted"
+	if resolved.ID() != "codex" || environment["CODEX_HOME"] != "/run/paje/secrets/codex" {
+		t.Fatalf("ResolveAgent() adapter=%#v environment=%#v", resolved, environment)
+	}
+	if !reflect.DeepEqual(profile, original) {
+		t.Fatalf("ResolveAgent() mutated persisted profile: got=%#v want=%#v", profile, original)
+	}
+}
+
 type stubAdapter struct {
-	id           string
-	version      string
-	capabilities map[string]bool
+	id               string
+	version          string
+	capabilities     map[string]bool
+	agentEnvironment func([]workerprofile.SecretRequirement) (map[string]string, error)
 }
 
 func (adapter stubAdapter) ID() string              { return adapter.id }
@@ -63,6 +95,12 @@ func (adapter stubAdapter) AgentCommand(string) (executor.Command, error) {
 func (adapter stubAdapter) Parse(executor.Result) (string, error) { return "", nil }
 func (adapter stubAdapter) AcceptsCapability(capability string) bool {
 	return adapter.capabilities[capability]
+}
+func (adapter stubAdapter) AgentEnvironment(requirements []workerprofile.SecretRequirement) (map[string]string, error) {
+	if adapter.agentEnvironment != nil {
+		return adapter.agentEnvironment(requirements)
+	}
+	return nil, nil
 }
 
 type stubPointerAdapter struct{ stubAdapter }

@@ -11,10 +11,12 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/araihu/paje/internal/artifact"
 	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/verification"
 	"github.com/araihu/paje/internal/workerprofile"
 )
 
@@ -42,6 +44,7 @@ type Request struct {
 	ArtifactManifest  artifact.Manifest          `json:"artifact_manifest"`
 	WorkerProfile     workerprofile.Snapshot     `json:"worker_profile"`
 	ExecutionEvidence artifact.ExecutionEvidence `json:"execution_evidence"`
+	Verification      []verification.Result      `json:"verification"`
 	Title             string                     `json:"title"`
 	Body              string                     `json:"body"`
 	Draft             bool                       `json:"draft"`
@@ -91,6 +94,9 @@ func (r Request) ValidatePortable() error {
 	case len(r.ArtifactManifest.Changes) == 0:
 		return invalid("artifact manifest changes are required")
 	default:
+		if err := validateVerificationPlanBinding(r); err != nil {
+			return invalid(err.Error())
+		}
 		if err := validatePortableEvidence(r); err != nil {
 			return invalid(err.Error())
 		}
@@ -179,7 +185,18 @@ func CloneRequest(req Request) Request {
 	cloned.ArtifactManifest.MemoryIDs = append([]string(nil), req.ArtifactManifest.MemoryIDs...)
 	cloned.WorkerProfile = req.WorkerProfile.Clone()
 	cloned.ExecutionEvidence = cloneExecutionEvidence(req.ExecutionEvidence)
+	cloned.Verification = cloneVerification(req.Verification)
 	return cloned
+}
+
+// CloneVerification returns an independent copy of the frozen artifact
+// verification plan carried across the workflow/publisher boundary.
+func CloneVerification(source []verification.Result) []verification.Result {
+	clone := cloneVerification(source)
+	if clone == nil {
+		return []verification.Result{}
+	}
+	return clone
 }
 
 // RequestsEqual compares the complete immutable publication subject.
@@ -240,31 +257,216 @@ func validatePortableEvidence(request Request) error {
 			return errors.New("portable tool evidence does not match worker profile")
 		}
 	}
-	agentFound := false
-	for _, attempt := range *evidence.Attempts {
+	attempts := *evidence.Attempts
+	agentIndex := -1
+	attemptKeys := make(map[string]struct{}, len(attempts))
+	for index, attempt := range attempts {
 		if err := attempt.ID.Validate(); err != nil || attempt.ID.RunID != request.RunID ||
 			attempt.Started && !attempt.Created || attempt.Completed && !attempt.Started {
 			return errors.New("portable attempt evidence does not match run")
 		}
+		if _, duplicate := attemptKeys[attempt.ID.Key()]; duplicate {
+			return errors.New("portable attempt evidence is duplicated")
+		}
+		attemptKeys[attempt.ID.Key()] = struct{}{}
 		if attempt.ID.Purpose == executor.PurposeAgent {
-			if agentFound || attempt.ID.Sequence != 0 ||
+			if agentIndex >= 0 || attempt.ID.Sequence != 0 ||
 				evidence.ExitCode != attempt.ExitCode || evidence.Started != attempt.Started ||
 				evidence.Completed != attempt.Completed || evidence.Truncated != attempt.Truncated {
 				return errors.New("portable agent evidence is inconsistent")
 			}
-			agentFound = true
+			agentIndex = index
 		}
 	}
-	if !agentFound {
+	if agentIndex < 0 {
 		return errors.New("portable agent evidence is missing")
 	}
-	if !reflect.DeepEqual(
-		[]string(*evidence.VerificationEnvironmentKeys),
-		[]string{"HOME", "PATH", "TMPDIR"},
-	) {
-		return errors.New("portable verification environment evidence is unsupported")
+	agentAttempt := attempts[agentIndex]
+	verificationAttempts := make(map[int]artifact.AttemptEvidence)
+	for _, attempt := range attempts {
+		if attempt.ID.Stage != agentAttempt.ID.Stage ||
+			attempt.ID.Attempt != agentAttempt.ID.Attempt ||
+			!attempt.ID.StartedAt.Equal(agentAttempt.ID.StartedAt) {
+			return errors.New("portable attempt generation evidence drifted")
+		}
+		if attempt.ID.Purpose != executor.PurposeVerification {
+			continue
+		}
+		if attempt.ID.Sequence <= 0 {
+			return errors.New("portable verification attempt sequence is invalid")
+		}
+		if _, duplicate := verificationAttempts[attempt.ID.Sequence]; duplicate {
+			return errors.New("portable verification attempt sequence is duplicated")
+		}
+		verificationAttempts[attempt.ID.Sequence] = attempt
+	}
+	if err := validateAgentEnvironmentEvidence(request.WorkerProfile, evidence, agentAttempt.Started); err != nil {
+		return err
+	}
+	if err := validateVerificationEnvironmentEvidence(
+		evidence.VerificationEnvironmentKeys,
+		request.Verification,
+		verificationAttempts,
+	); err != nil {
+		return err
 	}
 	return nil
+}
+
+func validateAgentEnvironmentEvidence(
+	profile workerprofile.Snapshot,
+	evidence artifact.ExecutionEvidence,
+	confirmed bool,
+) error {
+	if !confirmed {
+		if evidence.AgentEnvironmentKeys != nil {
+			return errors.New("portable agent environment evidence claims an unconfirmed presentation")
+		}
+		return nil
+	}
+	if evidence.AgentEnvironmentKeys == nil {
+		return errors.New("portable confirmed agent environment evidence is missing")
+	}
+	expected := map[string]struct{}{"HOME": {}, "PATH": {}, "TMPDIR": {}}
+	for _, requirement := range profile.Secrets {
+		switch {
+		case requirement.Capability == "harness.codex-auth":
+			if requirement.BindingRevision == 0 || requirement.Stage != workerprofile.StageAgent ||
+				requirement.Delivery != workerprofile.DeliveryDirectory ||
+				requirement.Target != "/run/paje/secrets/codex" || !requirement.Required {
+				return errors.New("portable Codex auth environment requirement is not exact")
+			}
+			expected["CODEX_HOME"] = struct{}{}
+		case strings.HasPrefix(requirement.Capability, "harness."):
+			return errors.New("portable harness environment requirement is unsupported")
+		}
+		if requirement.Delivery == workerprofile.DeliveryEnvironment {
+			expected[requirement.Target] = struct{}{}
+		}
+	}
+	want := make([]string, 0, len(expected))
+	for key := range expected {
+		want = append(want, key)
+	}
+	sort.Strings(want)
+	if !reflect.DeepEqual([]string(*evidence.AgentEnvironmentKeys), want) {
+		return errors.New("portable agent environment evidence does not match exact declaration")
+	}
+	return nil
+}
+
+func validateVerificationEnvironmentEvidence(
+	keys *artifact.EnvironmentKeyList,
+	plan []verification.Result,
+	attempts map[int]artifact.AttemptEvidence,
+) error {
+	if keys == nil {
+		return errors.New("portable verification environment evidence is missing")
+	}
+	actual := []string(*keys)
+	if len(plan) == 0 {
+		if len(attempts) != 0 || len(actual) != 0 {
+			return errors.New("portable verification evidence contradicts the frozen zero-attempt plan")
+		}
+		return nil
+	}
+	if len(attempts) != len(plan) {
+		return errors.New("portable verification attempt evidence does not match frozen plan")
+	}
+	expected := make(map[string]struct{}, 4)
+	for index, scheduled := range plan {
+		attempt, found := attempts[index+1]
+		if !found || !attempt.Started {
+			return errors.New("portable verification attempt confirmation is missing")
+		}
+		expected["HOME"] = struct{}{}
+		expected["PATH"] = struct{}{}
+		expected["TMPDIR"] = struct{}{}
+		for _, key := range scheduled.Command.EnvironmentKeys {
+			expected[key] = struct{}{}
+		}
+	}
+	want := make([]string, 0, len(expected))
+	for key := range expected {
+		want = append(want, key)
+	}
+	sort.Strings(want)
+	if !reflect.DeepEqual(actual, want) {
+		return errors.New("portable verification environment evidence does not match exact declaration")
+	}
+	return nil
+}
+
+func validateVerificationPlanBinding(request Request) error {
+	if request.Verification == nil {
+		return errors.New("portable frozen verification plan is missing")
+	}
+	for _, result := range request.Verification {
+		if result.Command.Environment != nil {
+			return errors.New("portable frozen verification declaration drifted")
+		}
+		if err := validateVerificationEnvironmentDeclaration(result.Command.EnvironmentKeys); err != nil {
+			return err
+		}
+	}
+	want, err := verificationPlanMember(request.Verification, request.ArtifactManifest)
+	if err != nil {
+		return errors.New("portable frozen verification plan cannot be encoded")
+	}
+	found := false
+	for _, member := range request.ArtifactManifest.Members {
+		if member.Name != "verification.json" {
+			continue
+		}
+		if found || member != want {
+			return errors.New("portable frozen verification plan does not match artifact digest")
+		}
+		found = true
+	}
+	if !found {
+		return errors.New("portable frozen verification plan digest is missing")
+	}
+	return nil
+}
+
+func validateVerificationEnvironmentDeclaration(keys []string) error {
+	if keys == nil {
+		return errors.New("portable frozen verification environment declaration is missing")
+	}
+	previous := ""
+	for _, key := range keys {
+		if key != "GOWORK" || previous != "" && key <= previous {
+			return errors.New("portable frozen verification environment declaration is invalid")
+		}
+		previous = key
+	}
+	return nil
+}
+
+func verificationPlanMember(
+	plan []verification.Result,
+	manifest artifact.Manifest,
+) (artifact.Member, error) {
+	manifest.Members = nil
+	normalized, _, _, err := artifact.Canonicalize(artifact.Bundle{
+		Manifest:     manifest,
+		ChangesPatch: []byte("frozen verification plan binding"),
+		ExecutionMetadata: json.RawMessage(
+			`{"completed":false,"duration":0,"exit_code":0,"started":false,"truncated":false}`,
+		),
+		Verification: cloneVerification(plan),
+		Preflight:    map[string]string{},
+		Warnings:     []string{},
+	})
+	if err != nil {
+		return artifact.Member{}, err
+	}
+	for _, member := range normalized.Manifest.Members {
+		if member.Name == "verification.json" {
+			return member, nil
+		}
+	}
+	return artifact.Member{}, errors.New("canonical verification member is missing")
 }
 
 func validateRuntimeEvidence(profile workerprofile.Snapshot, evidence artifact.RuntimeEvidence) error {
@@ -322,6 +524,29 @@ func cloneExecutionEvidence(source artifact.ExecutionEvidence) artifact.Executio
 		value := make(artifact.EnvironmentKeyList, len(*source.VerificationEnvironmentKeys))
 		copy(value, *source.VerificationEnvironmentKeys)
 		clone.VerificationEnvironmentKeys = &value
+	}
+	return clone
+}
+
+func cloneVerification(source []verification.Result) []verification.Result {
+	if source == nil {
+		return nil
+	}
+	clone := make([]verification.Result, len(source))
+	copy(clone, source)
+	for index := range clone {
+		clone[index].Command.Args = append([]string(nil), source[index].Command.Args...)
+		if source[index].Command.EnvironmentKeys != nil {
+			clone[index].Command.EnvironmentKeys = append(
+				[]string{}, source[index].Command.EnvironmentKeys...,
+			)
+		}
+		if source[index].Command.Environment != nil {
+			clone[index].Command.Environment = make(map[string]string, len(source[index].Command.Environment))
+			for key, value := range source[index].Command.Environment {
+				clone[index].Command.Environment[key] = value
+			}
+		}
 	}
 	return clone
 }

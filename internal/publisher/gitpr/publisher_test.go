@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,11 +76,11 @@ func TestPublisherVerificationAttemptIdentitiesAreDeterministicDistinctAndReplay
 	request := fixture.requestWithVerificationCommands([]verification.Command{
 		{
 			Name: "go test", Directory: ".", Executable: "go",
-			Args: []string{"test", "./..."}, Timeout: time.Minute, Required: true,
+			Args: []string{"test", "./..."}, EnvironmentKeys: []string{"GOWORK"}, Timeout: time.Minute, Required: true,
 		},
 		{
 			Name: "go vet", Directory: ".", Executable: "go",
-			Args: []string{"vet", "./..."}, Timeout: time.Minute, Required: true,
+			Args: []string{"vet", "./..."}, EnvironmentKeys: []string{"GOWORK"}, Timeout: time.Minute, Required: true,
 		},
 	})
 
@@ -608,6 +609,7 @@ func newPublicationFixture(t *testing.T) *publicationFixture {
 		Branch: "paje/code-change/run-123", Artifact: ref,
 		ArtifactManifest: bundle.Manifest, WorkerProfile: profile,
 		ExecutionEvidence: executionEvidence,
+		Verification:      publisher.CloneVerification(bundle.Verification),
 		Title:             "Update value", Body: "Generated safely by Pajé.", Draft: true,
 	}
 	fixture.publisher, err = New(Dependencies{
@@ -648,9 +650,15 @@ func (f *publicationFixture) captureArtifact(value string) artifact.Reference {
 			StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
 		},
 		Created: true, Started: true, Completed: true, Destroyed: true,
+	}, {
+		ID: executor.AttemptID{
+			RunID: "run-123", Stage: "execute", Attempt: 1,
+			StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeVerification, Sequence: 1,
+		},
+		Created: true, Started: true, Completed: true, Destroyed: true,
 	}}
 	agentEnvironment := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
-	verificationEnvironment := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
+	verificationEnvironment := artifact.EnvironmentKeyList{"GOWORK", "HOME", "PATH", "TMPDIR"}
 	execution, err := json.Marshal(artifact.ExecutionEvidence{
 		ExitCode: 0, Duration: 1, Started: true, Completed: true,
 		Profile: &artifact.WorkerProfileEvidence{
@@ -679,7 +687,7 @@ func (f *publicationFixture) captureArtifact(value string) artifact.Reference {
 		Verification: []verification.Result{{
 			Command: verification.Command{
 				Name: "go test", Directory: ".", Executable: "go",
-				Args: []string{"test", "./..."}, Timeout: time.Minute, Required: true,
+				Args: []string{"test", "./..."}, EnvironmentKeys: []string{"GOWORK"}, Timeout: time.Minute, Required: true,
 			},
 			ExitCode: 0, Passed: true,
 		}},
@@ -700,7 +708,42 @@ func (f *publicationFixture) requestWithVerificationCommands(commands []verifica
 	}
 	bundle.Verification = make([]verification.Result, len(commands))
 	for index, command := range commands {
+		if command.EnvironmentKeys == nil {
+			command.EnvironmentKeys = []string{}
+		}
 		bundle.Verification[index] = verification.Result{Command: command, Passed: true}
+	}
+	evidence, err := publisher.DecodeExecutionEvidence(bundle.ExecutionMetadata)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	attempts := artifact.AttemptEvidenceList{}
+	for _, attempt := range *evidence.Attempts {
+		if attempt.ID.Purpose != executor.PurposeVerification {
+			attempts = append(attempts, attempt)
+		}
+	}
+	verificationKeys := map[string]struct{}{}
+	for index, command := range commands {
+		attempt := confirmedVerificationAttemptForFixture(attempts[0].ID, index+1)
+		attempts = append(attempts, attempt)
+		verificationKeys["HOME"] = struct{}{}
+		verificationKeys["PATH"] = struct{}{}
+		verificationKeys["TMPDIR"] = struct{}{}
+		for _, key := range command.EnvironmentKeys {
+			verificationKeys[key] = struct{}{}
+		}
+	}
+	keys := make(artifact.EnvironmentKeyList, 0, len(verificationKeys))
+	for key := range verificationKeys {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	evidence.Attempts = &attempts
+	evidence.VerificationEnvironmentKeys = &keys
+	bundle.ExecutionMetadata, err = json.Marshal(evidence)
+	if err != nil {
+		f.t.Fatal(err)
 	}
 	reference, err := f.store.Save(context.Background(), bundle)
 	if err != nil {
@@ -710,7 +753,7 @@ func (f *publicationFixture) requestWithVerificationCommands(commands []verifica
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	evidence, err := publisher.DecodeExecutionEvidence(bound.ExecutionMetadata)
+	evidence, err = publisher.DecodeExecutionEvidence(bound.ExecutionMetadata)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -718,7 +761,19 @@ func (f *publicationFixture) requestWithVerificationCommands(commands []verifica
 	request.Artifact = reference
 	request.ArtifactManifest = bound.Manifest
 	request.ExecutionEvidence = evidence
+	request.Verification = publisher.CloneVerification(bound.Verification)
 	return request
+}
+
+func confirmedVerificationAttemptForFixture(
+	agent executor.AttemptID,
+	sequence int,
+) artifact.AttemptEvidence {
+	agent.Purpose = executor.PurposeVerification
+	agent.Sequence = sequence
+	return artifact.AttemptEvidence{
+		ID: agent, Created: true, Started: true, Completed: true, Destroyed: true,
+	}
 }
 
 func (f *publicationFixture) git(args ...string) string {

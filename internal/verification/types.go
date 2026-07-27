@@ -42,6 +42,11 @@ type Command struct {
 	Directory  string
 	Executable string
 	Args       []string
+	// EnvironmentKeys is keys-only durable result evidence for the exact
+	// command-specific environment declaration confirmed at child start. Nil
+	// means absent or unconfirmed; an empty slice is an explicit declaration
+	// with no command-specific keys. Values are never durable.
+	EnvironmentKeys []string `json:"environment_keys"`
 	// Environment contains command-specific exact-environment overrides.
 	// It is intentionally separate from Args so callers never need shell syntax
 	// for values such as GOWORK=off.

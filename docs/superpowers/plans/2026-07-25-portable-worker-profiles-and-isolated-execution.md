@@ -168,16 +168,24 @@ local fallback requires an inactive marker.
 #### PW-12.1 — harness/workflow/artifact/publisher truth
 
 - Dependencies: integrated `PW-12.2` after accepted `PW-12.2R`.
-- Owned paths: `internal/harness/**`,
+- Owned paths: this canonical plan and its linked portable-worker design,
+  `internal/harness/harness.go`, `internal/harness/registry.go`,
+  `internal/harness/registry_test.go`, `internal/harness/codex/adapter.go`,
+  `internal/harness/codex/adapter_test.go`,
   `internal/workflow/codechange/execute.go`,
   `internal/workflow/codechange/execute_test.go`,
-  `internal/workflow/codechange/resolve_test.go`, `internal/artifact/**`, and
-  `internal/publisher/**` only.
+  `internal/workflow/codechange/resolve_test.go`,
+  `internal/workflow/codechange/publish.go`, `internal/publisher/publisher.go`,
+  `internal/publisher/publisher_test.go`, and the fixture-only refreeze of
+  `internal/publisher/gitpr/publisher_test.go`, plus the final exact refreeze of
+  `internal/verification/types.go` and the canonical-digest fixture migration
+  in `internal/artifact/filesystem/store_test.go` only.
 - Acceptance: `PW-SC01`, `PW-H01`, `PW-EV01`, and `PW-PU01`, including exact
   Codex tuple denial, defensive-copy mutation tests, no pre-child presented-key
   evidence, separately derived confirmed-attempt state and exact key unions,
-  plus publisher cases for no attempt, confirmed-empty, confirmed-nonempty,
-  partial, extra, inverse, and drift.
+  plus publisher cases for no attempt, confirmed-empty declaration with exact
+  baseline, confirmed-nonempty declaration, stripped-empty, partial, extra,
+  inverse, and drift.
 - `execution_placement`: isolated implementation worktree.
 - `parallelism_primitive`: `persistent_session`.
 - `placement_rationale`: durable workflow and evidence mutation crosses several
@@ -188,6 +196,22 @@ local fallback requires an inactive marker.
 - `fallback`: block until the accepted foundation is integrated; do not alter
   executor, sandbox-init, workspace, documentation, site, or chart paths.
 - `promotion_trigger`: `none`.
+
+Requirement coverage, not a historical session or criterion count, closes
+this node:
+
+- `PW-SC01`: every executor request runs `ValidateDeclaration` before executor
+  dispatch, and the full agent declaration is validated before first acquire;
+- `PW-H01`: `AgentEnvironment` receives a defensive requirement copy and only
+  the exact Codex auth tuple yields the exact `CODEX_HOME` binding;
+- `PW-EV01`: child-start receipt confirmation controls per-attempt state and
+  the derived agent/verification key unions, after recomputing the exact
+  request-bound environment/materialization digest; and
+- `PW-PU01`: portable publisher validation covers skipped, confirmed-empty
+  declaration with exact baseline, confirmed-nonempty declaration,
+  stripped-empty, partial, extra, inverse, missing, and generation-drifted
+  evidence against the defensively copied, manifest-authenticated frozen
+  verification plan without historical compatibility.
 
 #### PW-12.1R — independent truth-contract review
 
@@ -1344,9 +1368,11 @@ generic lifecycle flags, exit/duration/truncation, safe environment key names,
 and verification results. Reject any artifact or diagnostic containing a
 detector match, provider/source value, engine detail, or ephemeral host path.
 Record confirmed attempt identity/generation separately from each attempt's
-presented-key names, and derive top-level key unions from confirmed child-start
-receipts only; a confirmed attempt with zero non-baseline keys remains an
-explicit confirmed-empty attempt.
+presented-key names. After accepting the exact child-start receipt, persist the
+sorted keys-only command declaration as `verification.Command.EnvironmentKeys`
+and derive top-level key unions from confirmed receipts only; a confirmed
+attempt with zero command-specific keys remains explicit while its union still
+contains the canonical baseline.
 
 - [ ] **Step 6: Run the workflow, artifact, policy, race, and fencing gates**
 
@@ -1404,16 +1430,17 @@ changes:
 | Case | Confirmed attempts | Presented-key union | Expected |
 | --- | --- | --- | --- |
 | no attempt | frozen plan requires zero | empty | accept |
-| confirmed-empty | exact child-start receipt | empty | accept |
-| confirmed-nonempty | exact child-start receipt | exact nonempty union | accept |
+| confirmed-empty declaration | exact child-start receipt and authenticated `EnvironmentKeys: []` | exact baseline | accept |
+| stripped confirmed union | exact child-start receipt and authenticated declaration | empty | reject |
+| confirmed-nonempty declaration | exact child-start receipt and authenticated declared keys | exact baseline plus declaration union | accept |
 | partial | exact receipts | missing derived key | reject |
 | extra | exact receipts | unpresented key | reject |
 | inverse | receipt facts and claimed confirmation disagree | any | reject |
 | drift | attempt identity/generation or keys differ from receipts | any | reject |
 
-An empty union never proves that no verification child ran. Missing confirmed-
-attempt evidence fails when verification was required or receipts prove a child
-started.
+An empty union is valid only for a frozen zero-attempt plan. Missing confirmed-
+attempt evidence or authenticated command-key declarations fail when
+verification was scheduled or receipts prove a child started.
 
 - [ ] **Step 2: Run publisher tests and confirm they fail**
 

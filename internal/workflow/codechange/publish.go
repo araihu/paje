@@ -175,6 +175,7 @@ func buildPublisherRequestWithBundle(
 	request.ArtifactManifest = bundle.Manifest
 	request.WorkerProfile = record.WorkerProfile.Clone()
 	request.ExecutionEvidence = executionEvidence
+	request.Verification = publisher.CloneVerification(bundle.Verification)
 	if err := request.ValidatePortable(); err != nil {
 		return publisher.Request{}, err
 	}

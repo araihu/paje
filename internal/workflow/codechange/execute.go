@@ -2,6 +2,8 @@ package codechange
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,27 +35,29 @@ const (
 )
 
 type executeOutcome struct {
-	execution        executor.Result
-	agentOutput      string
-	profile          repository.ProfileResult
-	verification     []verification.Result
-	capture          gitcapture.Result
-	profileSnapshot  workerprofile.Snapshot
-	runtimeIsolated  bool
-	runtimeCertified bool
-	harnessEvidence  artifact.HarnessEvidence
-	toolEvidence     []artifact.ToolEvidence
-	attemptEvidence  []artifact.AttemptEvidence
-	artifact         *artifact.Reference
-	failure          *run.Failure
-	cause            error
-	cleanupFailed    bool
-	evidence         map[string]string
-	scrubber         durableScrubber
-	ownership        stageOwnership
-	ownershipLost    bool
-	ownershipRecord  run.Record
-	ownershipErr     error
+	execution                executor.Result
+	agentOutput              string
+	profile                  repository.ProfileResult
+	verification             []verification.Result
+	capture                  gitcapture.Result
+	profileSnapshot          workerprofile.Snapshot
+	runtimeIsolated          bool
+	runtimeCertified         bool
+	harnessEvidence          artifact.HarnessEvidence
+	toolEvidence             []artifact.ToolEvidence
+	attemptEvidence          []artifact.AttemptEvidence
+	confirmedEnvironmentKeys map[string][]string
+	confirmedCommandKeys     map[string][]string
+	artifact                 *artifact.Reference
+	failure                  *run.Failure
+	cause                    error
+	cleanupFailed            bool
+	evidence                 map[string]string
+	scrubber                 durableScrubber
+	ownership                stageOwnership
+	ownershipLost            bool
+	ownershipRecord          run.Record
+	ownershipErr             error
 }
 
 type activeLease struct {
@@ -322,9 +326,11 @@ func (s *Service) executePrepared(
 ) executeOutcome {
 	scrubber, scrubberErr := newDurableScrubber(workspacePath)
 	outcome := executeOutcome{
-		evidence:  make(map[string]string),
-		scrubber:  scrubber,
-		ownership: ownership,
+		evidence:                 make(map[string]string),
+		confirmedEnvironmentKeys: make(map[string][]string),
+		confirmedCommandKeys:     make(map[string][]string),
+		scrubber:                 scrubber,
+		ownership:                ownership,
 	}
 	if scrubberErr != nil {
 		return outcome.withFailure(unsafeEphemeralPrefixFailure(), scrubberErr)
@@ -337,16 +343,23 @@ func (s *Service) executePrepared(
 	if err != nil {
 		return outcome.withFailure(executorUnavailableFailure(), err)
 	}
-	adapter, err := s.harnesses.Resolve(outcome.profileSnapshot)
+	adapter, agentEnvironment, err := s.harnesses.ResolveAgent(outcome.profileSnapshot)
 	if err != nil {
 		return outcome.withFailure(executorUnavailableFailure(), err)
+	}
+	baseline := sandboxEnvironment()
+	agentAttempt := executorAttempt(record.ID, ownership, executor.PurposeAgent, 0)
+	if err := validateAgentEnvironmentDeclaration(
+		agentAttempt, outcome.profileSnapshot, workspacePath, baseline, agentEnvironment,
+	); err != nil {
+		return outcome.withFailure(agentEnvironmentFailure(), err)
 	}
 	fenced := &fencedExecutor{
 		service: s, target: target, runID: record.ID, ownership: ownership, outcome: &outcome,
 	}
-	baseline := sandboxEnvironment()
-	outcome.evidence["agent_environment_keys"] = encodeStrings(sortedMapKeys(baseline))
-	outcome.evidence["verification_environment_keys"] = encodeStrings(sortedMapKeys(baseline))
+	outcome.evidence["agent_attempt_started"] = "false"
+	outcome.evidence["verification_attempt_started"] = "false"
+	outcome.evidence["verification_environment_keys"] = "[]"
 
 	harnessProbe := adapter.Probe()
 	harnessResult, probeErr, probeCleanupErr := fenced.runProbe(
@@ -429,25 +442,32 @@ func (s *Service) executePrepared(
 		return outcome.withFailure(failure, err)
 	}
 
+	agentCommand, err := adapter.AgentCommand(prompt)
+	if err != nil {
+		return outcome.withFailure(agentProtocolFailure(), err)
+	}
+	agentCommand.Environment, err = mergeAgentEnvironment(agentCommand.Environment, agentEnvironment)
+	if err != nil {
+		return outcome.withFailure(agentEnvironmentFailure(), err)
+	}
+	agentRequest := executor.Request{
+		Attempt: agentAttempt, Profile: outcome.profileSnapshot.Clone(), Command: agentCommand,
+		Workspace:   executor.Workspace{HostPath: workspacePath, SandboxPath: executor.SandboxWorkspaceRoot, Writable: true},
+		Environment: cloneStringMap(baseline),
+		Timeout:     s.executeLease, OutputLimit: defaultOutputLimit,
+	}
+	if err := agentRequest.ValidateDeclaration(); err != nil {
+		agentRequest.Destroy()
+		return outcome.withFailure(agentEnvironmentFailure(), err)
+	}
 	leases, acquireErr := s.acquireAgentLeases(ctx, record, ownership, &outcome)
 	if acquireErr != nil {
+		agentRequest.Destroy()
 		return outcome.withFailure(secretAcquisitionFailure(ctx), acquireErr)
 	}
 	detector := detectorForLeases(leases)
 	defer detector.Destroy()
-	agentCommand, err := adapter.AgentCommand(prompt)
-	if err != nil {
-		cleanupErr := s.cleanupAgent(ctx, fenced, leases, false)
-		outcome = outcome.withFailure(agentProtocolFailure(), err)
-		return outcome.withCleanupFailure(cleanupErr)
-	}
-	agentAttempt := executorAttempt(record.ID, ownership, executor.PurposeAgent, 0)
-	agentRequest := executor.Request{
-		Attempt: agentAttempt, Profile: outcome.profileSnapshot.Clone(), Command: agentCommand,
-		Workspace:   executor.Workspace{HostPath: workspacePath, SandboxPath: executor.SandboxWorkspaceRoot, Writable: true},
-		Environment: cloneStringMap(baseline), Secrets: leaseMaterializations(leases),
-		Timeout: s.executeLease, OutputLimit: defaultOutputLimit,
-	}
+	agentRequest.Secrets = leaseMaterializations(leases)
 	var executorErr error
 	outcome.execution, executorErr = fenced.Execute(ctx, agentRequest)
 	agentRequest.Destroy()
@@ -658,7 +678,7 @@ func (s *Service) runVerification(
 	if err != nil {
 		return outcome.withFailure(executorUnavailableFailure(), err)
 	}
-	for _, original := range outcome.profile.Commands {
+	for index, original := range outcome.profile.Commands {
 		command := original
 		command.Directory, err = durableDirectory(workspacePath, command.Directory)
 		if err != nil {
@@ -666,6 +686,9 @@ func (s *Service) runVerification(
 				Diagnostic: "verification command directory is unsafe", CauseCode: "verification_internal"}, err)
 		}
 		result := runner.Run(ctx, command)
+		result.Command.EnvironmentKeys = fenced.outcome.commandEnvironmentKeys(
+			executorAttempt(record.ID, outcome.ownership, executor.PurposeVerification, index+1),
+		)
 		outcome.verification = append(outcome.verification, result)
 		if outcome.ownershipLost {
 			return outcome
@@ -726,6 +749,43 @@ func sandboxEnvironment() map[string]string {
 	}
 }
 
+func validateAgentEnvironmentDeclaration(
+	attempt executor.AttemptID,
+	profile workerprofile.Snapshot,
+	workspacePath string,
+	baseline map[string]string,
+	agentEnvironment map[string]string,
+) error {
+	request := executor.Request{
+		Attempt: attempt, Profile: profile.Clone(),
+		Command: executor.Command{
+			Executable: "codex", Directory: executor.SandboxWorkspaceRoot,
+			Environment: cloneStringMap(agentEnvironment),
+		},
+		Workspace: executor.Workspace{
+			HostPath: workspacePath, SandboxPath: executor.SandboxWorkspaceRoot, Writable: true,
+		},
+		Environment: cloneStringMap(baseline), Timeout: defaultSandboxTimeout,
+		OutputLimit: defaultOutputLimit,
+	}
+	defer request.Destroy()
+	return request.ValidateDeclaration()
+}
+
+func mergeAgentEnvironment(command, derived map[string]string) (map[string]string, error) {
+	merged := cloneStringMap(command)
+	if merged == nil {
+		merged = make(map[string]string, len(derived))
+	}
+	for key, value := range derived {
+		if _, collision := merged[key]; collision {
+			return nil, errors.New("agent command environment collides with harness environment")
+		}
+		merged[key] = value
+	}
+	return merged, nil
+}
+
 func sortedMapKeys(values map[string]string) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -753,11 +813,23 @@ func (target *fencedExecutor) check(ctx context.Context) bool {
 }
 
 func (target *fencedExecutor) Execute(ctx context.Context, request executor.Request) (executor.Result, error) {
+	if err := request.ValidateDeclaration(); err != nil {
+		return executor.Result{}, err
+	}
 	if !target.check(ctx) {
 		return executor.Result{}, ErrPhaseInProgress
 	}
 	result, executeErr := target.target.Execute(ctx, request)
-	target.recordExecution(request.Attempt, result)
+	if receiptErr := validateChildStartConfirmation(request, result); receiptErr != nil {
+		result.Started = false
+		result.Completed = false
+		result.ChildStartReceipt = nil
+		executeErr = errors.Join(
+			executeErr,
+			executor.WrapError("internal", "ambiguous_attempt", receiptErr),
+		)
+	}
+	target.recordExecution(request, result)
 	if request.Attempt.Purpose == executor.PurposeAgent && result.Started {
 		if err := target.service.checkpointAgentLifecycle(ctx, target.runID, target.ownership, result); err != nil {
 			executeErr = errors.Join(executeErr, err)
@@ -838,8 +910,8 @@ func (target *fencedExecutor) runProbe(
 	return result, err, destroyErr
 }
 
-func (target *fencedExecutor) recordExecution(attempt executor.AttemptID, result executor.Result) {
-	target.markAttempt(attempt, func(evidence *artifact.AttemptEvidence) {
+func (target *fencedExecutor) recordExecution(request executor.Request, result executor.Result) {
+	target.markAttempt(request.Attempt, func(evidence *artifact.AttemptEvidence) {
 		evidence.Created = result.Created
 		evidence.Started = result.Started
 		evidence.Completed = result.Completed
@@ -847,6 +919,119 @@ func (target *fencedExecutor) recordExecution(attempt executor.AttemptID, result
 		evidence.Duration = result.Duration.Seconds()
 		evidence.Truncated = result.StdoutTruncated || result.StderrTruncated
 	})
+	if !result.Started {
+		return
+	}
+	target.outcome.confirmedEnvironmentKeys[request.Attempt.Key()] = presentedEnvironmentKeys(request)
+	target.outcome.confirmedCommandKeys[request.Attempt.Key()] = sortedMapKeys(request.Command.Environment)
+	switch request.Attempt.Purpose {
+	case executor.PurposeAgent:
+		target.outcome.evidence["agent_attempt_started"] = "true"
+		target.outcome.evidence["agent_environment_keys"] = encodeStrings(
+			target.outcome.environmentKeys(executor.PurposeAgent),
+		)
+	case executor.PurposeVerification:
+		target.outcome.evidence["verification_attempt_started"] = "true"
+		target.outcome.evidence["verification_environment_keys"] = encodeStrings(
+			target.outcome.environmentKeys(executor.PurposeVerification),
+		)
+	}
+}
+
+func validateChildStartConfirmation(request executor.Request, result executor.Result) error {
+	if !result.Started {
+		if result.Completed || result.ChildStartReceipt != nil {
+			return errors.New("executor result claims completion or receipt without child start")
+		}
+		return nil
+	}
+	if !result.Created || result.ChildStartReceipt == nil {
+		return errors.New("executor child start lacks a private receipt")
+	}
+	receipt := result.ChildStartReceipt
+	if err := receipt.Validate(); err != nil {
+		return err
+	}
+	expected, err := executor.NewChildStartReceipt(
+		request.Attempt,
+		request.Command,
+		request.Environment,
+		receiptEnvironmentFiles(request),
+		receipt.Challenge,
+	)
+	if err != nil || !receipt.Matches(expected) {
+		return errors.New("executor child-start receipt is rebound")
+	}
+	return nil
+}
+
+// receiptEnvironmentFiles reconstructs PW-12.2's provider-neutral private
+// environment-materialization declaration without reading any secret bytes.
+func receiptEnvironmentFiles(request executor.Request) map[string]string {
+	var files map[string]string
+	for _, materialization := range request.Secrets {
+		if materialization.Delivery() != workerprofile.DeliveryEnvironment {
+			continue
+		}
+		if files == nil {
+			files = make(map[string]string)
+		}
+		digest := sha256.Sum256([]byte(materialization.Target()))
+		files[materialization.Target()] = path.Join(
+			"/run/paje/secrets/environment",
+			hex.EncodeToString(digest[:16]),
+		)
+	}
+	return files
+}
+
+func presentedEnvironmentKeys(request executor.Request) []string {
+	keys := make(map[string]struct{}, len(request.Environment)+len(request.Command.Environment)+len(request.Secrets))
+	for key := range request.Environment {
+		keys[key] = struct{}{}
+	}
+	for key := range request.Command.Environment {
+		keys[key] = struct{}{}
+	}
+	for _, materialization := range request.Secrets {
+		if materialization.Delivery() == workerprofile.DeliveryEnvironment {
+			keys[materialization.Target()] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (outcome executeOutcome) environmentKeys(purpose executor.Purpose) []string {
+	keys := make(map[string]struct{})
+	for _, attempt := range outcome.attemptEvidence {
+		if attempt.ID.Purpose != purpose || !attempt.Started {
+			continue
+		}
+		for _, key := range outcome.confirmedEnvironmentKeys[attempt.ID.Key()] {
+			keys[key] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (outcome executeOutcome) commandEnvironmentKeys(attempt executor.AttemptID) []string {
+	keys, confirmed := outcome.confirmedCommandKeys[attempt.Key()]
+	if !confirmed {
+		return nil
+	}
+	result := make([]string, len(keys))
+	copy(result, keys)
+	return result
 }
 
 func (target *fencedExecutor) markAttempt(attempt executor.AttemptID, update func(*artifact.AttemptEvidence)) {
@@ -1057,6 +1242,11 @@ func executorUnavailableFailure() run.Failure {
 		Diagnostic: "worker runtime is unavailable", CauseCode: "executor_unavailable"}
 }
 
+func agentEnvironmentFailure() run.Failure {
+	return run.Failure{Stage: "execute", Class: run.FailureEnvironment, Retryable: false,
+		Diagnostic: "agent environment declaration is invalid", CauseCode: "agent_environment_invalid"}
+}
+
 func agentProtocolFailure() run.Failure {
 	return run.Failure{Stage: "execute", Class: run.FailureAgent, Retryable: false,
 		Diagnostic: "agent harness protocol failed", CauseCode: "agent_protocol"}
@@ -1125,8 +1315,12 @@ func buildBundle(record run.Record, outcome executeOutcome) (artifact.Bundle, er
 	copy(tools, outcome.toolEvidence)
 	attempts := make(artifact.AttemptEvidenceList, len(outcome.attemptEvidence))
 	copy(attempts, outcome.attemptEvidence)
-	agentKeys := artifact.EnvironmentKeyList(sortedMapKeys(sandboxEnvironment()))
-	verificationKeys := artifact.EnvironmentKeyList(sortedMapKeys(sandboxEnvironment()))
+	var agentKeys *artifact.EnvironmentKeyList
+	if keys := outcome.environmentKeys(executor.PurposeAgent); len(keys) != 0 {
+		value := artifact.EnvironmentKeyList(keys)
+		agentKeys = &value
+	}
+	verificationKeyList := artifact.EnvironmentKeyList(outcome.environmentKeys(executor.PurposeVerification))
 	executionMetadata, err := json.Marshal(artifact.ExecutionEvidence{
 		ExitCode: outcome.execution.ExitCode, Duration: outcome.execution.Duration.Seconds(),
 		Started: outcome.execution.Started, Completed: outcome.execution.Completed,
@@ -1136,8 +1330,8 @@ func buildBundle(record run.Record, outcome executeOutcome) (artifact.Bundle, er
 		Runtime: &runtimeEvidence, Harness: &outcome.harnessEvidence,
 		Tools:                       &tools,
 		Attempts:                    &attempts,
-		AgentEnvironmentKeys:        &agentKeys,
-		VerificationEnvironmentKeys: &verificationKeys,
+		AgentEnvironmentKeys:        agentKeys,
+		VerificationEnvironmentKeys: &verificationKeyList,
 	})
 	if err != nil {
 		return artifact.Bundle{}, err

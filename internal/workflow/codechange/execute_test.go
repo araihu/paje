@@ -143,6 +143,519 @@ func TestExecuteUsesDistinctSecretFreeAndAgentSandboxes(t *testing.T) {
 	}
 }
 
+func TestExecuteBindsCodexHomeAndDerivesSkippedVerificationEvidence(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err != nil || result.Artifact == nil {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	var agentRequest executor.Request
+	for _, request := range fixture.executor.Requests() {
+		if request.Attempt.Purpose == executor.PurposeAgent {
+			agentRequest = request
+			break
+		}
+	}
+	if got := agentRequest.Command.Environment["CODEX_HOME"]; got != "/run/paje/secrets/codex" {
+		t.Fatalf("agent CODEX_HOME = %q", got)
+	}
+	evidence := loadExecutionEvidence(t, fixture, *result.Artifact)
+	if evidence.AgentEnvironmentKeys == nil || !reflect.DeepEqual(
+		[]string(*evidence.AgentEnvironmentKeys),
+		[]string{"CODEX_HOME", "HOME", "PATH", "TMPDIR"},
+	) {
+		t.Fatalf("agent environment keys = %#v", evidence.AgentEnvironmentKeys)
+	}
+	if evidence.VerificationEnvironmentKeys == nil || len(*evidence.VerificationEnvironmentKeys) != 0 {
+		t.Fatalf("skipped verification environment keys = %#v", evidence.VerificationEnvironmentKeys)
+	}
+	for _, attempt := range *evidence.Attempts {
+		if attempt.ID.Purpose == executor.PurposeVerification {
+			t.Fatalf("skipped verification recorded attempt = %#v", attempt)
+		}
+	}
+	record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	stage, _ := latestStage(record, "execute")
+	if stage.Evidence["agent_attempt_started"] != "true" ||
+		stage.Evidence["verification_attempt_started"] != "false" ||
+		stage.Evidence["verification_environment_keys"] != "[]" {
+		t.Fatalf("durable attempt/environment evidence = %#v", stage.Evidence)
+	}
+}
+
+func TestExecuteRejectsAgentEnvironmentCollisionBeforeAcquireOrExecutor(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.harness.agentEnvironment = func([]workerprofile.SecretRequirement) (map[string]string, error) {
+		return map[string]string{"PATH": "/untrusted/bin"}, nil
+	}
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err == nil || result.FailureClass != run.FailureEnvironment || result.Retryable {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	if got := len(fixture.secrets.Requests()); got != 0 {
+		t.Fatalf("secret acquisitions = %d, want 0", got)
+	}
+	if got := len(fixture.executor.Requests()); got != 0 {
+		t.Fatalf("executor requests = %d, want 0", got)
+	}
+}
+
+func TestExecuteProtectsPersistedSecretRequirementsFromAdapterMutation(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.harness.agentEnvironment = func(requirements []workerprofile.SecretRequirement) (map[string]string, error) {
+		requirements[0].Target = "/run/paje/secrets/mutated"
+		return map[string]string{"CODEX_HOME": "/run/paje/secrets/codex"}, nil
+	}
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+
+	if _, err := fixture.service.Execute(context.Background(), "run-123"); err != nil {
+		t.Fatal(err)
+	}
+	record, err := fixture.runs.Load(context.Background(), "run-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture.harness.agentEnvironmentCalls != 1 || record.WorkerProfile.Secrets[0].Target != "/run/paje/secrets/codex" {
+		t.Fatalf("adapter calls=%d persisted requirements=%#v", fixture.harness.agentEnvironmentCalls, record.WorkerProfile.Secrets)
+	}
+}
+
+func TestExecuteDoesNotClaimAgentEnvironmentBeforeConfirmedChildStart(t *testing.T) {
+	tests := map[string]func(*serviceFixture){
+		"acquisition failure": func(fixture *serviceFixture) {
+			fixture.secrets.SetAcquireResult("harness.codex-auth", secret.Lease{}, errors.New("source unavailable"))
+		},
+		"bootstrap only": func(fixture *serviceFixture) {
+			fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+				result := executor.Result{Created: true, Started: true, Completed: true, SafeFacts: portableSafeFacts(request.Profile)}
+				if request.Attempt.Purpose == executor.PurposeProbe {
+					result.Stdout = []byte("codex 0.144.5")
+				}
+				if request.Attempt.Purpose == executor.PurposeAgent {
+					result = executor.Result{Created: true, BootstrapStarted: true}
+				}
+				fixture.executor.SetResult(request.Attempt, result, nil)
+			})
+		},
+		"ambiguous receipt": func(fixture *serviceFixture) {
+			fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+				result := executor.Result{Created: true, Started: true, Completed: true, SafeFacts: portableSafeFacts(request.Profile)}
+				if request.Attempt.Purpose == executor.PurposeProbe {
+					result.Stdout = []byte("codex 0.144.5")
+				}
+				if request.Attempt.Purpose == executor.PurposeAgent {
+					rebound := request.Attempt
+					rebound.Sequence++
+					receipt, err := executor.NewRandomChildStartReceipt(rebound, request.Command, request.Environment, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					result.ChildStartReceipt = &receipt
+				}
+				fixture.executor.SetResult(request.Attempt, result, nil)
+			})
+		},
+		"missing receipt": func(fixture *serviceFixture) {
+			target := &receiptStrippingExecutor{
+				Executor: fixture.executor, purpose: executor.PurposeAgent,
+			}
+			registry, err := executor.NewRegistry(executor.Registration{
+				RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.service.executors = registry
+		},
+	}
+	for name, configure := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			configure(fixture)
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || result.Artifact != nil {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			stage, _ := latestStage(record, "execute")
+			if _, claimed := stage.Evidence["agent_environment_keys"]; claimed ||
+				stage.Evidence["agent_attempt_started"] != "false" {
+				t.Fatalf("unconfirmed agent claimed presentation = %#v", stage.Evidence)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsReceiptEnvironmentDriftBeforeClaimingPresentedKeys(t *testing.T) {
+	tests := map[string]struct {
+		purpose   executor.Purpose
+		configure func(*testing.T, *serviceFixture)
+		build     func(executor.Request) (map[string]string, map[string]string)
+	}{
+		"agent omitted environment materialization": {
+			purpose: executor.PurposeAgent,
+			configure: func(t *testing.T, fixture *serviceFixture) {
+				configureSecondAgentSecret(t, fixture, "receipt-bound-secret")
+			},
+			build: func(request executor.Request) (map[string]string, map[string]string) {
+				return cloneStringMap(request.Environment), nil
+			},
+		},
+		"agent changed environment materialization": {
+			purpose: executor.PurposeAgent,
+			configure: func(t *testing.T, fixture *serviceFixture) {
+				configureSecondAgentSecret(t, fixture, "receipt-bound-secret")
+			},
+			build: func(request executor.Request) (map[string]string, map[string]string) {
+				files := receiptEnvironmentFiles(request)
+				files["WORKLOAD_TOKEN"] += "-drift"
+				return cloneStringMap(request.Environment), files
+			},
+		},
+		"verification changed baseline environment": {
+			purpose: executor.PurposeVerification,
+			configure: func(_ *testing.T, fixture *serviceFixture) {
+				fixture.profile.result.Commands = []verification.Command{{
+					Name: "required", Directory: "/tmp/workspace", Executable: "git",
+					Args: []string{"status"}, Timeout: time.Minute, Required: true,
+				}}
+			},
+			build: func(request executor.Request) (map[string]string, map[string]string) {
+				environment := cloneStringMap(request.Environment)
+				delete(environment, "TMPDIR")
+				return environment, nil
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newServiceFixture(t)
+			test.configure(t, fixture)
+			target := &receiptEnvironmentDriftExecutor{
+				Executor: fixture.executor, purpose: test.purpose, build: test.build,
+			}
+			registry, err := executor.NewRegistry(executor.Registration{
+				RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.service.executors = registry
+			fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+				return capturedChange(), nil
+			}
+			if _, err := fixture.service.Resolve(
+				context.Background(), validRawInput("Change docs", "receipt-environment-drift"),
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err == nil || test.purpose == executor.PurposeAgent && result.Artifact != nil {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			stage, _ := latestStage(record, "execute")
+			key := "agent_environment_keys"
+			startedKey := "agent_attempt_started"
+			if test.purpose == executor.PurposeVerification {
+				key = "verification_environment_keys"
+				startedKey = "verification_attempt_started"
+			}
+			claimed := stage.Evidence[key]
+			if test.purpose == executor.PurposeAgent {
+				if _, exists := stage.Evidence[key]; exists {
+					claimed = "unexpected"
+				}
+			} else if claimed == "[]" {
+				claimed = ""
+			}
+			if claimed != "" || stage.Evidence[startedKey] != "false" {
+				t.Fatalf("drifted receipt claimed presentation: %#v", stage.Evidence)
+			}
+			if test.purpose == executor.PurposeVerification && result.Artifact != nil {
+				bundle := fixture.artifacts.Snapshot().Bundles[result.Artifact.Digest]
+				if len(bundle.Verification) != 1 ||
+					bundle.Verification[0].Command.EnvironmentKeys != nil {
+					t.Fatalf("drifted receipt persisted declaration: %#v", bundle.Verification)
+				}
+			}
+		})
+	}
+}
+
+func TestExecutePersistsReceiptBackedVerificationEnvironmentDeclaration(t *testing.T) {
+	tests := map[string]struct {
+		command         verification.Command
+		wantDeclaration []string
+		wantUnion       []string
+	}{
+		"generic go without GOWORK": {
+			command: verification.Command{
+				Name: "required", Directory: "/tmp/workspace", Executable: "go",
+				Args: []string{"version"}, Timeout: time.Minute, Required: true,
+			},
+			wantDeclaration: []string{},
+			wantUnion:       []string{"HOME", "PATH", "TMPDIR"},
+		},
+		"Go profile GOWORK": {
+			command: verification.Command{
+				Name: "required", Directory: "/tmp/workspace", Executable: "go",
+				Args: []string{"test", "./..."}, Environment: map[string]string{"GOWORK": "off"},
+				Timeout: time.Minute, Required: true,
+			},
+			wantDeclaration: []string{"GOWORK"},
+			wantUnion:       []string{"GOWORK", "HOME", "PATH", "TMPDIR"},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			fixture.profile.result.Commands = []verification.Command{test.command}
+			fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+				return capturedChange(), nil
+			}
+
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err != nil || result.Artifact == nil {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			bundle := fixture.artifacts.Snapshot().Bundles[result.Artifact.Digest]
+			if len(bundle.Verification) != 1 || bundle.Verification[0].Command.Environment != nil ||
+				!reflect.DeepEqual(bundle.Verification[0].Command.EnvironmentKeys, test.wantDeclaration) {
+				t.Fatalf("verification declaration = %#v", bundle.Verification)
+			}
+			evidence := loadExecutionEvidence(t, fixture, *result.Artifact)
+			if evidence.VerificationEnvironmentKeys == nil || !reflect.DeepEqual(
+				[]string(*evidence.VerificationEnvironmentKeys), test.wantUnion,
+			) {
+				t.Fatalf("verification environment keys = %#v", evidence.VerificationEnvironmentKeys)
+			}
+			confirmed := 0
+			for _, attempt := range *evidence.Attempts {
+				if attempt.ID.Purpose == executor.PurposeVerification && attempt.Started {
+					confirmed++
+				}
+			}
+			if confirmed != 1 {
+				t.Fatalf("confirmed verification attempts = %d", confirmed)
+			}
+			record, _ := fixture.runs.Load(context.Background(), "run-123")
+			stage, _ := latestStage(record, "execute")
+			if stage.Evidence["verification_attempt_started"] != "true" {
+				t.Fatalf("durable verification state = %#v", stage.Evidence)
+			}
+		})
+	}
+}
+
+func TestPublisherPortableEnvironmentEvidenceTruthTable(t *testing.T) {
+	request := portablePublisherRequest(t)
+	verificationAttempt := artifact.AttemptEvidence{
+		ID: executor.AttemptID{
+			RunID: request.RunID, Stage: "execute", Attempt: 1,
+			StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeVerification, Sequence: 1,
+		},
+		Created: true, Started: true, Completed: true, Destroyed: true,
+	}
+	baseline := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
+	empty := artifact.EnvironmentKeyList{}
+	tests := map[string]struct {
+		scheduled bool
+		mutate    func(*publisher.Request)
+		valid     bool
+	}{
+		"verification skipped": {mutate: func(request *publisher.Request) {
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &empty
+		}, valid: true},
+		"confirmed empty union rejected": {scheduled: true, mutate: func(request *publisher.Request) {
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, verificationAttempt)
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &empty
+		}},
+		"confirmed nonempty": {scheduled: true, mutate: func(request *publisher.Request) {
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, verificationAttempt)
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &baseline
+		}, valid: true},
+		"partial": {scheduled: true, mutate: func(request *publisher.Request) {
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, verificationAttempt)
+			keys := artifact.EnvironmentKeyList{"HOME", "PATH"}
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &keys
+		}},
+		"extra": {scheduled: true, mutate: func(request *publisher.Request) {
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, verificationAttempt)
+			keys := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR", "TOKEN"}
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &keys
+		}},
+		"inverse": {scheduled: true, mutate: func(request *publisher.Request) {
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &baseline
+		}},
+		"drift": {scheduled: true, mutate: func(request *publisher.Request) {
+			drifted := verificationAttempt
+			drifted.ID.Attempt++
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, drifted)
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &baseline
+		}},
+		"missing": {scheduled: true, mutate: func(request *publisher.Request) {
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, verificationAttempt)
+			request.ExecutionEvidence.VerificationEnvironmentKeys = nil
+		}},
+		"unconfirmed attempt": {scheduled: true, mutate: func(request *publisher.Request) {
+			unconfirmed := verificationAttempt
+			unconfirmed.Started = false
+			unconfirmed.Completed = false
+			*request.ExecutionEvidence.Attempts = append(*request.ExecutionEvidence.Attempts, unconfirmed)
+			request.ExecutionEvidence.VerificationEnvironmentKeys = &empty
+		}},
+		"agent missing": {mutate: func(request *publisher.Request) {
+			request.ExecutionEvidence.AgentEnvironmentKeys = nil
+		}},
+		"agent partial": {mutate: func(request *publisher.Request) {
+			keys := artifact.EnvironmentKeyList{"HOME", "PATH", "TMPDIR"}
+			request.ExecutionEvidence.AgentEnvironmentKeys = &keys
+		}},
+		"agent inverse": {mutate: func(request *publisher.Request) {
+			attempts := *request.ExecutionEvidence.Attempts
+			attempts[0].Started = false
+			attempts[0].Completed = false
+			request.ExecutionEvidence.Started = false
+			request.ExecutionEvidence.Completed = false
+		}},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := publisher.CloneRequest(request)
+			if test.scheduled {
+				schedulePortableVerification(t, &candidate, "git")
+			}
+			test.mutate(&candidate)
+			err := candidate.ValidatePortable()
+			if test.valid && err != nil {
+				t.Fatalf("ValidatePortable() error = %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("ValidatePortable() error = nil")
+			}
+		})
+	}
+}
+
+func loadExecutionEvidence(t *testing.T, fixture *serviceFixture, reference artifact.Reference) artifact.ExecutionEvidence {
+	t.Helper()
+	bundle := fixture.artifacts.Snapshot().Bundles[reference.Digest]
+	evidence, err := publisher.DecodeExecutionEvidence(bundle.ExecutionMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evidence
+}
+
+func portablePublisherRequest(t *testing.T) publisher.Request {
+	t.Helper()
+	profile := resolvedWorkerProfile(t)
+	tools := artifact.ToolEvidenceList{}
+	attempts := artifact.AttemptEvidenceList{{
+		ID: executor.AttemptID{
+			RunID: "run-123", Stage: "execute", Attempt: 1,
+			StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
+		},
+		Created: true, Started: true, Completed: true, Destroyed: true,
+	}}
+	agentKeys := artifact.EnvironmentKeyList{"CODEX_HOME", "HOME", "PATH", "TMPDIR"}
+	empty := artifact.EnvironmentKeyList{}
+	plan := []verification.Result{}
+	manifest := artifact.Manifest{
+		RunID: "run-123", Template: template.ID{Name: "code-change", Version: 1},
+		Repository: "https://example.test/repository.git",
+		BaseSHA:    strings.Repeat("a", 40), TreeSHA: strings.Repeat("c", 40),
+		Changes: []artifact.Change{{Path: "changed.txt", Status: "M"}},
+	}
+	manifest.Members = []artifact.Member{portableVerificationMember(t, manifest, plan)}
+	return publisher.Request{
+		RunID: "run-123", Repository: "https://example.test/repository.git",
+		BaseSHA: strings.Repeat("a", 40), TargetRef: "refs/heads/main",
+		Branch:           "paje/code-change/run-123",
+		Artifact:         artifact.Reference{RunID: "run-123", Digest: strings.Repeat("b", 64), Size: 1},
+		ArtifactManifest: manifest,
+		WorkerProfile:    profile,
+		ExecutionEvidence: artifact.ExecutionEvidence{
+			Started: true, Completed: true,
+			Profile: &artifact.WorkerProfileEvidence{
+				Name: profile.Metadata.Name, Revision: profile.Metadata.Revision, Digest: profile.Digest,
+			},
+			Runtime: &artifact.RuntimeEvidence{
+				Kind: profile.Runtime.Kind, ImageDigest: strings.Repeat("a", 64),
+				Platform: profile.Runtime.Platform, Isolated: true, Certified: true,
+			},
+			Harness: &artifact.HarnessEvidence{
+				ID: profile.Harness.ID, DeclaredVersion: profile.Harness.Version,
+				ProbedVersion: profile.Harness.Version, ProbePassed: true,
+			},
+			Tools: &tools, Attempts: &attempts,
+			AgentEnvironmentKeys: &agentKeys, VerificationEnvironmentKeys: &empty,
+		},
+		Verification: plan, Title: "Portable change",
+	}
+}
+
+func schedulePortableVerification(t *testing.T, request *publisher.Request, executable string) {
+	t.Helper()
+	request.Verification = []verification.Result{{
+		Command: verification.Command{
+			Name: executable + " verification", Directory: ".", Executable: executable,
+			Args: []string{"status"}, EnvironmentKeys: []string{}, Timeout: time.Minute, Required: true,
+		},
+		Passed: true,
+	}}
+	request.ArtifactManifest.Members = []artifact.Member{
+		portableVerificationMember(t, request.ArtifactManifest, request.Verification),
+	}
+}
+
+func portableVerificationMember(
+	t *testing.T,
+	manifest artifact.Manifest,
+	plan []verification.Result,
+) artifact.Member {
+	t.Helper()
+	manifest.Members = nil
+	normalized, _, _, err := artifact.Canonicalize(artifact.Bundle{
+		Manifest:     manifest,
+		ChangesPatch: []byte("frozen verification plan binding"),
+		ExecutionMetadata: json.RawMessage(
+			`{"completed":false,"duration":0,"exit_code":0,"started":false,"truncated":false}`,
+		),
+		Verification: plan,
+		Preflight:    map[string]string{},
+		Warnings:     []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range normalized.Manifest.Members {
+		if member.Name == "verification.json" {
+			return member
+		}
+	}
+	t.Fatal("verification plan member is missing")
+	return artifact.Member{}
+}
+
 func TestExecuteDestroysAgentBeforeReverseLeaseRevocation(t *testing.T) {
 	fixture := newServiceFixture(t)
 	profile := resolvedWorkerProfile(t)
@@ -212,8 +725,16 @@ func TestExecuteDestroysAgentBeforeReverseLeaseRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := fixture.service.Execute(context.Background(), "run-123"); err != nil {
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err != nil || result.Artifact == nil {
 		t.Fatalf("Execute() error = %v", err)
+	}
+	evidence := loadExecutionEvidence(t, fixture, *result.Artifact)
+	if evidence.AgentEnvironmentKeys == nil || !reflect.DeepEqual(
+		[]string(*evidence.AgentEnvironmentKeys),
+		[]string{"CODEX_HOME", "HOME", "PATH", "TMPDIR", "WORKLOAD_TOKEN"},
+	) {
+		t.Fatalf("agent presented-key union = %#v", evidence.AgentEnvironmentKeys)
 	}
 	agentDestroy := slicesIndex(events, "destroy:agent:0")
 	secondRevoke := slicesIndex(events, "revoke:fixture-workload-lease")
@@ -943,6 +1464,67 @@ type eventExecutor struct {
 	events *[]string
 }
 
+func (target *eventExecutor) Execute(ctx context.Context, request executor.Request) (executor.Result, error) {
+	result, err := target.Executor.Execute(ctx, request)
+	if !result.Started || result.ChildStartReceipt == nil {
+		return result, err
+	}
+	receipt, receiptErr := executor.NewChildStartReceipt(
+		request.Attempt,
+		request.Command,
+		request.Environment,
+		receiptEnvironmentFiles(request),
+		result.ChildStartReceipt.Challenge,
+	)
+	if receiptErr != nil {
+		return executor.Result{}, receiptErr
+	}
+	result.ChildStartReceipt = &receipt
+	return result, err
+}
+
+type receiptStrippingExecutor struct {
+	executor.Executor
+	purpose executor.Purpose
+}
+
+type receiptEnvironmentDriftExecutor struct {
+	executor.Executor
+	purpose executor.Purpose
+	build   func(executor.Request) (map[string]string, map[string]string)
+}
+
+func (target *receiptEnvironmentDriftExecutor) Execute(
+	ctx context.Context,
+	request executor.Request,
+) (executor.Result, error) {
+	result, err := target.Executor.Execute(ctx, request)
+	if request.Attempt.Purpose != target.purpose || !result.Started || result.ChildStartReceipt == nil {
+		return result, err
+	}
+	environment, environmentFiles := target.build(request)
+	receipt, receiptErr := executor.NewChildStartReceipt(
+		request.Attempt,
+		request.Command,
+		environment,
+		environmentFiles,
+		result.ChildStartReceipt.Challenge,
+	)
+	if receiptErr != nil {
+		return executor.Result{}, receiptErr
+	}
+	result.ChildStartReceipt = &receipt
+	return result, err
+}
+
+func (target *receiptStrippingExecutor) Execute(ctx context.Context, request executor.Request) (executor.Result, error) {
+	result, err := target.Executor.Execute(ctx, request)
+	if request.Attempt.Purpose == target.purpose {
+		result.ChildStartReceipt = nil
+	}
+	return result, err
+}
+
 func (target *eventExecutor) Destroy(ctx context.Context, attempt executor.AttemptID) error {
 	*target.events = append(*target.events, "destroy:"+string(attempt.Purpose)+":"+strconv.Itoa(attempt.Sequence))
 	return target.Executor.Destroy(ctx, attempt)
@@ -1065,21 +1647,27 @@ func (target *cancellationExecutor) Execute(ctx context.Context, request executo
 	if err := request.Validate(); err != nil {
 		return executor.Result{}, err
 	}
+	receipt, err := executor.NewRandomChildStartReceipt(
+		request.Attempt, request.Command, request.Environment, nil,
+	)
+	if err != nil {
+		return executor.Result{}, err
+	}
 	if request.Attempt.Purpose == executor.PurposeProbe {
 		return executor.Result{
 			Created: true, Started: true, Completed: true, Stdout: []byte("codex 0.144.5"),
-			SafeFacts: portableSafeFacts(request.Profile),
+			SafeFacts: portableSafeFacts(request.Profile), ChildStartReceipt: &receipt,
 		}, nil
 	}
 	if request.Attempt.Purpose != executor.PurposeAgent {
-		return executor.Result{Created: true, Started: true, Completed: true}, nil
+		return executor.Result{Created: true, Started: true, Completed: true, ChildStartReceipt: &receipt}, nil
 	}
 	target.agentStarted()
 	<-ctx.Done()
 	target.mu.Lock()
 	target.state = executor.StateRunning
 	target.mu.Unlock()
-	return executor.Result{Created: true, Started: true}, ctx.Err()
+	return executor.Result{Created: true, Started: true, ChildStartReceipt: &receipt}, ctx.Err()
 }
 
 func (target *cancellationExecutor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {

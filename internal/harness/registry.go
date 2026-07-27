@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/araihu/paje/internal/workerprofile"
@@ -55,6 +56,32 @@ func (registry *Registry) Resolve(profile workerprofile.Snapshot) (Adapter, erro
 		}
 	}
 	return adapter, nil
+}
+
+// ResolveAgent binds one exact adapter to an independent copy of the
+// persisted secret requirements and returns an independent non-secret
+// environment declaration for the agent child.
+func (registry *Registry) ResolveAgent(profile workerprofile.Snapshot) (Adapter, map[string]string, error) {
+	adapter, err := registry.Resolve(profile)
+	if err != nil {
+		return nil, nil, err
+	}
+	environment, err := adapter.AgentEnvironment(slices.Clone(profile.Secrets))
+	if err != nil {
+		return nil, nil, err
+	}
+	return adapter, cloneEnvironment(environment), nil
+}
+
+func cloneEnvironment(environment map[string]string) map[string]string {
+	if environment == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(environment))
+	for key, value := range environment {
+		clone[key] = value
+	}
+	return clone
 }
 
 func nilAdapter(adapter Adapter) bool {
