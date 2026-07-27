@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/verification"
 )
 
@@ -178,11 +179,11 @@ func (p *GoProfile) Inspect(ctx context.Context, request ProfileRequest) (Profil
 }
 
 func (p *GenericProfile) inspectGit(ctx context.Context, commands CommandRunner) (ProfileResult, error) {
-	baseSHA, err := p.profileOutput(ctx, commands, ".", nil, "git rev-parse HEAD", "git", "rev-parse", "HEAD")
+	baseSHA, err := p.gitProfileOutput(ctx, commands, ".", "git rev-parse HEAD", "rev-parse", "HEAD")
 	if err != nil {
 		return ProfileResult{}, err
 	}
-	status, err := p.profileOutput(ctx, commands, ".", nil, "git status", "git", "status", "--porcelain=v1")
+	status, err := p.gitProfileOutput(ctx, commands, ".", "git status", "status", "--porcelain=v1")
 	if err != nil {
 		return ProfileResult{}, err
 	}
@@ -194,7 +195,7 @@ func (p *GenericProfile) inspectGit(ctx context.Context, commands CommandRunner)
 }
 
 func (p *GenericProfile) discoverModules(ctx context.Context, workspace string, commands CommandRunner) ([]string, error) {
-	output, err := p.profileOutput(ctx, commands, ".", nil, "git ls-files go.mod", "git", "ls-files", "-z", "--", "go.mod", "**/go.mod")
+	output, err := p.gitProfileOutput(ctx, commands, ".", "git ls-files go.mod", "ls-files", "-z", "--", "go.mod", "**/go.mod")
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +230,18 @@ func (p *GenericProfile) discoverModules(ctx context.Context, workspace string, 
 		return nil, fmt.Errorf("inspect Go repository profile: no tracked go.mod files")
 	}
 	return modules, nil
+}
+
+func (p *GenericProfile) gitProfileOutput(
+	ctx context.Context,
+	commands CommandRunner,
+	directory, operation string,
+	args ...string,
+) (string, error) {
+	gitArgs := make([]string, 0, len(args)+2)
+	gitArgs = append(gitArgs, "-c", "safe.directory="+executor.SandboxWorkspaceRoot)
+	gitArgs = append(gitArgs, args...)
+	return p.profileOutput(ctx, commands, directory, nil, operation, "git", gitArgs...)
 }
 
 func (p *GenericProfile) profileOutput(ctx context.Context, commands CommandRunner, directory string, environment map[string]string, operation, executable string, args ...string) (string, error) {

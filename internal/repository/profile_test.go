@@ -73,6 +73,106 @@ func TestRepositoryProfileUsesInjectedSandboxRunner(t *testing.T) {
 	}
 }
 
+func TestProfilesTrustOnlyExactSandboxWorkspaceForBuiltInGit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		inspect    func(repository.ProfileRequest) (repository.ProfileResult, error)
+		outputs    map[string]string
+		wantProbes int
+	}{
+		{
+			name: "generic",
+			inspect: func(request repository.ProfileRequest) (repository.ProfileResult, error) {
+				profile, err := repository.NewGenericProfile(verification.DefaultLimits)
+				if err != nil {
+					return repository.ProfileResult{}, err
+				}
+				return profile.Inspect(context.Background(), request)
+			},
+			outputs: map[string]string{
+				"git rev-parse HEAD": "abc123\n",
+				"git status":         "",
+			},
+			wantProbes: 2,
+		},
+		{
+			name: "go",
+			inspect: func(request repository.ProfileRequest) (repository.ProfileResult, error) {
+				profile, err := repository.NewGoProfile(verification.DefaultLimits)
+				if err != nil {
+					return repository.ProfileResult{}, err
+				}
+				return profile.Inspect(context.Background(), request)
+			},
+			outputs: map[string]string{
+				"git rev-parse HEAD":  "abc123\n",
+				"git status":          "",
+				"go env GOWORK":       "/workspace/go.work\n",
+				"git ls-files go.mod": "go.mod\x00",
+				"go list -m -json":    `{"Path":"example.test/root"}`,
+			},
+			wantProbes: 3,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			workspace := t.TempDir()
+			runner := &scriptedCommandRunner{outputs: test.outputs}
+			userArgs := []string{"status", "--short"}
+			result, err := test.inspect(repository.ProfileRequest{
+				Workspace: workspace,
+				Commands:  runner,
+				Checks: []verification.CommandSpec{{
+					Name:       "user git check",
+					Directory:  ".",
+					Executable: "git",
+					Args:       append([]string(nil), userArgs...),
+					Timeout:    "1m",
+					Required:   true,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			probes := 0
+			for _, command := range runner.commands {
+				if command.Executable != "git" {
+					continue
+				}
+				probes++
+				wantPrefix := []string{"-c", "safe.directory=/workspace"}
+				if len(command.Args) < len(wantPrefix) || !reflect.DeepEqual(command.Args[:len(wantPrefix)], wantPrefix) {
+					t.Fatalf("built-in Git args = %#v, want prefix %#v", command.Args, wantPrefix)
+				}
+				bindings := 0
+				for _, arg := range command.Args {
+					if arg == "safe.directory=/workspace" {
+						bindings++
+					}
+					if arg == "safe.directory=*" || arg == "--global" || arg == "--system" || strings.Contains(arg, workspace) {
+						t.Fatalf("built-in Git command has unsafe trust mutation: %#v", command)
+					}
+				}
+				if bindings != 1 || command.Environment != nil {
+					t.Fatalf("built-in Git trust binding = %d, environment = %#v, command = %#v", bindings, command.Environment, command)
+				}
+			}
+			if probes != test.wantProbes {
+				t.Fatalf("built-in Git probes = %d, want %d: %#v", probes, test.wantProbes, runner.commands)
+			}
+			if len(result.Commands) != 1 || result.Commands[0].Executable != "git" || !reflect.DeepEqual(result.Commands[0].Args, userArgs) {
+				t.Fatalf("user-supplied Git check was rewritten: %#v", result.Commands)
+			}
+		})
+	}
+}
+
 type scriptedCommandRunner struct {
 	outputs  map[string]string
 	commands []verification.Command
