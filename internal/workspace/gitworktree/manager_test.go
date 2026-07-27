@@ -1,6 +1,7 @@
 package gitworktree_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,10 +10,20 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/araihu/paje/internal/workspace/gitworktree"
+)
+
+const (
+	orphanHelperEnvironment = "PAJE_GITWORKTREE_ORPHAN_HELPER"
+	orphanHelperRoot        = "PAJE_GITWORKTREE_ORPHAN_ROOT"
+	orphanHelperSource      = "PAJE_GITWORKTREE_ORPHAN_SOURCE"
+	orphanHelperSHA         = "PAJE_GITWORKTREE_ORPHAN_SHA"
+	orphanHelperReady       = "PAJE_GITWORKTREE_ORPHAN_READY"
 )
 
 func TestManagerPreparesIsolatedWorktreesAndCleansThem(t *testing.T) {
@@ -63,6 +74,140 @@ func TestManagerPreparesIsolatedWorktreesAndCleansThem(t *testing.T) {
 	}
 	if _, err := os.Stat(firstPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Stat(cleaned workspace) error = %v, want not exist", err)
+	}
+}
+
+func TestManagerReapsWorkspaceAbandonedByKilledProcessAndPreservesActiveLease(t *testing.T) {
+	if os.Getenv(orphanHelperEnvironment) == "1" {
+		manager, err := gitworktree.New(os.Getenv(orphanHelperRoot))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepared, err := manager.Prepare(
+			context.Background(),
+			os.Getenv(orphanHelperSource),
+			os.Getenv(orphanHelperSHA),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(os.Getenv(orphanHelperReady), []byte(prepared.Path()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			runtime.KeepAlive(prepared)
+			time.Sleep(time.Second)
+		}
+	}
+
+	requireGit(t)
+	root := filepath.Join(t.TempDir(), "manager")
+	source := newRepository(t)
+	sha := gitOutput(t, source, "rev-parse", "HEAD")
+	activeManager, err := gitworktree.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := activeManager.Prepare(context.Background(), source, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = active.Cleanup(context.Background()) })
+
+	ready := filepath.Join(t.TempDir(), "orphan-ready")
+	command := exec.Command(os.Args[0], "-test.run=^TestManagerReapsWorkspaceAbandonedByKilledProcessAndPreservesActiveLease$")
+	command.Env = append(os.Environ(),
+		orphanHelperEnvironment+"=1",
+		orphanHelperRoot+"="+root,
+		orphanHelperSource+"="+source,
+		orphanHelperSHA+"="+sha,
+		orphanHelperReady+"="+ready,
+	)
+	var childOutput bytes.Buffer
+	command.Stdout = &childOutput
+	command.Stderr = &childOutput
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = command.Process.Kill() })
+	waited := make(chan error, 1)
+	go func() { waited <- command.Wait() }()
+	orphanPath := waitForOrphanWorkspace(t, ready, waited, &childOutput)
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waited; err == nil {
+		t.Fatal("orphan helper exited cleanly after kill")
+	}
+	if _, err := os.Stat(orphanPath); err != nil {
+		t.Fatalf("abandoned workspace missing before recovery: %v", err)
+	}
+
+	if _, err := gitworktree.New(root); err != nil {
+		t.Fatalf("New(recovery) error = %v", err)
+	}
+	if _, err := os.Stat(orphanPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned workspace remains after recovery: %v", err)
+	}
+	assertFileContent(t, filepath.Join(active.Path(), "file.txt"), "original")
+}
+
+func TestManagerRecoveryRejectsSymlinkAndPreservesForeignDirectory(t *testing.T) {
+	requireGit(t)
+	root := filepath.Join(t.TempDir(), "manager")
+	if _, err := gitworktree.New(root); err != nil {
+		t.Fatal(err)
+	}
+	worktreesRoot := filepath.Join(root, "worktrees")
+	foreign := filepath.Join(worktreesRoot, "foreign")
+	if err := os.Mkdir(foreign, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	foreignMarker := filepath.Join(foreign, "must-survive")
+	if err := os.WriteFile(foreignMarker, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	outsideMarker := filepath.Join(outside, "must-survive")
+	if err := os.WriteFile(outsideMarker, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(worktreesRoot, "paje-123456")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := gitworktree.New(root); err == nil {
+		t.Fatal("New() accepted symlinked managed workspace candidate")
+	}
+	assertFileContent(t, foreignMarker, "safe")
+	assertFileContent(t, outsideMarker, "safe")
+}
+
+func waitForOrphanWorkspace(t *testing.T, ready string, waited <-chan error, output *bytes.Buffer) string {
+	t.Helper()
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-waited:
+			t.Fatalf("orphan helper exited before ready: %v\n%s", err, output.String())
+		case <-deadline.C:
+			t.Fatalf("orphan helper did not become ready\n%s", output.String())
+		case <-ticker.C:
+			encoded, err := os.ReadFile(ready)
+			if err == nil {
+				path := strings.TrimSpace(string(encoded))
+				if path == "" {
+					t.Fatal("orphan helper wrote empty workspace path")
+				}
+				return path
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 

@@ -21,8 +21,9 @@ import (
 )
 
 var (
-	immutableSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	refPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/@-]*$`)
+	immutableSHAPattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	managedWorkspacePattern = regexp.MustCompile(`^paje-[0-9]+$`)
+	refPattern              = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/@-]*$`)
 )
 
 // Manager maintains cached repository mirrors and ephemeral worktrees.
@@ -65,12 +66,16 @@ func New(root string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{
+	manager := &Manager{
 		gitPath:       gitPath,
 		root:          canonicalRoot,
 		repositories:  repositories,
 		worktreesRoot: worktreesRoot,
-	}, nil
+	}
+	if err := manager.recoverAbandonedWorkspaces(); err != nil {
+		return nil, fmt.Errorf("create git workspace manager: recover abandoned workspaces: %w", err)
+	}
+	return manager, nil
 }
 
 // Prepare creates an isolated detached worktree at an already-resolved SHA.
@@ -105,43 +110,189 @@ func (m *Manager) Prepare(
 		return nil, err
 	}
 
+	prepared, err := m.allocateWorkspace(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(cause error) (workspace.Workspace, error) {
+		cleanupErr := prepared.cleanupLocked(context.Background())
+		if !prepared.cleaned {
+			cleanupErr = errors.Join(cleanupErr, prepared.closeLease())
+		}
+		return nil, errors.Join(cause, cleanupErr)
+	}
+
+	if err := m.runGit(ctx, "clone", "--no-local", "--no-checkout", mirror, prepared.path); err != nil {
+		return fail(fmt.Errorf("prepare git workspace: clone detached workspace: %w", err))
+	}
+	if err := m.runGit(ctx, "-C", prepared.path, "checkout", "--detach", sha); err != nil {
+		return fail(fmt.Errorf("prepare git workspace: checkout detached revision: %w", err))
+	}
+	if err := m.runGit(ctx, "-C", prepared.path, "remote", "remove", "origin"); err != nil {
+		return fail(fmt.Errorf("prepare git workspace: remove clone remote: %w", err))
+	}
+	if err := m.validateStandaloneWorkspace(ctx, prepared.path); err != nil {
+		return fail(fmt.Errorf("prepare git workspace: validate standalone workspace: %w", err))
+	}
+	current, err := os.Lstat(prepared.path)
+	if err != nil || !os.SameFile(prepared.identity, current) {
+		return fail(errors.Join(errors.New("prepare git workspace: workspace identity was rebound"), err))
+	}
+	return prepared, nil
+}
+
+func (m *Manager) allocateWorkspace(ctx context.Context) (*gitWorkspace, error) {
+	root, err := openLockedDirectory(m.worktreesRoot)
+	if err != nil {
+		return nil, fmt.Errorf("prepare git workspace: lock worktrees root: %w", err)
+	}
+	defer root.Close()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	path, err := os.MkdirTemp(m.worktreesRoot, "paje-")
 	if err != nil {
 		return nil, fmt.Errorf("prepare git workspace: allocate worktree path: %w", err)
 	}
-	if err := os.Remove(path); err != nil {
-		return nil, fmt.Errorf("prepare git workspace: release worktree path: %w", err)
+	name := filepath.Base(path)
+	if !managedWorkspacePattern.MatchString(name) {
+		return nil, errors.New("prepare git workspace: allocated worktree name is invalid")
 	}
-	if err := validateManagedPath(m.worktreesRoot, path, true); err != nil {
-		return nil, fmt.Errorf("prepare git workspace: validate worktree path: %w", err)
+	lease, identity, active, err := lockWorkspaceAt(int(root.Fd()), name)
+	if err != nil {
+		return nil, fmt.Errorf("prepare git workspace: lock allocated worktree: %w", err)
 	}
+	if !active {
+		return nil, errors.New("prepare git workspace: allocated worktree is already active")
+	}
+	return &gitWorkspace{manager: m, path: path, identity: identity, lease: lease}, nil
+}
 
-	if err := m.runGit(ctx, "clone", "--no-local", "--no-checkout", mirror, path); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, fmt.Errorf("prepare git workspace: clone detached workspace: %w", err)
+func (m *Manager) recoverAbandonedWorkspaces() error {
+	root, err := openLockedDirectory(m.worktreesRoot)
+	if err != nil {
+		return err
 	}
-	if err := m.runGit(ctx, "-C", path, "checkout", "--detach", sha); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, fmt.Errorf("prepare git workspace: checkout detached revision: %w", err)
+	entries, err := root.ReadDir(-1)
+	if err != nil {
+		_ = root.Close()
+		return err
 	}
-	if err := m.runGit(ctx, "-C", path, "remote", "remove", "origin"); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, fmt.Errorf("prepare git workspace: remove clone remote: %w", err)
+	var candidates []*gitWorkspace
+	closeCandidates := func() {
+		for _, candidate := range candidates {
+			_ = candidate.closeLease()
+		}
 	}
-	if err := m.validateStandaloneWorkspace(ctx, path); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, fmt.Errorf("prepare git workspace: validate standalone workspace: %w", err)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "paje-") {
+			continue
+		}
+		if !managedWorkspacePattern.MatchString(name) {
+			closeCandidates()
+			_ = root.Close()
+			return fmt.Errorf("managed workspace name %q is invalid", name)
+		}
+		lease, identity, abandoned, err := lockWorkspaceAt(int(root.Fd()), name)
+		if err != nil {
+			closeCandidates()
+			_ = root.Close()
+			return fmt.Errorf("inspect managed workspace %q: %w", name, err)
+		}
+		if !abandoned {
+			continue
+		}
+		candidates = append(candidates, &gitWorkspace{
+			manager:  m,
+			path:     filepath.Join(m.worktreesRoot, name),
+			identity: identity,
+			lease:    lease,
+		})
 	}
-	identity, err := os.Lstat(path)
-	if err != nil || !identity.IsDir() || identity.Mode()&os.ModeSymlink != 0 {
-		_ = os.RemoveAll(path)
-		return nil, fmt.Errorf("prepare git workspace: capture workspace identity: %w", err)
+	if err := root.Close(); err != nil {
+		closeCandidates()
+		return err
 	}
-	return &gitWorkspace{
-		manager:  m,
-		path:     path,
-		identity: identity,
-	}, nil
+	for index, candidate := range candidates {
+		if err := candidate.Cleanup(context.Background()); err != nil {
+			for _, remaining := range candidates[index:] {
+				_ = remaining.closeLease()
+			}
+			return fmt.Errorf("clean abandoned workspace %q: %w", filepath.Base(candidate.path), err)
+		}
+	}
+	return nil
+}
+
+func openLockedDirectory(path string) (*os.File, error) {
+	before, err := os.Lstat(path)
+	if err != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.Join(errors.New("managed directory identity is invalid"), err)
+	}
+	descriptor, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	directory := os.NewFile(uintptr(descriptor), "git-worktrees-root")
+	if directory == nil {
+		_ = unix.Close(descriptor)
+		return nil, errors.New("open managed directory")
+	}
+	opened, err := directory.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		_ = directory.Close()
+		return nil, errors.Join(errors.New("managed directory identity was rebound"), err)
+	}
+	if err := unix.Flock(descriptor, unix.LOCK_EX); err != nil {
+		_ = directory.Close()
+		return nil, err
+	}
+	current, err := os.Lstat(path)
+	if err != nil || !os.SameFile(opened, current) {
+		_ = directory.Close()
+		return nil, errors.Join(errors.New("managed directory identity was rebound"), err)
+	}
+	return directory, nil
+}
+
+func lockWorkspaceAt(parentDescriptor int, name string) (*os.File, os.FileInfo, bool, error) {
+	before, err := statDirectoryAt(parentDescriptor, name)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	descriptor, err := unix.Openat(
+		parentDescriptor,
+		name,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	lease := os.NewFile(uintptr(descriptor), "git-workspace-lease")
+	if lease == nil {
+		_ = unix.Close(descriptor)
+		return nil, nil, false, errors.New("open workspace lease")
+	}
+	opened, err := lease.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		_ = lease.Close()
+		return nil, nil, false, errors.Join(errors.New("workspace identity was rebound"), err)
+	}
+	if err := unix.Flock(descriptor, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lease.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, nil, false, nil
+		}
+		return nil, nil, false, err
+	}
+	current, err := statDirectoryAt(parentDescriptor, name)
+	if err != nil || !os.SameFile(opened, current) {
+		_ = lease.Close()
+		return nil, nil, false, errors.Join(errors.New("workspace identity was rebound"), err)
+	}
+	return lease, opened, true, nil
 }
 
 func (m *Manager) validateStandaloneWorkspace(ctx context.Context, workspacePath string) error {
@@ -411,6 +562,7 @@ type gitWorkspace struct {
 	manager               *Manager
 	path                  string
 	identity              os.FileInfo
+	lease                 *os.File
 	cleaned               bool
 	cleanup               *cleanupExchangeState
 	beforeCleanupExchange func()
@@ -442,6 +594,15 @@ func (w *gitWorkspace) Cleanup(ctx context.Context) error {
 
 	w.manager.mu.Lock()
 	defer w.manager.mu.Unlock()
+	return w.cleanupLocked(ctx)
+}
+
+func (w *gitWorkspace) cleanupLocked(ctx context.Context) (returnedErr error) {
+	defer func() {
+		if w.cleaned {
+			returnedErr = errors.Join(returnedErr, w.closeLease())
+		}
+	}()
 	if err := w.manager.validateRoots(); err != nil {
 		return fmt.Errorf("cleanup git workspace: %w", err)
 	}
@@ -615,6 +776,15 @@ func (w *gitWorkspace) finishCleanupExchange(ctx context.Context, parentDescript
 	w.cleanup = nil
 	w.cleaned = true
 	return nil
+}
+
+func (w *gitWorkspace) closeLease() error {
+	if w.lease == nil {
+		return nil
+	}
+	lease := w.lease
+	w.lease = nil
+	return lease.Close()
 }
 
 func rollbackCleanupExchange(
