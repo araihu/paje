@@ -522,7 +522,7 @@ func TestCoordinatorAndWorkerImageSeparation(t *testing.T) {
 	coordinator := docker.buildImage(t, "Dockerfile", "coordinator")
 	worker := docker.buildImage(t, "Dockerfile.worker-codex", "worker")
 
-	for _, command := range []string{"paje", "git", "ssh"} {
+	for _, command := range []string{"paje", "paje-leaf-gateway", "git", "ssh"} {
 		assertCommandPresent(t, docker, coordinator.reference, command)
 	}
 	for _, command := range []string{"codex", "node", "go", "paje-sandbox-init"} {

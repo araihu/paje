@@ -17,7 +17,12 @@ RUN CGO_ENABLED=0 go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/paje \
-    ./cmd/paje
+    ./cmd/paje \
+    && CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/paje-leaf-gateway \
+    ./cmd/paje-leaf-gateway
 
 FROM alpine:3.22
 
@@ -37,10 +42,11 @@ LABEL org.opencontainers.image.revision="${PAJE_COMMIT}" \
 
 RUN addgroup -S -g 65532 paje \
     && adduser -S -D -H -u 65532 -G paje paje \
-    && mkdir -p /workspace /run/paje \
-    && chown 65532:65532 /workspace /run/paje
+    && mkdir -p /workspace /run/paje /run/paje-leaf /var/lib/paje-leaf \
+    && chown 65532:65532 /workspace /run/paje /run/paje-leaf /var/lib/paje-leaf
 
 COPY --from=build /out/paje /usr/local/bin/paje
+COPY --from=build /out/paje-leaf-gateway /usr/local/bin/paje-leaf-gateway
 
 ENV HOME=/run/paje \
     PAJE_WORKSPACE_ROOT=/workspace \

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Using Pajé"
+  short_description: "Delegate code changes to local Pajé"
+  default_prompt: "Use $using-paje to delegate this code change to the local Pajé runtime."
