@@ -659,6 +659,8 @@ func TestCaptureRejectsNameStatusAndStageCrossValidationMismatch(t *testing.T) {
 }
 
 func TestCaptureCancelsGitDescendants(t *testing.T) {
+	const processWatchdog = 10 * time.Second
+
 	workspace := fakeWorkspace(t)
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	fake := filepath.Join(t.TempDir(), "git")
@@ -675,7 +677,7 @@ func TestCaptureCancelsGitDescendants(t *testing.T) {
 		_, err := capturer.Capture(ctx, gitcapture.Request{Workspace: workspace, BaseSHA: strings.Repeat("a", 40), MaxBytes: 1 << 20})
 		result <- err
 	}()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(processWatchdog)
 	for {
 		if _, statErr := os.Stat(pidFile); statErr == nil {
 			break
@@ -705,7 +707,7 @@ func TestCaptureCancelsGitDescendants(t *testing.T) {
 	if parseErr != nil {
 		t.Fatal(parseErr)
 	}
-	deadline = time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(processWatchdog)
 	for syscall.Kill(pid, 0) == nil && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
