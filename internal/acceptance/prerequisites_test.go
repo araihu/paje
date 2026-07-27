@@ -13,8 +13,8 @@ func TestOptedInAcceptancePrerequisiteFailuresAreFatal(t *testing.T) {
 		switch helper {
 		case "github":
 			TestGitHubPublicationAcceptance(t)
-		case "codex-binary":
-			TestCodexArtifactAcceptance(t)
+		case "codex-docker":
+			_ = requireDockerAcceptance(t)
 		case "codex-auth":
 			_ = existingCodexHome(t)
 		default:
@@ -41,12 +41,13 @@ func TestOptedInAcceptancePrerequisiteFailuresAreFatal(t *testing.T) {
 			wantError: "required acceptance variables",
 		},
 		{
-			name: "Codex executable", helper: "codex-binary",
+			name: "Codex Docker endpoint", helper: "codex-docker",
 			env: map[string]string{
-				"PAJE_CODEX_INTEGRATION": "1",
-				"PATH":                   t.TempDir(),
+				"PAJE_DOCKER_ACCEPTANCE":    "1",
+				"PAJE_CODEX_ACCEPTANCE":     "1",
+				"PAJE_DOCKER_TEST_ENDPOINT": "",
 			},
-			wantError: "authenticated Codex acceptance requires codex on PATH",
+			wantError: "set PAJE_DOCKER_TEST_ENDPOINT to an explicit local Unix socket",
 		},
 		{
 			name: "Codex auth", helper: "codex-auth",

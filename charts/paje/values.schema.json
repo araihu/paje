@@ -7,9 +7,8 @@
     "publisher",
     "persistence",
     "limits",
-    "environment",
     "secrets",
-    "codexAuth"
+    "codeChange"
   ],
   "properties": {
     "replicaCount": {
@@ -19,11 +18,19 @@
     },
     "adapters": {
       "type": "object",
-      "required": ["memory", "workspace", "runner"],
+      "required": ["memory", "workspace"],
+      "additionalProperties": false,
       "properties": {
         "memory": {"type": "string", "enum": ["mock", "mem0"]},
-        "workspace": {"type": "string", "enum": ["mock", "git"]},
-        "runner": {"type": "string", "enum": ["mock", "local", "codex"]}
+        "workspace": {"type": "string", "enum": ["mock", "git"]}
+      }
+    },
+    "codeChange": {
+      "type": "object",
+      "required": ["executor"],
+      "additionalProperties": false,
+      "properties": {
+        "executor": {"type": "string", "const": "mock"}
       }
     },
     "publisher": {
@@ -57,17 +64,6 @@
         "commandOutputBytes": {"type": "integer", "minimum": 1}
       }
     },
-    "environment": {
-      "type": "object",
-      "required": ["allowlist"],
-      "properties": {
-        "allowlist": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
-        }
-      }
-    },
     "secrets": {
       "type": "object",
       "required": ["hatchet", "mem0", "github"],
@@ -76,14 +72,10 @@
         "mem0": {"$ref": "#/definitions/credential"},
         "github": {"$ref": "#/definitions/credential"}
       }
-    },
-    "codexAuth": {
-      "type": "object",
-      "required": ["existingSecret"],
-      "properties": {
-        "existingSecret": {"type": "string"}
-      }
     }
+  },
+  "propertyNames": {
+    "not": {"pattern": "^(runner|codex[A]uth|environment)$"}
   },
   "allOf": [
     {
@@ -126,24 +118,6 @@
           "secrets": {
             "properties": {
               "github": {"$ref": "#/definitions/configuredCredential"}
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "adapters": {
-            "properties": {"runner": {"const": "codex"}}
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "codexAuth": {
-            "properties": {
-              "existingSecret": {"type": "string", "minLength": 1}
             }
           }
         }

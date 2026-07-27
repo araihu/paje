@@ -270,3 +270,13 @@ test("language controls retain explicit routes and implement query and anchor pr
   assert.match(switcherSource, /destination\.search = window\.location\.search/);
   assert.match(switcherSource, /destination\.hash = window\.location\.hash/);
 });
+
+test("publishes the exact portable execution support matrix", async () => {
+  for (const locale of ["en", "pt-br", "es"]) {
+    const { html } = await render(locale);
+    assert.match(html, /Local Docker Engine — current/);
+    assert.match(html, /Host — development only/);
+    assert.match(html, /Kubernetes Jobs — planned/);
+    assert.doesNotMatch(html, /Kubernetes Jobs — current|Kubernetes execution — current|certified Kubernetes/i);
+  }
+});

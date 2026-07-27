@@ -19,9 +19,9 @@ helm upgrade --install paje ./charts/paje \\
 const phaseNames = ["Resolve", "Execute", "Approval", "Publish", "Finalize"] as const;
 const guideAnchors = ["preparar", "instalar", "executar", "aprovar"] as const;
 const docHrefs = [
-  `${githubUrl}#workflow-input`,
-  `${githubUrl}#configuration`,
-  `${githubUrl}#kubernetes-deployment`,
+  `${githubUrl}/blob/main/docs/worker-profiles.md`,
+  `${githubUrl}/blob/main/docs/worker-secrets.md`,
+  `${githubUrl}/blob/main/docs/executors.md`,
   `${githubUrl}/blob/main/docs/superpowers/specs/2026-07-24-beta-code-change-workflow-design.md`,
 ] as const;
 
@@ -42,6 +42,7 @@ function workflowInput(locale: Locale) {
           user_id: "operator@example.com",
           app_id: "service",
         },
+        worker_profile: "codex-go@1",
         profile: "generic",
         checks: [
           {
@@ -331,6 +332,21 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
             <div className="boundary-footer">
               <span>codex home</span><span>git publisher</span><span>artifact store</span>
             </div>
+          </div>
+        </section>
+
+        <section className="section features-section" id="suporte" aria-label="Portable executor support">
+          <div className="section-heading split-heading">
+            <div>
+              <p className="kicker">Portable worker execution</p>
+              <h2>Support is explicit.<br />Claims follow evidence.</h2>
+            </div>
+            <p>Helm installs the coordinator only. Worker profiles, secret bindings, and executor capacity are operator-owned inputs.</p>
+          </div>
+          <div className="feature-grid">
+            <article className="feature-card"><div className="feature-topline"><span>01</span><code>supported</code></div><h3>Local Docker Engine — current</h3><p>Isolated containers use exact worker profiles, bounded secret leases, and restart-safe lifecycle evidence.</p></article>
+            <article className="feature-card"><div className="feature-topline"><span>02</span><code>development</code></div><h3>Host — development only</h3><p>The host adapter preserves the portable contract for local development, but it is not an isolation boundary.</p></article>
+            <article className="feature-card"><div className="feature-topline"><span>03</span><code>planned</code></div><h3>Kubernetes Jobs — planned</h3><p>The coordinator chart creates no workload Job and mounts no Docker socket.</p></article>
           </div>
         </section>
 

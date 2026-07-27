@@ -177,9 +177,6 @@ func (s *Service) beginExecuteStage(ctx context.Context, runID string) (run.Reco
 		}
 		agentAttempt := executorAttempt(runID, ownership, executor.PurposeAgent, 0)
 		state, inspectErr := target.Inspect(ctx, agentAttempt)
-		if inspectErr != nil {
-			return s.failAmbiguousExecute(ctx, runID, ownership, inspectErr)
-		}
 		owned, identityErr := s.checkExecuteIdentity(ctx, runID, ownership)
 		if identityErr != nil {
 			return owned, false, identityErr
@@ -188,8 +185,12 @@ func (s *Service) beginExecuteStage(ctx context.Context, runID string) (run.Reco
 			continue
 		}
 		durableStart := latest.Evidence["agent_started"] == "true"
-		if (state != executor.StateAbsent && state != executor.StateCreated) || durableStart {
-			return s.failAmbiguousExecute(ctx, runID, ownership, errors.New("prior agent attempt may have started"))
+		if inspectErr != nil || (state != executor.StateAbsent && state != executor.StateCreated) || durableStart {
+			cause := inspectErr
+			if cause == nil {
+				cause = errors.New("prior agent attempt may have started")
+			}
+			return s.compensateAmbiguousExecute(ctx, runID, ownership, target, agentAttempt, cause)
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupTimeout)
 		destroyErr := target.Destroy(cleanupCtx, agentAttempt)
@@ -238,13 +239,22 @@ func (s *Service) completeCheckpointedExecute(ctx context.Context, runID string,
 }
 
 func (s *Service) failAmbiguousExecute(ctx context.Context, runID string, ownership stageOwnership, cause error) (run.Record, bool, error) {
+	return s.failRecoveredExecute(ctx, runID, ownership, ambiguousAttemptFailure(), cause)
+}
+
+func (s *Service) failRecoveredExecute(
+	ctx context.Context,
+	runID string,
+	ownership stageOwnership,
+	failure run.Failure,
+	cause error,
+) (run.Record, bool, error) {
 	record, err := s.mutate(context.WithoutCancel(ctx), runID, func(current run.Record) (run.Record, bool, error) {
 		if !exactStageIdentity(current, ownership) {
 			return current, false, ErrPhaseInProgress
 		}
 		next := run.CloneRecord(current)
 		latest, _ := latestStage(next, "execute")
-		failure := ambiguousAttemptFailure()
 		latest.Status = run.StageFailed
 		latest.FinishedAt = s.clock()
 		latest.Failure = &failure
@@ -261,8 +271,58 @@ func (s *Service) failAmbiguousExecute(ctx context.Context, runID string, owners
 	if err != nil {
 		return record, false, err
 	}
-	failure := ambiguousAttemptFailure()
 	return record, false, newPhaseError(failure, cause)
+}
+
+func (s *Service) compensateAmbiguousExecute(
+	ctx context.Context,
+	runID string,
+	ownership stageOwnership,
+	target executor.Executor,
+	attempt executor.AttemptID,
+	cause error,
+) (run.Record, bool, error) {
+	before, beforeErr := s.checkExecuteIdentity(ctx, runID, ownership)
+	if beforeErr != nil || !exactStageIdentity(before, ownership) {
+		return before, false, errors.Join(ErrPhaseInProgress, beforeErr)
+	}
+	cancelErr := s.boundedRecoveryCleanup(ctx, func(cleanupCtx context.Context) error {
+		return target.Cancel(cleanupCtx, attempt)
+	})
+	between, betweenErr := s.checkExecuteIdentity(ctx, runID, ownership)
+	destroyErr := s.boundedRecoveryCleanup(ctx, func(cleanupCtx context.Context) error {
+		return target.Destroy(cleanupCtx, attempt)
+	})
+	after, afterErr := s.checkExecuteIdentity(ctx, runID, ownership)
+	cleanupErr := errors.Join(cancelErr, destroyErr)
+	if betweenErr != nil || !exactStageIdentity(between, ownership) ||
+		afterErr != nil || !exactStageIdentity(after, ownership) {
+		return after, false, errors.Join(ErrPhaseInProgress, cause, cleanupErr, betweenErr, afterErr)
+	}
+	if cleanupErr != nil {
+		failure := run.Failure{
+			Stage: "execute", Class: run.FailureCleanup, Retryable: false,
+			Diagnostic: "attempt cleanup failed", CauseCode: "cleanup_failed",
+		}
+		return s.failRecoveredExecute(ctx, runID, ownership, failure, errors.Join(cause, cleanupErr))
+	}
+	return s.failAmbiguousExecute(ctx, runID, ownership, cause)
+}
+
+func (s *Service) boundedRecoveryCleanup(
+	ctx context.Context,
+	operation func(context.Context) error,
+) error {
+	cleanupCtx, cancel := s.cleanupContext(ctx)
+	defer cancel()
+	completed := make(chan error, 1)
+	go func() { completed <- operation(cleanupCtx) }()
+	select {
+	case err := <-completed:
+		return err
+	case <-cleanupCtx.Done():
+		return cleanupCtx.Err()
+	}
 }
 
 func (s *Service) retryConclusiveNonStart(ctx context.Context, runID string, ownership stageOwnership) (run.Record, bool, error) {

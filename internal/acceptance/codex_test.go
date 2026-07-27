@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -34,6 +35,7 @@ import (
 	codexrunner "github.com/araihu/paje/internal/runner/codex"
 	"github.com/araihu/paje/internal/secret"
 	secretmock "github.com/araihu/paje/internal/secret/mock"
+	secretprovider "github.com/araihu/paje/internal/secret/provider"
 	"github.com/araihu/paje/internal/template"
 	templatecodechange "github.com/araihu/paje/internal/template/codechange"
 	"github.com/araihu/paje/internal/verification"
@@ -130,6 +132,252 @@ func TestCodexAcceptancePortableCompositionReachesResolve(t *testing.T) {
 }
 
 func TestCodexArtifactAcceptance(t *testing.T) {
+	requireOptIn(t, "PAJE_DOCKER_ACCEPTANCE", "the real Docker portable-runtime acceptance suite")
+	requireOptIn(t, "PAJE_CODEX_ACCEPTANCE", "the authenticated standard codex-go@1 acceptance test")
+	codexHome := existingCodexHome(t)
+	worker := requireDockerAcceptance(t).publishWorker(t)
+	registerRunDockerResourceCleanup(t, worker.docker, codexAcceptanceRunID)
+	if worker.profile.Metadata.String() != "codex-go@1" {
+		t.Fatalf("rendered worker profile = %q, want codex-go@1", worker.profile.Metadata.String())
+	}
+	if len(worker.profile.Secrets) != 1 {
+		t.Fatalf("rendered codex-go@1 secret requirements = %d, want one exact auth binding", len(worker.profile.Secrets))
+	}
+
+	authBytes, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("read authenticated Codex prerequisite: %v", err)
+	}
+	authRoot := t.TempDir()
+	if err := os.Chmod(authRoot, 0o700); err != nil {
+		t.Fatalf("harden Codex auth source root: %v", err)
+	}
+	authRootInfo, err := os.Lstat(authRoot)
+	if err != nil || !authRootInfo.IsDir() || authRootInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("Codex auth source root mode = %v, %v, want directory 0700", authRootInfo, err)
+	}
+	if err := os.WriteFile(filepath.Join(authRoot, "auth.json"), authBytes, 0o600); err != nil {
+		clear(authBytes)
+		t.Fatal(err)
+	}
+	clear(authBytes)
+	requirement := worker.profile.Secrets[0]
+	binding, err := secret.NewBinding(
+		secret.BindingRef{Capability: requirement.Capability, Revision: requirement.BindingRevision},
+		secret.Authorization{
+			ProfileID: worker.profile.Metadata, Stage: requirement.Stage,
+			Delivery: requirement.Delivery, Target: requirement.Target,
+		},
+		"filesystem", authRoot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := secretprovider.NewFilesystem(secretprovider.FilesystemConfig{
+		AllowedRoots: []string{authRoot}, MaxBytes: 10 << 20, MaxEntries: 8, OwnerUID: os.Getuid(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 5*time.Second)
+	probe, err := provider.Read(probeCtx, authRoot)
+	cancelProbe()
+	if err != nil {
+		t.Fatalf("read hardened Codex auth source: %v", err)
+	}
+	probe.Destroy()
+	broker, err := secret.NewBroker(
+		exactBindingRegistry{binding: binding},
+		map[string]secret.Provider{"filesystem": provider},
+		secret.BrokerConfig{LeaseTTL: 10 * time.Minute},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newLiveDockerExecutor(t, worker)
+	executors, err := executor.NewRegistry(executor.Registration{RuntimeKind: workerprofile.RuntimeOCI, Executor: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := harnesscodex.New(harnesscodex.SupportedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harnesses, err := harness.NewRegistry(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceRepository, baseSHA := newCodexAcceptanceRepository(t)
+	sourceTree := gitOutput(t, sourceRepository, "write-tree")
+	workspaceRoot := newSharedAcceptanceRoot(t, worker.docker.repositoryRoot, ".paje-codex-acceptance-")
+	workspaces, err := gitworktree.New(workspaceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := runfilesystem.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := artifactfilesystem.New(t.TempDir(), 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = artifacts.Close() })
+	environments, err := environment.NewPolicy(environment.Config{RuntimeRoot: t.TempDir(), Source: baselineEnvironment()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	genericProfile, err := repository.NewGenericProfile(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goProfile, err := repository.NewGoProfile(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := verification.NewExecutor(verification.DefaultLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changePolicy, err := policy.NewChangePolicy(policy.Config{Workspace: workspaceRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := template.NewRegistry(templatecodechange.Definition{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryStore := memorymock.NewStore([]memory.Memory{{
+		ID:       "paje-codex-acceptance-memory",
+		Content:  "In module-a/greeting/greeting.go, replace exactly `const Message = \"before\"` with `const Message = \"after\"`. Change no other file.",
+		Metadata: map[string]string{"user_id": "acceptance", "app_id": "codex"},
+	}})
+	service, err := codechange.New(codechange.Dependencies{
+		Templates: registry, Runs: runs, Memory: memoryStore, Resolver: workspaces, Workspaces: workspaces,
+		Profiles:       map[string]repository.Profile{"generic": genericProfile, "go": goProfile},
+		WorkerProfiles: workerprofilemock.NewRegistry(worker.profile), SecretBindings: exactBindingRegistry{binding: binding},
+		Secrets: broker, Executors: executors, Harnesses: harnesses, Environments: environments,
+		Agent: &recordingRunner{}, Verifier: verifier, Capturer: capturer, Policy: changePolicy, Artifacts: artifacts,
+		Publisher: publishermock.NewPublisher(publisher.Result{}, nil), Clock: time.Now,
+		NewID: func() string { return codexAcceptanceRunID },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := templatecodechange.Input{
+		IdempotencyKey:  codexAcceptanceRunID,
+		TaskDescription: "First apply the exact one-line edit from scoped memory. Change no other file. Confirm git diff contains exactly the target path and change. Only then include " + codexAcceptanceMarker + " in the final response.",
+		RepositoryURI:   sourceRepository, BaseRef: "main", MemoryQuery: "module-a/greeting/greeting.go", MemoryLimit: 1,
+		Tags: map[string]string{"user_id": "acceptance", "app_id": "codex"}, Profile: "go",
+		WorkerProfile: "codex-go@1", Publication: templatecodechange.Publication{Mode: "artifact"},
+	}
+	rawInput, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	resolved, err := service.Resolve(ctx, rawInput)
+	if err != nil || resolved.RunID != codexAcceptanceRunID {
+		t.Fatalf("Resolve() = %#v, %v", resolved, err)
+	}
+	resolvedRecord, err := runs.Load(ctx, resolved.RunID)
+	memoryID := ""
+	if len(resolvedRecord.MemorySnapshot) == 1 {
+		memoryID = resolvedRecord.MemorySnapshot[0].ID
+	}
+	if err != nil || len(resolvedRecord.MemorySnapshot) != 1 ||
+		memoryID != "paje-codex-acceptance-memory" {
+		t.Fatalf("durable Codex memory binding ID/count = %q/%d, %v",
+			memoryID, len(resolvedRecord.MemorySnapshot), err)
+	}
+	executed, err := service.Execute(ctx, resolved.RunID)
+	if err != nil || executed.Artifact == nil {
+		t.Fatalf("Execute() = %#v, chain=%q", executed, safeErrorChain(err))
+	}
+	if _, err := service.Approval(ctx, resolved.RunID, approvalmock.NewGate(approval.Result{}, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Publish(ctx, resolved.RunID); err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := service.Finalize(ctx, resolved.RunID)
+	if err != nil || finalized.Status != run.StatusSucceeded {
+		t.Fatalf("Finalize() = %#v, %v", finalized, err)
+	}
+	record, err := runs.Load(ctx, resolved.RunID)
+	if err != nil || record.WorkerProfile == nil || record.WorkerProfile.Metadata.String() != "codex-go@1" || len(record.SecretBindings) != 1 {
+		t.Fatalf("durable portable binding = %#v, %v", record, err)
+	}
+	if broker.ActiveLeases() != 0 {
+		t.Fatalf("active Codex auth leases = %d, want zero", broker.ActiveLeases())
+	}
+	bundle, err := artifacts.Load(ctx, finalized.Artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var executionEvidence struct {
+		AgentEnvironmentKeys []string `json:"agent_environment_keys"`
+		Attempts             []struct {
+			ID      executor.AttemptID `json:"id"`
+			Started bool               `json:"started"`
+		} `json:"attempts"`
+	}
+	if err := json.Unmarshal(bundle.ExecutionMetadata, &executionEvidence); err != nil {
+		t.Fatalf("decode credentialed Codex execution evidence: %v", err)
+	}
+	if !slices.Contains(executionEvidence.AgentEnvironmentKeys, "CODEX_HOME") {
+		t.Fatalf("agent environment evidence = %q, want confirmed CODEX_HOME key", executionEvidence.AgentEnvironmentKeys)
+	}
+	confirmedAgent := false
+	for _, attempt := range executionEvidence.Attempts {
+		if attempt.ID.Purpose == executor.PurposeAgent && attempt.Started {
+			confirmedAgent = true
+		}
+	}
+	if !confirmedAgent {
+		t.Fatalf("credentialed Codex attempts lack confirmed agent child start: %#v", executionEvidence.Attempts)
+	}
+	assertNoCredentialEvidence(t, string(bundle.ExecutionMetadata))
+	if !strings.Contains(string(bundle.AgentOutput), codexAcceptanceMarker) || len(bundle.Manifest.Changes) != 1 ||
+		bundle.Manifest.Changes[0].Path != "module-a/greeting/greeting.go" || len(bundle.Verification) != 2 ||
+		!bundle.Verification[0].Passed || !bundle.Verification[1].Passed {
+		t.Fatalf("credentialed Codex artifact evidence = %#v output=%q", bundle.Manifest, bundle.AgentOutput)
+	}
+	fresh, err := workspaces.Prepare(ctx, sourceRepository, baseSHA)
+	if err != nil {
+		t.Fatalf("prepare fresh credentialed Codex reproduction worktree: %v", err)
+	}
+	if err := capturer.Apply(ctx, gitcapture.ApplyRequest{
+		Workspace: fresh.Path(), BaseSHA: baseSHA,
+		Patch: bundle.ChangesPatch, ExpectedTreeSHA: bundle.Manifest.TreeSHA,
+	}); err != nil {
+		t.Fatalf("apply credentialed Codex artifact: %v", err)
+	}
+	if got := gitOutput(t, fresh.Path(), "write-tree"); got != bundle.Manifest.TreeSHA {
+		t.Fatalf("credentialed Codex reproduced tree = %q, want manifest tree %q", got, bundle.Manifest.TreeSHA)
+	}
+	if got, err := os.ReadFile(filepath.Join(fresh.Path(), "module-a", "greeting", "greeting.go")); err != nil ||
+		string(got) != "package greeting\n\nconst Message = \"after\"\n" {
+		t.Fatalf("credentialed Codex reproduced requested file = %q, error=%v", got, err)
+	}
+	if err := fresh.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup credentialed Codex reproduction worktree: %v", err)
+	}
+	if gitOutput(t, sourceRepository, "rev-parse", "HEAD") != baseSHA || gitOutput(t, sourceRepository, "write-tree") != sourceTree ||
+		gitOutput(t, sourceRepository, "status", "--porcelain=v1") != "" {
+		t.Fatal("credentialed Codex acceptance changed source checkout")
+	}
+	assertDirectoryEmpty(t, filepath.Join(workspaceRoot, "worktrees"))
+	assertRunDockerResourcesAbsent(t, worker.docker, codexAcceptanceRunID)
+}
+
+func runLegacyCodexArtifactAcceptance(t *testing.T) {
 	requireOptIn(t, "PAJE_CODEX_INTEGRATION", "the authenticated Codex artifact acceptance test")
 	if _, err := exec.LookPath("codex"); err != nil {
 		t.Fatal("authenticated Codex acceptance requires codex on PATH")

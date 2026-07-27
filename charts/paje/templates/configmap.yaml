@@ -7,8 +7,10 @@ metadata:
 data:
   PAJE_MEMORY_ADAPTER: {{ .Values.adapters.memory | quote }}
   PAJE_WORKSPACE_ADAPTER: {{ .Values.adapters.workspace | quote }}
-  PAJE_RUNNER_ADAPTER: {{ .Values.adapters.runner | quote }}
   PAJE_PUBLISHER_ADAPTER: {{ .Values.publisher.adapter | quote }}
+  PAJE_CODECHANGE_EXECUTOR: {{ .Values.codeChange.executor | quote }}
+  PAJE_WORKER_PROFILE_DIR: "/etc/paje/worker-profiles"
+  PAJE_SECRET_BINDING_DIR: "/etc/paje/secret-bindings"
   {{- if .Values.persistence.enabled }}
   PAJE_WORKSPACE_ROOT: "/var/lib/paje/workspace"
   PAJE_RUN_ROOT: "/var/lib/paje/runs"
@@ -21,9 +23,6 @@ data:
   PAJE_RUNTIME_ROOT: "/run/paje"
   PAJE_ARTIFACT_LIMIT_BYTES: {{ .Values.limits.artifactBytes | int64 | quote }}
   PAJE_COMMAND_OUTPUT_LIMIT_BYTES: {{ .Values.limits.commandOutputBytes | int64 | quote }}
-  PAJE_ENV_ALLOWLIST: {{ .Values.environment.allowlist | toJson | quote }}
-  PAJE_RUNNER_COMMAND: {{ .Values.runner.command | quote }}
-  PAJE_RUNNER_ARGS: {{ .Values.runner.args | toJson | quote }}
   GITHUB_API_URL: {{ .Values.publisher.githubAPIURL | quote }}
   HOME: "/tmp"
   HATCHET_CLIENT_LOG_LEVEL: {{ .Values.hatchet.logLevel | quote }}
@@ -42,3 +41,19 @@ data:
   {{- with .Values.hatchet.tlsStrategy }}
   HATCHET_CLIENT_TLS_STRATEGY: {{ . | quote }}
   {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "paje.fullname" . }}-worker-profiles
+  labels:
+    {{- include "paje.labels" . | nindent 4 }}
+data: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "paje.fullname" . }}-secret-bindings
+  labels:
+    {{- include "paje.labels" . | nindent 4 }}
+data: {}

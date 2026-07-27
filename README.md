@@ -17,13 +17,29 @@ scoped memory snapshot, runs Codex in an isolated Git worktree, verifies every
 selected module, and persists a content-addressed artifact. Pull-request mode
 adds artifact-bound approval and idempotent draft GitHub publication.
 
+## Portable worker support
+
+| Executor | Support |
+| --- | --- |
+| Local Docker Engine | current |
+| Host | development only |
+| Kubernetes Jobs | planned |
+
+The Helm chart deploys the coordinator only. Its default portable catalogs are
+empty and read-only, and the code-change executor is `mock`; it mounts no
+Docker socket and creates no workload `Job`. Configure Local Docker directly
+on a trusted host when enabling portable worker execution. See
+[worker profiles](docs/worker-profiles.md),
+[worker secrets](docs/worker-secrets.md), and
+[executors](docs/executors.md).
+
 ## Requirements
 
 - Go 1.26 or newer for development
 - Docker and Helm 3 for packaging
 - an existing Hatchet installation
 - Git for the real workspace and publisher adapters
-- an authenticated Codex CLI or Codex auth Secret when using the Codex runner
+- an authenticated Codex auth directory when using `codex-go@1`
 - Mem0 and GitHub credentials only when those adapters are selected
 
 ## Workflow input
@@ -54,7 +70,7 @@ Artifact example:
       "app_id": "service"
     },
     "profile": "go",
-    "environment_keys": [],
+    "worker_profile": "codex-go@1",
     "publication": {
       "mode": "artifact"
     }
@@ -79,7 +95,7 @@ Draft pull-request example:
       "app_id": "service"
     },
     "profile": "go",
-    "environment_keys": [],
+    "worker_profile": "codex-go@1",
     "publication": {
       "mode": "pull_request",
       "provider": "github",
@@ -207,163 +223,85 @@ Pajé reads these worker variables directly:
 | `HATCHET_CLIENT_TOKEN` | required | Hatchet worker authentication; never passed to agent or verification children |
 | `PAJE_MEMORY_ADAPTER` | `mock` | `mock` or `mem0` |
 | `PAJE_WORKSPACE_ADAPTER` | `mock` | `mock` or `git` |
-| `PAJE_RUNNER_ADAPTER` | `mock` | `mock`, `local`, or `codex` |
 | `PAJE_PUBLISHER_ADAPTER` | `mock` | `mock` or `github` |
+| `PAJE_CODECHANGE_EXECUTOR` | `mock` | `mock`, `docker`, or explicitly enabled development-only `host` |
+| `PAJE_WORKER_PROFILE_DIR` | required | read-only canonical worker-profile catalog |
+| `PAJE_SECRET_BINDING_DIR` | required | read-only canonical secret-binding catalog |
+| `PAJE_DOCKER_ENDPOINT` | empty | explicit local Unix socket for the Docker executor |
+| `PAJE_DOCKER_REGISTRY_AUTH_FILE` | empty | bounded regular registry-auth file used only by the Docker adapter |
+| `PAJE_HOST_EXECUTOR_ENABLED` | `false` | explicit development-only host executor opt-in |
 | `PAJE_WORKSPACE_ROOT` | `<temp>/paje/workspaces` | repository mirrors and worktrees |
 | `PAJE_RUN_ROOT` | `<workspace-root>/runs` | filesystem run store |
 | `PAJE_ARTIFACT_ROOT` | `<workspace-root>/artifacts` | filesystem artifact store |
 | `PAJE_RUNTIME_ROOT` | `<workspace-root>/runtime` | per-attempt runtime data and publisher credentials |
 | `PAJE_ARTIFACT_LIMIT_BYTES` | `10485760` | maximum compressed artifact bytes |
 | `PAJE_COMMAND_OUTPUT_LIMIT_BYTES` | `1048576` | maximum captured output per verification command |
-| `PAJE_ENV_ALLOWLIST` | `[]` | JSON array of operator-approved non-secret child variable names |
-| `PAJE_RUNNER_COMMAND` | `codex` | executable for local/Codex runner |
-| `PAJE_RUNNER_ARGS` | `["exec"]` | JSON argument array for the local runner; ignored by Codex runner |
+| `PAJE_SECRET_FILESYSTEM_ROOTS` | `[]` | JSON array of exact provider roots |
+| `PAJE_SECRET_PROVIDER_MAX_BYTES`, `PAJE_SECRET_PROVIDER_MAX_ENTRIES` | bounded defaults | materialization limits |
 | `MEM0_API_KEY` | empty | required for `mem0`; never passed to agent or verification children |
 | `MEM0_BASE_URL` | adapter default | optional Mem0 API origin |
 | `GITHUB_TOKEN` | empty | required for GitHub publisher; available only to publisher HTTP/askpass operations |
 | `GITHUB_API_URL` | `https://api.github.com` | GitHub API origin |
-| `CODEX_HOME` | empty | required for Codex runner; authentication state passed only to agent stage |
 
 Hatchet SDK connection variables include `HATCHET_CLIENT_HOST_PORT`,
 `HATCHET_CLIENT_SERVER_URL`, `HATCHET_CLIENT_NAMESPACE`,
 `HATCHET_CLIENT_TLS_STRATEGY`, and `HATCHET_CLIENT_LOG_LEVEL`. The Helm values
 below render them when set.
 
-`PAJE_ENV_ALLOWLIST` names values that must also exist in the worker process
-environment, for example through `extraEnv`. It cannot include Hatchet, Mem0,
-Git, SSH, GitHub, `CODEX_HOME`, home/temp, or publisher-managed credential
-keys. Baseline path, locale, and certificate variables are selected
-automatically.
+Portable child environments are derived from the fixed baseline, exact harness
+declarations and broker-owned secret requirements. Submissions cannot add
+environment keys or values.
 
 The beta Helm values are:
 
 | Value | Default | Purpose |
 | --- | --- | --- |
 | `replicaCount` | `1` | fixed beta replica count; schema rejects any other value |
-| `image.repository`, `image.tag`, `image.pullPolicy` | `ghcr.io/araihu/paje`, chart app version, `IfNotPresent` | worker image |
+| `image.repository`, `image.tag`, `image.pullPolicy` | `ghcr.io/araihu/paje`, chart app version, `IfNotPresent` | coordinator image |
 | `imagePullSecrets` | `[]` | private image pull credentials |
 | `nameOverride`, `fullnameOverride` | empty | resource naming |
 | `serviceAccount.create`, `.automount`, `.annotations`, `.name` | `true`, `false`, `{}`, empty | worker identity; no API token by default |
 | `podAnnotations`, `podLabels` | `{}`, `{}` | pod metadata |
 | `podSecurityContext` | group `65532` | pod filesystem ownership |
 | `securityContext` | non-root UID/GID `65532`, read-only root, no privilege escalation, all capabilities dropped | container boundary |
-| `adapters.memory`, `.workspace`, `.runner` | `mock`, `mock`, `mock` | selected adapters |
+| `adapters.memory`, `.workspace` | `mock`, `mock` | selected coordinator adapters |
+| `codeChange.executor` | `mock` | fail-closed chart default; no in-pod Docker access |
 | `publisher.adapter`, `.githubAPIURL` | `mock`, `https://api.github.com` | publication adapter |
 | `workspace.root`, `.sizeLimit` | `/workspace`, `10Gi` | ephemeral data mount |
 | `persistence.enabled`, `.existingClaim`, `.size`, `.storageClass`, `.accessModes` | `false`, empty, `10Gi`, empty, `[ReadWriteOnce]` | filesystem durability |
 | `limits.artifactBytes`, `.commandOutputBytes` | `10485760`, `1048576` | artifact and command-output limits |
-| `environment.allowlist` | `[]` | non-secret child environment names |
-| `runner.command`, `.args` | `codex`, `[exec]` | runner executable and local-runner arguments |
 | `mem0.baseURL` | empty | optional Mem0 origin |
 | `hatchet.hostPort`, `.serverURL`, `.namespace`, `.tlsStrategy`, `.logLevel` | empty, empty, empty, empty, `info` | Hatchet SDK connection |
 | `secrets.hatchet`, `.mem0`, `.github` | separate `existingSecret`/`key`/`value` objects | worker service credentials |
-| `codexAuth.existingSecret` | empty | required read-only Codex auth seed when runner is `codex` |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | standard pod placement/resources |
 | `terminationGracePeriodSeconds` | `60` | bounded worker shutdown |
-| `extraEnv` | `[]` | additional worker variables; child access still requires the allowlist |
+| `extraEnv` | `[]` | additional coordinator variables; never implicit child input |
 
 See `charts/paje/values.yaml` and `charts/paje/values.schema.json` for the exact
-shape and schema constraints. Every active Hatchet, Mem0, GitHub, and Codex
+shape and schema constraints. Every active Hatchet, Mem0, and GitHub
 credential must use a distinct Secret, including generated service Secret
-names.
+names. Portable worker profiles and bindings are intentionally empty in the
+chart default and mounted read-only.
 
-## Kubernetes deployment
+## Kubernetes coordinator deployment
 
-Build the beta image with an auditable source revision:
-
-```bash
-PAJE_COMMIT="$(git rev-parse --verify 'HEAD^{commit}')"
-docker build \
-  --build-arg CODEX_VERSION=0.144.5 \
-  --build-arg PAJE_COMMIT="$PAJE_COMMIT" \
-  -t paje:beta .
-```
-
-`PAJE_COMMIT` has no fallback: the build rejects a missing value or anything
-other than a full 40-character lowercase hexadecimal commit. The image includes
-Codex CLI 0.144.5 and runs as UID/GID 65532. The chart supports a read-only root
-filesystem by mounting writable data, runtime, temp, and Codex-home volumes.
-
-Create separate worker credentials without putting values in shell history or
-process arguments. This example reads values silently, stores them only in a
-private temporary directory, sends file paths to `kubectl`, and removes the
-temporary material immediately:
+The Helm chart installs the Pajé coordinator, not a Kubernetes workload
+runner. It renders one Deployment, no `Job`, no Docker socket, no worker auth
+mount and no executable worker profile. The empty profile and binding catalogs
+are mounted read-only, so portable submissions fail closed until an operator
+chooses a supported executor outside this chart.
 
 ```bash
-kubectl create namespace paje
-
-PAJE_SECRET_DIR="$(mktemp -d)"
-chmod 700 "$PAJE_SECRET_DIR"
-read -rsp 'Hatchet token: ' HATCHET_CLIENT_TOKEN; printf '\n'
-printf '%s' "$HATCHET_CLIENT_TOKEN" >"$PAJE_SECRET_DIR/hatchet-client-token"
-unset HATCHET_CLIENT_TOKEN
-read -rsp 'Mem0 API key: ' MEM0_API_KEY; printf '\n'
-printf '%s' "$MEM0_API_KEY" >"$PAJE_SECRET_DIR/mem0-api-key"
-unset MEM0_API_KEY
-read -rsp 'GitHub token: ' GITHUB_TOKEN; printf '\n'
-printf '%s' "$GITHUB_TOKEN" >"$PAJE_SECRET_DIR/github-token"
-unset GITHUB_TOKEN
-chmod 600 "$PAJE_SECRET_DIR"/*
-
-kubectl -n paje create secret generic paje-hatchet \
-  --from-file=hatchet-client-token="$PAJE_SECRET_DIR/hatchet-client-token"
-kubectl -n paje create secret generic paje-mem0 \
-  --from-file=mem0-api-key="$PAJE_SECRET_DIR/mem0-api-key"
-kubectl -n paje create secret generic paje-github \
-  --from-file=github-token="$PAJE_SECRET_DIR/github-token"
-
-rm -f "$PAJE_SECRET_DIR/hatchet-client-token" \
-  "$PAJE_SECRET_DIR/mem0-api-key" \
-  "$PAJE_SECRET_DIR/github-token"
-rmdir "$PAJE_SECRET_DIR"
-unset PAJE_SECRET_DIR
-```
-
-Seed only Codex authentication files. Do not place Hatchet, Mem0, GitHub, SSH,
-or Git credentials in this Secret:
-
-```bash
-kubectl -n paje create secret generic paje-codex-auth \
-  --from-file=auth.json="${CODEX_HOME:-$HOME/.codex}/auth.json"
-```
-
-The Secret is mounted read-only into an init container. It copies the seed into
-a private writable `emptyDir`, which becomes `CODEX_HOME`; Codex runtime writes
-never mutate the Secret.
-
-Push the exact image under an immutable tag, then install that tag. The
-repository and tag below are placeholders for an operator-owned registry:
-
-```bash
-PAJE_IMAGE_REPOSITORY='<registry>/paje'
-PAJE_IMAGE_TAG="$PAJE_COMMIT"
-docker tag paje:beta "$PAJE_IMAGE_REPOSITORY:$PAJE_IMAGE_TAG"
-docker push "$PAJE_IMAGE_REPOSITORY:$PAJE_IMAGE_TAG"
-
 helm upgrade --install paje charts/paje \
-  --namespace paje \
-  --set image.repository="$PAJE_IMAGE_REPOSITORY" \
-  --set image.tag="$PAJE_IMAGE_TAG" \
+  --namespace paje --create-namespace \
   --set persistence.enabled=true \
-  --set adapters.memory=mem0 \
-  --set adapters.workspace=git \
-  --set adapters.runner=codex \
-  --set publisher.adapter=github \
-  --set secrets.hatchet.existingSecret=paje-hatchet \
-  --set secrets.mem0.existingSecret=paje-mem0 \
-  --set secrets.github.existingSecret=paje-github \
-  --set codexAuth.existingSecret=paje-codex-auth
+  --set secrets.hatchet.existingSecret=paje-hatchet
 ```
-
-For a local cluster whose nodes already contain `paje:beta`, use
-`--set image.repository=paje --set image.tag=beta --set image.pullPolicy=Never`
-instead of pushing. In both cases, verify the deployed image has the expected
-`org.opencontainers.image.revision` label.
 
 When `persistence.enabled=true`, the chart mounts one PVC at `/var/lib/paje`
 and uses `/var/lib/paje/workspace`, `/var/lib/paje/runs`, and
-`/var/lib/paje/artifacts`. `/run/paje`, `/tmp`, and the writable Codex home are
-ephemeral and intentionally cleared with the pod.
+`/var/lib/paje/artifacts`. `/run/paje` and `/tmp` remain ephemeral. Kubernetes
+Job execution is planned, not current support.
 
 ## Inspect and reapply an artifact
 
@@ -425,10 +363,15 @@ or required variable is a fatal failure; an opted-in acceptance test never
 silently skips.
 
 Authenticated Codex acceptance uses the existing `CODEX_HOME` (or
-`$HOME/.codex`) through the explicit agent-stage policy:
+`$HOME/.codex`) as a real broker source, builds and publishes the standard
+worker image, renders exact `codex-go@1`, and runs it through the real local
+Docker executor. Once both opt-ins are present, missing Docker or auth
+prerequisites are fatal; the test never converts them to a skip.
 
 ```bash
-PAJE_CODEX_INTEGRATION=1 \
+PAJE_DOCKER_ACCEPTANCE=1 \
+PAJE_CODEX_ACCEPTANCE=1 \
+PAJE_DOCKER_TEST_ENDPOINT=unix:///var/run/docker.sock \
   go test ./internal/acceptance \
   -run TestCodexArtifactAcceptance -v -count=1
 ```

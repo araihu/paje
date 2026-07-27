@@ -1685,6 +1685,53 @@ func (target *blockingDestroyExecutor) Inspect(ctx context.Context, attempt exec
 	return target.Executor.Inspect(ctx, attempt)
 }
 
+type recoveryCleanupExecutor struct {
+	executor.Executor
+	mu            sync.Mutex
+	state         executor.State
+	cancelErr     error
+	destroyErr    error
+	cancelRelease chan struct{}
+	events        []string
+	attempts      []executor.AttemptID
+}
+
+func (target *recoveryCleanupExecutor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {
+	if err := ctx.Err(); err != nil {
+		return executor.StateUnknown, err
+	}
+	if err := attempt.Validate(); err != nil {
+		return executor.StateUnknown, err
+	}
+	return target.state, nil
+}
+
+func (target *recoveryCleanupExecutor) Cancel(_ context.Context, attempt executor.AttemptID) error {
+	target.record("cancel", attempt)
+	if target.cancelRelease != nil {
+		<-target.cancelRelease
+	}
+	return target.cancelErr
+}
+
+func (target *recoveryCleanupExecutor) Destroy(_ context.Context, attempt executor.AttemptID) error {
+	target.record("destroy", attempt)
+	return target.destroyErr
+}
+
+func (target *recoveryCleanupExecutor) record(event string, attempt executor.AttemptID) {
+	target.mu.Lock()
+	target.events = append(target.events, event)
+	target.attempts = append(target.attempts, attempt)
+	target.mu.Unlock()
+}
+
+func (target *recoveryCleanupExecutor) Snapshot() ([]string, []executor.AttemptID) {
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	return slices.Clone(target.events), slices.Clone(target.attempts)
+}
+
 type blockingRevokeBroker struct {
 	secret.Broker
 	mu      sync.Mutex
@@ -2982,6 +3029,86 @@ func TestExecuteRecoveryTreatsPostStartAndUnknownAsAmbiguous(t *testing.T) {
 			if record.Failure == nil || record.Failure.CauseCode != "ambiguous_attempt" ||
 				len(fixture.executor.Requests()) != 0 {
 				t.Fatalf("ambiguous recovery record=%#v requests=%#v", record, fixture.executor.Requests())
+			}
+		})
+	}
+}
+
+func TestExecuteRecoveryCompensatesPostStartBeforeTerminalPersistence(t *testing.T) {
+	tests := []struct {
+		name       string
+		cancelErr  error
+		destroyErr error
+		block      bool
+		wantClass  run.FailureClass
+		wantCause  string
+	}{
+		{name: "confirmed cleanup remains ambiguous", wantClass: run.FailureInternal, wantCause: "ambiguous_attempt"},
+		{name: "cancel failure still destroys", cancelErr: errors.New("cancel failed"), wantClass: run.FailureCleanup, wantCause: "cleanup_failed"},
+		{name: "destroy failure overrides ambiguity", destroyErr: errors.New("destroy failed"), wantClass: run.FailureCleanup, wantCause: "cleanup_failed"},
+		{name: "blocking cancel is bounded and still destroys", block: true, wantClass: run.FailureCleanup, wantCause: "cleanup_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedServiceFixture(t)
+			clock := newMutableClock(time.Unix(100, 0).UTC())
+			fixture.service.clock = clock.Now
+			fixture.service.executeLease = time.Minute
+			fixture.service.cleanupTimeout = 20 * time.Millisecond
+			if _, started, err := fixture.service.beginStage(
+				context.Background(), "run-123", "execute", run.StatusExecuting,
+			); err != nil || !started {
+				t.Fatalf("beginStage() started=%t error=%v", started, err)
+			}
+			attempt := executor.AttemptID{
+				RunID: "run-123", Stage: "execute", Attempt: 1,
+				StartedAt: time.Unix(100, 0).UTC(), Purpose: executor.PurposeAgent,
+			}
+			target := &recoveryCleanupExecutor{
+				Executor: fixture.executor, state: executor.StateChildStarted,
+				cancelErr: test.cancelErr, destroyErr: test.destroyErr,
+			}
+			if test.block {
+				target.cancelRelease = make(chan struct{})
+				defer close(target.cancelRelease)
+			}
+			registry, err := executor.NewRegistry(executor.Registration{
+				RuntimeKind: workerprofile.RuntimeOCI, Executor: target,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.service.executors = registry
+			clock.Advance(2 * time.Minute)
+
+			before := time.Now()
+			result, executeErr := fixture.service.Execute(context.Background(), "run-123")
+			if time.Since(before) > 300*time.Millisecond {
+				t.Fatalf("recovery compensation exceeded bounded budget: %v", time.Since(before))
+			}
+			if executeErr == nil || result.Status != run.StatusFailed || result.FailureClass != test.wantClass || result.Retryable {
+				t.Fatalf("Execute(recovery) result=%#v error=%v", result, executeErr)
+			}
+			if test.cancelErr != nil && !errors.Is(executeErr, test.cancelErr) {
+				t.Fatalf("Execute(recovery) error = %v, want joined cancel failure", executeErr)
+			}
+			if test.destroyErr != nil && !errors.Is(executeErr, test.destroyErr) {
+				t.Fatalf("Execute(recovery) error = %v, want joined destroy failure", executeErr)
+			}
+			if test.block && !errors.Is(executeErr, context.DeadlineExceeded) {
+				t.Fatalf("Execute(recovery) error = %v, want bounded cancel deadline", executeErr)
+			}
+			events, attempts := target.Snapshot()
+			if !reflect.DeepEqual(events, []string{"cancel", "destroy"}) ||
+				len(attempts) != 2 || attempts[0].Key() != attempt.Key() || attempts[1].Key() != attempt.Key() {
+				t.Fatalf("recovery cleanup events=%#v attempts=%#v, want exact independent cancel/destroy", events, attempts)
+			}
+			record, err := fixture.runs.Load(context.Background(), "run-123")
+			latest, found := latestStage(record, "execute")
+			if err != nil || record.Status != run.StatusFailed || record.Failure == nil ||
+				record.Failure.Class != test.wantClass || record.Failure.CauseCode != test.wantCause || record.Failure.Retryable ||
+				!found || latest.Attempts != 1 {
+				t.Fatalf("durable recovery cleanup = %#v, %v", record, err)
 			}
 		})
 	}

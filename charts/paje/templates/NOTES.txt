@@ -1,6 +1,6 @@
-Pajé worker {{ include "paje.fullname" . }} has been installed.
+Pajé coordinator {{ include "paje.fullname" . }} has been installed.
 
-The worker connects outbound to Hatchet and exposes no Kubernetes Service.
+The coordinator connects outbound to Hatchet and exposes no Kubernetes Service.
 Inspect it with:
 
   kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "paje.fullname" . }} --follow
@@ -35,8 +35,16 @@ Pull-request mode requires an artifact-bound Hatchet event:
 Configured adapters:
   memory:    {{ .Values.adapters.memory }}
   workspace: {{ .Values.adapters.workspace }}
-  runner:    {{ .Values.adapters.runner }}
   publisher: {{ .Values.publisher.adapter }}
+  executor:  {{ .Values.codeChange.executor }} (fail-closed coordinator default)
+
+Worker catalogs:
+  profiles: /etc/paje/worker-profiles (empty, read-only)
+  bindings: /etc/paje/secret-bindings (empty, read-only)
+
+This chart is coordinator-only. It creates no workload Job, mounts no Docker
+socket, and installs no worker credential. Configure real worker profiles,
+secret bindings, and an executor outside this chart before accepting work.
 
 Persistence:
   enabled: {{ .Values.persistence.enabled }}
@@ -58,15 +66,11 @@ Credential Secrets:
 {{- if eq .Values.publisher.adapter "github" }}
   GitHub:  {{ include "paje.githubSecretName" . }}
 {{- end }}
-{{- if eq .Values.adapters.runner "codex" }}
-  Codex:   {{ .Values.codexAuth.existingSecret }} (read-only auth seed copied to writable CODEX_HOME)
-{{- end }}
-
-Every active Hatchet, Mem0, GitHub, and Codex credential must use a distinct
-Secret, including generated service Secret names. The Codex auth Secret must
-contain only Codex authentication seed files, never Hatchet, Mem0, GitHub, Git,
-or SSH credentials. Agent and verification children cannot receive service
-credentials; only the publisher receives GitHub credentials. Before reading
+Every active Hatchet, Mem0, and GitHub credential must use a distinct Secret,
+including generated service Secret names. Worker credentials belong in the
+external binding catalog, never in this coordinator Deployment. Agent and
+verification children cannot receive service credentials; only the publisher
+receives GitHub credentials. Before reading
 configuration, the worker makes itself non-dumpable; combined with the chart's
 dropped capabilities and noNewPrivileges setting, same-UID children cannot
 inspect the credential-bearing parent. Startup fails if the guard cannot be
@@ -88,11 +92,11 @@ Inspect one persisted artifact:
   tar -xOzf "$ARCHIVE" verification.json | jq .
 
 Acceptance opt-ins:
-  Codex: PAJE_CODEX_INTEGRATION=1
+  Docker: PAJE_DOCKER_ACCEPTANCE=1 plus an explicit local Unix endpoint
+  Codex:  PAJE_DOCKER_ACCEPTANCE=1 and PAJE_CODEX_ACCEPTANCE=1
   GitHub: PAJE_GITHUB_ACCEPTANCE=1, PAJE_GITHUB_TOKEN,
           PAJE_GITHUB_TEST_REPOSITORY, PAJE_GITHUB_TEST_BASE_REF,
           PAJE_GITHUB_TEST_RUN_ID
-  Docker build arguments: PAJE_DOCKER_ACCEPTANCE=1
   Kubernetes server dry-run: PAJE_KUBE_ACCEPTANCE=1 and an explicitly verified
           non-production context
 

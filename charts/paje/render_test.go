@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,10 +14,84 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestChartRendersCoordinatorOnlyPortableRuntime(t *testing.T) {
+	manifests, rendered := renderChart(t, "--set", "secrets.hatchet.value=test")
+	if got := len(manifestsOfKind(manifests, "Deployment")); got != 1 {
+		t.Fatalf("rendered Deployments = %d, want coordinator only", got)
+	}
+	if got := len(manifestsOfKind(manifests, "Job")); got != 0 {
+		t.Fatalf("rendered workload Jobs = %d, want none", got)
+	}
+
+	deployment := oneManifestOfKind(t, manifests, "Deployment")
+	podSpec := mapValue(mapValue(mapValue(deployment, "spec"), "template"), "spec")
+	container := namedObject(t, sliceValue(podSpec, "containers"), "paje")
+	assertMount(t, container, "worker-profiles", "/etc/paje/worker-profiles", true)
+	assertMount(t, container, "secret-bindings", "/etc/paje/secret-bindings", true)
+	if got := len(sliceValue(podSpec, "initContainers")); got != 0 {
+		t.Fatalf("rendered init containers = %d, want none", got)
+	}
+
+	configMaps := manifestsOfKind(manifests, "ConfigMap")
+	if len(configMaps) != 3 {
+		t.Fatalf("rendered ConfigMaps = %d, want coordinator config plus two empty catalogs", len(configMaps))
+	}
+	config := namedManifest(t, configMaps, "paje")
+	data := mapValue(config, "data")
+	want := map[string]string{
+		"PAJE_CODECHANGE_EXECUTOR": "mock",
+		"PAJE_WORKER_PROFILE_DIR":  "/etc/paje/worker-profiles",
+		"PAJE_SECRET_BINDING_DIR":  "/etc/paje/secret-bindings",
+	}
+	for key, value := range want {
+		if got := fmt.Sprint(data[key]); got != value {
+			t.Errorf("ConfigMap %s = %q, want %q", key, got, value)
+		}
+	}
+	for _, forbidden := range []string{
+		"PAJE_RUNNER_ADAPTER", "PAJE_RUNNER_COMMAND", "PAJE_RUNNER_ARGS",
+		"PAJE_ENV_ALLOWLIST", "CODEX_HOME", "/var/run/docker.sock", "kind: Job",
+	} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("coordinator-only render contains %q", forbidden)
+		}
+	}
+}
+
+func TestChartRejectsRetiredWorkerConfiguration(t *testing.T) {
+	for _, value := range []string{
+		"adapters.runner=codex",
+		"runner.command=codex",
+		"codexAuth.existingSecret=paje-codex-auth",
+		"environment.allowlist[0]=WORKLOAD_TOKEN",
+	} {
+		if _, err := helmTemplate("--set", "secrets.hatchet.value=test", "--set", value); err == nil {
+			t.Fatalf("retired value %q was accepted", value)
+		}
+	}
+}
+
+func TestChartTemplatesContainNoRetiredWorkerConfiguration(t *testing.T) {
+	for _, name := range []string{
+		"values.yaml", "values.schema.json", "templates/_helpers.tpl",
+		"templates/configmap.yaml", "templates/deployment.yaml",
+		"templates/secret.yaml", "templates/NOTES.txt",
+	} {
+		contents, err := os.ReadFile(filepath.Join(".", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"adapters.runner", "codexAuth", "environment_keys", "PAJE_RUNNER_"} {
+			if strings.Contains(string(contents), forbidden) {
+				t.Errorf("%s retains retired worker configuration %q", name, forbidden)
+			}
+		}
+	}
+}
+
 func TestDefaultChartRendersOnlyRequiredGeneratedHatchetSecret(t *testing.T) {
 	manifests, rendered := renderChart(t,
 		"--set", "secrets.hatchet.value=hatchet-secret-value",
-		"--set", "adapters.runner=mock",
 	)
 	secrets := manifestsOfKind(manifests, "Secret")
 	if len(secrets) != 1 {
@@ -35,18 +111,16 @@ func TestDefaultChartRendersOnlyRequiredGeneratedHatchetSecret(t *testing.T) {
 	}
 }
 
-func TestBetaChartRendersPersistentCodexWorkerWithSeparatedCredentials(t *testing.T) {
+func TestBetaChartRendersPersistentCoordinatorWithSeparatedServiceCredentials(t *testing.T) {
 	manifests, _ := renderChart(t,
 		"--set", "persistence.enabled=true",
 		"--set", "persistence.size=20Gi",
 		"--set", "adapters.memory=mem0",
 		"--set", "adapters.workspace=git",
-		"--set", "adapters.runner=codex",
 		"--set", "publisher.adapter=github",
 		"--set", "secrets.hatchet.existingSecret=paje-hatchet",
 		"--set", "secrets.mem0.existingSecret=paje-mem0",
 		"--set", "secrets.github.existingSecret=paje-github",
-		"--set", "codexAuth.existingSecret=paje-codex-auth",
 	)
 
 	pvcs := manifestsOfKind(manifests, "PersistentVolumeClaim")
@@ -65,31 +139,13 @@ func TestBetaChartRendersPersistentCodexWorkerWithSeparatedCredentials(t *testin
 	}
 	podSpec := mapValue(mapValue(spec, "template"), "spec")
 	container := namedObject(t, sliceValue(podSpec, "containers"), "paje")
-	assertEnvValue(t, container, "CODEX_HOME", "/codex-home")
 	assertSecretEnv(t, container, "HATCHET_CLIENT_TOKEN", "paje-hatchet", "hatchet-client-token")
 	assertSecretEnv(t, container, "MEM0_API_KEY", "paje-mem0", "mem0-api-key")
 	assertSecretEnv(t, container, "GITHUB_TOKEN", "paje-github", "github-token")
 	assertMount(t, container, "data", "/var/lib/paje", false)
 	assertMount(t, container, "runtime", "/run/paje", false)
-	assertMount(t, container, "codex-home", "/codex-home", false)
-
-	init := namedObject(t, sliceValue(podSpec, "initContainers"), "seed-codex-home")
-	if got, want := stringSlice(init["command"]), []string{
-		"/bin/sh", "-ec", "cp -R /codex-auth-seed/. /codex-home/\nchmod -R go-rwx /codex-home\n",
-	}; !reflect.DeepEqual(got, want) {
-		t.Errorf("init command = %#v, want %#v", got, want)
-	}
-	assertMount(t, init, "codex-auth-seed", "/codex-auth-seed", true)
-	assertMount(t, init, "codex-home", "/codex-home", false)
-	security := mapValue(init, "securityContext")
-	if intValue(security, "runAsUser") != 65532 || intValue(security, "runAsGroup") != 65532 ||
-		boolValue(security, "allowPrivilegeEscalation") || !boolValue(security, "runAsNonRoot") {
-		t.Errorf("init securityContext = %#v", security)
-	}
-	capabilities := mapValue(security, "capabilities")
-	if got := stringSlice(capabilities["drop"]); !reflect.DeepEqual(got, []string{"ALL"}) {
-		t.Errorf("init dropped capabilities = %#v", got)
-	}
+	assertMount(t, container, "worker-profiles", "/etc/paje/worker-profiles", true)
+	assertMount(t, container, "secret-bindings", "/etc/paje/secret-bindings", true)
 
 	volumeNames := map[string]map[string]any{}
 	for _, item := range sliceValue(podSpec, "volumes") {
@@ -102,36 +158,26 @@ func TestBetaChartRendersPersistentCodexWorkerWithSeparatedCredentials(t *testin
 	if _, ok := volumeNames["runtime"]["emptyDir"]; !ok {
 		t.Errorf("runtime volume = %#v, want emptyDir", volumeNames["runtime"])
 	}
-	if _, ok := volumeNames["codex-home"]["emptyDir"]; !ok {
-		t.Errorf("codex-home volume = %#v, want emptyDir", volumeNames["codex-home"])
-	}
-	seed := mapValue(volumeNames["codex-auth-seed"], "secret")
-	if stringValue(seed, "secretName") != "paje-codex-auth" {
-		t.Errorf("Codex seed volume = %#v", seed)
-	}
-
-	configMap := oneManifestOfKind(t, manifests, "ConfigMap")
+	configMap := namedManifest(t, manifestsOfKind(manifests, "ConfigMap"), "paje")
 	wantData := map[string]string{
 		"PAJE_MEMORY_ADAPTER":             "mem0",
 		"PAJE_WORKSPACE_ADAPTER":          "git",
-		"PAJE_RUNNER_ADAPTER":             "codex",
 		"PAJE_PUBLISHER_ADAPTER":          "github",
+		"PAJE_CODECHANGE_EXECUTOR":        "mock",
+		"PAJE_WORKER_PROFILE_DIR":         "/etc/paje/worker-profiles",
+		"PAJE_SECRET_BINDING_DIR":         "/etc/paje/secret-bindings",
 		"PAJE_WORKSPACE_ROOT":             "/var/lib/paje/workspace",
 		"PAJE_RUN_ROOT":                   "/var/lib/paje/runs",
 		"PAJE_ARTIFACT_ROOT":              "/var/lib/paje/artifacts",
 		"PAJE_RUNTIME_ROOT":               "/run/paje",
 		"PAJE_ARTIFACT_LIMIT_BYTES":       "10485760",
 		"PAJE_COMMAND_OUTPUT_LIMIT_BYTES": "1048576",
-		"PAJE_ENV_ALLOWLIST":              "[]",
 	}
 	data := mapValue(configMap, "data")
 	for key, want := range wantData {
 		if got := fmt.Sprint(data[key]); got != want {
 			t.Errorf("ConfigMap %s = %q, want %q", key, got, want)
 		}
-	}
-	if _, found := data["CODEX_HOME"]; found {
-		t.Error("ConfigMap contains CODEX_HOME; it must be set only on the worker container")
 	}
 	if _, configured := container["args"]; configured {
 		t.Errorf("worker arguments = %#v, want no credential-bearing arguments", container["args"])
@@ -140,7 +186,6 @@ func TestBetaChartRendersPersistentCodexWorkerWithSeparatedCredentials(t *testin
 
 func TestChartGeneratesThreeSeparateRequiredCredentialSecrets(t *testing.T) {
 	manifests, _ := renderChart(t,
-		"--set", "adapters.runner=mock",
 		"--set", "adapters.memory=mem0",
 		"--set", "adapters.workspace=git",
 		"--set", "publisher.adapter=github",
@@ -176,11 +221,10 @@ func TestChartSchemaRejectsUnsafeRuntimeSelections(t *testing.T) {
 	}{
 		{name: "multiple replicas", args: []string{"--set", "replicaCount=2", "--set", "secrets.hatchet.value=test"}},
 		{name: "zero artifact limit", args: []string{"--set", "limits.artifactBytes=0", "--set", "secrets.hatchet.value=test"}},
-		{name: "unknown runner", args: []string{"--set", "adapters.runner=unknown", "--set", "secrets.hatchet.value=test"}},
+		{name: "non-mock executor", args: []string{"--set", "codeChange.executor=docker", "--set", "secrets.hatchet.value=test"}},
 		{name: "missing Hatchet secret", args: nil},
 		{name: "missing Mem0 secret", args: []string{"--set", "adapters.memory=mem0", "--set", "secrets.hatchet.value=test"}},
 		{name: "missing GitHub secret", args: []string{"--set", "publisher.adapter=github", "--set", "secrets.hatchet.value=test"}},
-		{name: "missing Codex auth seed", args: []string{"--set", "adapters.runner=codex", "--set", "secrets.hatchet.value=test"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -199,7 +243,6 @@ func TestChartRejectsSharedActiveCredentialSecrets(t *testing.T) {
 		{
 			name: "Hatchet and Mem0",
 			args: []string{
-				"--set", "adapters.runner=mock",
 				"--set", "adapters.memory=mem0",
 				"--set", "secrets.hatchet.existingSecret=shared-credentials",
 				"--set", "secrets.mem0.existingSecret=shared-credentials",
@@ -208,7 +251,6 @@ func TestChartRejectsSharedActiveCredentialSecrets(t *testing.T) {
 		{
 			name: "Hatchet and GitHub",
 			args: []string{
-				"--set", "adapters.runner=mock",
 				"--set", "publisher.adapter=github",
 				"--set", "secrets.hatchet.existingSecret=shared-credentials",
 				"--set", "secrets.github.existingSecret=shared-credentials",
@@ -217,68 +259,11 @@ func TestChartRejectsSharedActiveCredentialSecrets(t *testing.T) {
 		{
 			name: "Mem0 and GitHub",
 			args: []string{
-				"--set", "adapters.runner=mock",
 				"--set", "adapters.memory=mem0",
 				"--set", "publisher.adapter=github",
 				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
 				"--set", "secrets.mem0.existingSecret=shared-credentials",
 				"--set", "secrets.github.existingSecret=shared-credentials",
-			},
-		},
-		{
-			name: "Codex and existing Hatchet",
-			args: []string{
-				"--set", "adapters.runner=codex",
-				"--set", "secrets.hatchet.existingSecret=shared-credentials",
-				"--set", "codexAuth.existingSecret=shared-credentials",
-			},
-		},
-		{
-			name: "Codex and generated Hatchet",
-			args: []string{
-				"--set", "adapters.runner=codex",
-				"--set", "secrets.hatchet.value=hatchet-value",
-				"--set", "codexAuth.existingSecret=paje-hatchet",
-			},
-		},
-		{
-			name: "Codex and existing Mem0",
-			args: []string{
-				"--set", "adapters.runner=codex",
-				"--set", "adapters.memory=mem0",
-				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
-				"--set", "secrets.mem0.existingSecret=shared-credentials",
-				"--set", "codexAuth.existingSecret=shared-credentials",
-			},
-		},
-		{
-			name: "Codex and generated Mem0",
-			args: []string{
-				"--set", "adapters.runner=codex",
-				"--set", "adapters.memory=mem0",
-				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
-				"--set", "secrets.mem0.value=mem0-value",
-				"--set", "codexAuth.existingSecret=paje-mem0",
-			},
-		},
-		{
-			name: "Codex and existing GitHub",
-			args: []string{
-				"--set", "adapters.runner=codex",
-				"--set", "publisher.adapter=github",
-				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
-				"--set", "secrets.github.existingSecret=shared-credentials",
-				"--set", "codexAuth.existingSecret=shared-credentials",
-			},
-		},
-		{
-			name: "Codex and generated GitHub",
-			args: []string{
-				"--set", "adapters.runner=codex",
-				"--set", "publisher.adapter=github",
-				"--set", "secrets.hatchet.existingSecret=hatchet-credentials",
-				"--set", "secrets.github.value=github-value",
-				"--set", "codexAuth.existingSecret=paje-github",
 			},
 		},
 	}
@@ -346,6 +331,17 @@ func oneManifestOfKind(t *testing.T, manifests []map[string]any, kind string) ma
 		t.Fatalf("rendered %s manifests = %d, want 1", kind, len(matching))
 	}
 	return matching[0]
+}
+
+func namedManifest(t *testing.T, manifests []map[string]any, name string) map[string]any {
+	t.Helper()
+	for _, manifest := range manifests {
+		if stringValue(mapValue(manifest, "metadata"), "name") == name {
+			return manifest
+		}
+	}
+	t.Fatalf("manifest named %q not found", name)
+	return nil
 }
 
 func mapValue(object map[string]any, key string) map[string]any {
