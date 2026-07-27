@@ -63,16 +63,18 @@ type outcomeEnvelope struct {
 }
 
 type transitionRecord struct {
-	binding        semanticBinding
-	request        requestEnvelope
-	requestPayload []byte
-	outcome        outcomeEnvelope
-	receipt        journal.CommitReceipt
+	binding         semanticBinding
+	request         requestEnvelope
+	requestPayload  []byte
+	outcome         outcomeEnvelope
+	receipt         journal.CommitReceipt
+	integrityDigest string
 }
 
 type projection struct {
 	installationID  string
 	global          journal.GlobalCursor
+	sourceDigest    string
 	runHeads        map[string]uint64
 	transitions     map[string]transitionRecord
 	idempotency     map[string]transitionRecord
@@ -85,9 +87,41 @@ type projection struct {
 	recoveries      map[string]RecoveryRecord
 }
 
+// projectionCache is derived only from verified Feed/Payload membership. Its
+// projection is immutable after installation; suffix rebuilds clone before
+// applying new events, so cache locking never spans journal I/O.
+type projectionCache struct {
+	cursor      journal.GlobalCursor
+	digest      string
+	stateDigest string
+	projection  *projection
+}
+
+type projectionCacheProjectedState struct {
+	RunHeads               map[string]uint64             `json:"run_heads"`
+	TransitionIndexDigest  string                        `json:"transition_index_digest"`
+	IdempotencyIndexDigest string                        `json:"idempotency_index_digest"`
+	Admissions             map[string]RunAdmission       `json:"admissions"`
+	AdmissionTombs         map[string]AdmissionTombstone `json:"admission_tombstones"`
+	Leases                 map[string]Lease              `json:"leases"`
+	LeaseTombs             map[string]LeaseTombstone     `json:"lease_tombstones"`
+	Handoffs               map[string]EvidenceHandoff    `json:"handoffs"`
+	HandoffReceipts        map[string]string             `json:"handoff_receipts"`
+	Recoveries             map[string]RecoveryRecord     `json:"recoveries"`
+}
+
+type transitionRecordIntegrity struct {
+	Binding        semanticBinding       `json:"binding"`
+	Request        requestEnvelope       `json:"request"`
+	RequestPayload []byte                `json:"request_payload"`
+	Outcome        outcomeEnvelope       `json:"outcome"`
+	Receipt        journal.CommitReceipt `json:"receipt"`
+}
+
 func newProjection() *projection {
 	return &projection{
-		runHeads: make(map[string]uint64), transitions: make(map[string]transitionRecord),
+		sourceDigest: digestBytes(nil),
+		runHeads:     make(map[string]uint64), transitions: make(map[string]transitionRecord),
 		idempotency: make(map[string]transitionRecord), admissions: make(map[string]RunAdmission),
 		admissionTombs: make(map[string]AdmissionTombstone), leases: make(map[string]Lease),
 		leaseTombs: make(map[string]LeaseTombstone), handoffs: make(map[string]EvidenceHandoff),
@@ -96,10 +130,30 @@ func newProjection() *projection {
 }
 
 func (s *Service) rebuild(ctx context.Context) (*projection, error) {
-	p := newProjection()
-	cursor := journal.GlobalCursor{}
+	p, cursor, cached := s.loadProjectionCache()
+	rebuilt, err := s.rebuildFrom(ctx, p, cursor)
+	if err != nil && cached != nil && cacheFallbackError(err) {
+		s.discardProjectionCache(cached)
+		cached = nil
+		rebuilt, err = s.rebuildFrom(ctx, newProjection(), journal.GlobalCursor{})
+	}
+	if err != nil {
+		return nil, err
+	}
+	if cached == nil || rebuilt.global != cached.cursor {
+		s.installProjectionCache(rebuilt)
+	}
+	return rebuilt, nil
+}
+
+func (s *Service) rebuildFrom(
+	ctx context.Context,
+	p *projection,
+	cursor journal.GlobalCursor,
+) (*projection, error) {
+	mutable := cursor == (journal.GlobalCursor{})
 	reservations := make(map[string]journal.Event)
-	var wantPosition journal.JournalPosition = 1
+	wantPosition := cursor.JournalPosition + 1
 	for {
 		events, next, err := s.store.Feed(ctx, cursor, 1000)
 		if err != nil {
@@ -112,12 +166,21 @@ func (s *Service) rebuild(ctx context.Context) (*projection, error) {
 		if next.InstallationID != p.installationID || next.SchemaVersion != journal.SchemaVersion {
 			return nil, typedError(CodeInvalidRecord, "", ErrInvalidRecord)
 		}
+		if len(events) > 0 && !mutable {
+			p = cloneProjection(p)
+			mutable = true
+		}
 		for _, event := range events {
 			if event.JournalPosition != wantPosition || event.RunSequence != p.runHeads[event.ControlRunID]+1 {
 				return nil, typedError(CodeInvalidRecord, "", ErrInvalidRecord)
 			}
 			wantPosition++
 			p.runHeads[event.ControlRunID] = event.RunSequence
+			eventDigest, err := journal.Digest(event)
+			if err != nil {
+				return nil, typedError(CodeInvalidRecord, "", ErrInvalidRecord)
+			}
+			p.sourceDigest = digestBytes([]byte(p.sourceDigest + "\x00" + eventDigest))
 			if event.Kind == journal.EventActionReserved {
 				if _, exists := reservations[event.ActionID]; exists {
 					return nil, typedError(CodeInvalidRecord, "", ErrInvalidRecord)
@@ -170,12 +233,17 @@ func (s *Service) rebuild(ctx context.Context) (*projection, error) {
 					Action: action, Reservation: reservation, Outcome: event, Created: true,
 				},
 			}
+			if err := sealTransitionRecord(&record); err != nil {
+				return nil, err
+			}
 			semanticKey := semanticIndex(request.Binding.ControlRunID, request.Binding.ActionID, request.Binding.Generation)
 			idempotencyKey := idempotencyIndex(request.Binding.ControlRunID, request.Binding.IdempotencyKey)
-			if prior, exists := p.transitions[semanticKey]; exists && !sameTransition(prior, record) {
+			if prior, exists := p.transitions[semanticKey]; exists &&
+				(!validTransitionRecord(prior) || !sameTransition(prior, record)) {
 				return nil, typedError(CodeInvalidRecord, request.SemanticOperation, ErrInvalidRecord)
 			}
-			if prior, exists := p.idempotency[idempotencyKey]; exists && !sameTransition(prior, record) {
+			if prior, exists := p.idempotency[idempotencyKey]; exists &&
+				(!validTransitionRecord(prior) || !sameTransition(prior, record)) {
 				return nil, typedError(CodeInvalidRecord, request.SemanticOperation, ErrInvalidRecord)
 			}
 			p.transitions[semanticKey] = record
@@ -186,7 +254,9 @@ func (s *Service) rebuild(ctx context.Context) (*projection, error) {
 			delete(reservations, event.ActionID)
 		}
 		cursor = next
-		p.global = next
+		if mutable {
+			p.global = next
+		}
 		if len(events) == 0 {
 			break
 		}
@@ -200,6 +270,243 @@ func (s *Service) rebuild(ctx context.Context) (*projection, error) {
 		}
 	}
 	return p, nil
+}
+
+func (s *Service) loadProjectionCache() (*projection, journal.GlobalCursor, *projectionCache) {
+	s.cacheMu.Lock()
+	cached := s.cache
+	s.cacheMu.Unlock()
+	if cached == nil {
+		return newProjection(), journal.GlobalCursor{}, nil
+	}
+	if !validProjectionCache(cached) {
+		s.discardProjectionCache(cached)
+		return newProjection(), journal.GlobalCursor{}, nil
+	}
+	return cached.projection, cached.cursor, cached
+}
+
+func (s *Service) installProjectionCache(p *projection) {
+	candidate, err := newProjectionCache(p)
+	if err != nil {
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cache != nil {
+		if s.cache.cursor.InstallationID != candidate.cursor.InstallationID ||
+			s.cache.cursor.SchemaVersion != candidate.cursor.SchemaVersion {
+			s.cache = candidate
+			return
+		}
+		if s.cache.cursor.JournalPosition > candidate.cursor.JournalPosition {
+			return
+		}
+		if s.cache.cursor.JournalPosition == candidate.cursor.JournalPosition {
+			if s.cache.digest == candidate.digest {
+				return
+			}
+			s.cache = nil
+			return
+		}
+	}
+	s.cache = candidate
+}
+
+func (s *Service) discardProjectionCache(cached *projectionCache) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cache == cached {
+		s.cache = nil
+	}
+}
+
+func (s *Service) discardCachedProjection(p *projection) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cache != nil && s.cache.projection == p {
+		s.cache = nil
+	}
+}
+
+func newProjectionCache(p *projection) (*projectionCache, error) {
+	stateDigest, digest, err := projectionCacheDigests(p)
+	if err != nil {
+		return nil, err
+	}
+	return &projectionCache{
+		cursor: p.global, digest: digest, stateDigest: stateDigest, projection: p,
+	}, nil
+}
+
+func validProjectionCache(cached *projectionCache) bool {
+	if cached == nil || cached.projection == nil || !journal.ValidDigest(cached.digest) {
+		return false
+	}
+	p := cached.projection
+	if !boundedRequired(p.installationID, 128) || cached.cursor != p.global ||
+		cached.cursor.InstallationID != p.installationID ||
+		cached.cursor.SchemaVersion != journal.SchemaVersion || !journal.ValidDigest(p.sourceDigest) ||
+		p.runHeads == nil || p.transitions == nil || p.idempotency == nil ||
+		p.admissions == nil || p.admissionTombs == nil || p.leases == nil ||
+		p.leaseTombs == nil || p.handoffs == nil || p.handoffReceipts == nil || p.recoveries == nil {
+		return false
+	}
+	var eventCount uint64
+	for _, runHead := range p.runHeads {
+		if runHead > uint64(cached.cursor.JournalPosition)-eventCount {
+			return false
+		}
+		eventCount += runHead
+	}
+	if eventCount != uint64(cached.cursor.JournalPosition) {
+		return false
+	}
+	stateDigest, digest, err := projectionCacheDigests(p)
+	return err == nil && stateDigest == cached.stateDigest && digest == cached.digest
+}
+
+func projectionCacheDigest(p *projection) (string, error) {
+	_, digest, err := projectionCacheDigests(p)
+	return digest, err
+}
+
+func projectionCacheDigests(p *projection) (string, string, error) {
+	transitionsDigest, err := transitionIndexDigest(p.transitions)
+	if err != nil {
+		return "", "", err
+	}
+	idempotencyIndexDigest, err := transitionIndexDigest(p.idempotency)
+	if err != nil {
+		return "", "", err
+	}
+	statePayload, err := json.Marshal(projectionCacheProjectedState{
+		RunHeads: p.runHeads, TransitionIndexDigest: transitionsDigest,
+		IdempotencyIndexDigest: idempotencyIndexDigest,
+		Admissions:             p.admissions, AdmissionTombs: p.admissionTombs,
+		Leases: p.leases, LeaseTombs: p.leaseTombs, Handoffs: p.handoffs,
+		HandoffReceipts: p.handoffReceipts, Recoveries: p.recoveries,
+	})
+	if err != nil {
+		return "", "", typedError(CodeInvalidRecord, "", ErrInvalidRecord)
+	}
+	stateDigest := digestBytes(statePayload)
+	digest, err := digestValueOnly(struct {
+		InstallationID  string               `json:"installation_id"`
+		Cursor          journal.GlobalCursor `json:"cursor"`
+		SourceDigest    string               `json:"source_digest"`
+		StateDigest     string               `json:"state_digest"`
+		RunCount        int                  `json:"run_count"`
+		TransitionCount int                  `json:"transition_count"`
+		Idempotency     int                  `json:"idempotency_count"`
+		Admissions      int                  `json:"admission_count"`
+		AdmissionTombs  int                  `json:"admission_tombstone_count"`
+		Leases          int                  `json:"lease_count"`
+		LeaseTombs      int                  `json:"lease_tombstone_count"`
+		Handoffs        int                  `json:"handoff_count"`
+		HandoffReceipts int                  `json:"handoff_receipt_count"`
+		Recoveries      int                  `json:"recovery_count"`
+	}{
+		InstallationID: p.installationID, Cursor: p.global, SourceDigest: p.sourceDigest,
+		StateDigest: stateDigest,
+		RunCount:    len(p.runHeads), TransitionCount: len(p.transitions), Idempotency: len(p.idempotency),
+		Admissions: len(p.admissions), AdmissionTombs: len(p.admissionTombs), Leases: len(p.leases),
+		LeaseTombs: len(p.leaseTombs), Handoffs: len(p.handoffs), HandoffReceipts: len(p.handoffReceipts),
+		Recoveries: len(p.recoveries),
+	})
+	return stateDigest, digest, err
+}
+
+func sealTransitionRecord(record *transitionRecord) error {
+	digest, err := transitionIntegrityDigest(*record)
+	if err != nil {
+		return err
+	}
+	record.integrityDigest = digest
+	return nil
+}
+
+func validTransitionRecord(record transitionRecord) bool {
+	if !journal.ValidDigest(record.integrityDigest) {
+		return false
+	}
+	digest, err := transitionIntegrityDigest(record)
+	return err == nil && digest == record.integrityDigest
+}
+
+func transitionIntegrityDigest(record transitionRecord) (string, error) {
+	payload, err := json.Marshal(transitionRecordIntegrity{
+		Binding: record.binding, Request: record.request, RequestPayload: record.requestPayload,
+		Outcome: record.outcome, Receipt: record.receipt,
+	})
+	if err != nil {
+		return "", typedError(CodeInvalidRecord, "", ErrInvalidRecord)
+	}
+	return digestBytes(payload), nil
+}
+
+func transitionIndexDigest(values map[string]transitionRecord) (string, error) {
+	// XOR makes the index seal independent of Go map iteration order. Entry
+	// digests bind both the key and immutable record seal; counts are bound by
+	// the enclosing cache digest.
+	var combined [sha256.Size]byte
+	for key, record := range values {
+		if !journal.ValidDigest(record.integrityDigest) {
+			return "", typedError(CodeInvalidRecord, "", ErrInvalidRecord)
+		}
+		entry := sha256.Sum256([]byte(key + "\x00" + record.integrityDigest))
+		for index := range combined {
+			combined[index] ^= entry[index]
+		}
+	}
+	return "sha256:" + hex.EncodeToString(combined[:]), nil
+}
+
+func digestValueOnly(value any) (string, error) {
+	digest, _, err := digestValue(value)
+	return digest, err
+}
+
+func cacheFallbackError(err error) bool {
+	return errors.Is(err, ErrInvalidRecord) || errors.Is(err, ErrNotFound)
+}
+
+func cloneProjection(source *projection) *projection {
+	cloned := newProjection()
+	cloned.installationID = source.installationID
+	cloned.global = source.global
+	cloned.sourceDigest = source.sourceDigest
+	for key, value := range source.runHeads {
+		cloned.runHeads[key] = value
+	}
+	for key, value := range source.transitions {
+		cloned.transitions[key] = value
+	}
+	for key, value := range source.idempotency {
+		cloned.idempotency[key] = value
+	}
+	for key, value := range source.admissions {
+		cloned.admissions[key] = value
+	}
+	for key, value := range source.admissionTombs {
+		cloned.admissionTombs[key] = value
+	}
+	for key, value := range source.leases {
+		cloned.leases[key] = value
+	}
+	for key, value := range source.leaseTombs {
+		cloned.leaseTombs[key] = value
+	}
+	for key, value := range source.handoffs {
+		cloned.handoffs[key] = value
+	}
+	for key, value := range source.handoffReceipts {
+		cloned.handoffReceipts[key] = value
+	}
+	for key, value := range source.recoveries {
+		cloned.recoveries[key] = value
+	}
+	return cloned
 }
 
 func admissionComponent(payload []byte) (bool, error) {

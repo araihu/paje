@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/araihu/paje/internal/controlplane/journal"
@@ -22,6 +23,8 @@ type Service struct {
 	clock            func() time.Time
 	observer         Observer
 	scannerAuthority string
+	cacheMu          sync.Mutex
+	cache            *projectionCache
 }
 
 func New(dependencies Dependencies) (*Service, error) {
@@ -93,6 +96,10 @@ func (s *Service) commitTransition(
 			return transitionRecord{}, false, err
 		}
 		if existing, ok := p.transitions[semanticIndex(controlRunID, identity.ActionID, identity.Generation)]; ok {
+			if !validTransitionRecord(existing) {
+				s.discardCachedProjection(p)
+				continue
+			}
 			if !bytes.Equal(existing.requestPayload, requestPayload) || existing.binding != binding {
 				return transitionRecord{}, false, typedError(CodeConflict, operation, ErrConflict)
 			}
@@ -100,6 +107,10 @@ func (s *Service) commitTransition(
 			return existing, false, nil
 		}
 		if existing, ok := p.idempotency[idempotencyIndex(controlRunID, identity.IdempotencyKey)]; ok {
+			if !validTransitionRecord(existing) {
+				s.discardCachedProjection(p)
+				continue
+			}
 			if !bytes.Equal(existing.requestPayload, requestPayload) || existing.binding != binding {
 				return transitionRecord{}, false, typedError(CodeConflict, operation, ErrConflict)
 			}
@@ -156,6 +167,9 @@ func (s *Service) commitTransition(
 				binding: binding, request: request, requestPayload: requestPayload,
 				outcome: outcome, receipt: receipt,
 			}
+			if err := sealTransitionRecord(&record); err != nil {
+				return transitionRecord{}, false, err
+			}
 			return record, receipt.Created, nil
 		}
 		// A dependency may lose the response after the commit became visible.
@@ -163,6 +177,10 @@ func (s *Service) commitTransition(
 		recovered, rebuildErr := s.rebuild(ctx)
 		if rebuildErr == nil {
 			if existing, ok := recovered.transitions[semanticIndex(controlRunID, identity.ActionID, identity.Generation)]; ok {
+				if !validTransitionRecord(existing) {
+					s.discardCachedProjection(recovered)
+					continue
+				}
 				if !bytes.Equal(existing.requestPayload, requestPayload) || existing.binding != binding {
 					return transitionRecord{}, false, typedError(CodeConflict, operation, ErrConflict)
 				}
