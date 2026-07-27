@@ -57,6 +57,9 @@ func (target *Executor) waitForChildStart(
 func (target *Executor) readChildStartReceipt(ctx context.Context, containerID string) (executor.ChildStartReceipt, error) {
 	encoded, copyErr := target.engine.CopyFile(ctx, containerID, sandboxinit.ChildStartReceiptPath, maxChildReceiptBytes)
 	if copyErr != nil && len(encoded) == 0 {
+		if errors.Is(copyErr, errPrivateReceiptOutcomeUncertain) {
+			return executor.ChildStartReceipt{}, errChildStartReceiptNotObservable
+		}
 		return executor.ChildStartReceipt{}, copyErr
 	}
 	defer clear(encoded)

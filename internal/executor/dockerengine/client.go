@@ -360,6 +360,12 @@ func readPrivateReceiptExecOutput(
 		}
 		return nil, errors.New("Docker private receipt reader failed")
 	}
+	if inspected.ExitCode >= 128 && inspected.ExitCode <= 255 {
+		if stderrTruncated || len(stderr) != 0 || stdoutTruncated {
+			return nil, errors.New("Docker private receipt reader failed")
+		}
+		return candidate, errPrivateReceiptOutcomeUncertain
+	}
 	if stderrTruncated || len(stderr) != 0 || stdoutTruncated {
 		return nil, errors.New("Docker private receipt reader failed")
 	}

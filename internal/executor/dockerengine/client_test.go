@@ -32,6 +32,35 @@ func TestReadPrivateReceiptExecOutputMapsMissingReceiptToNotFoundAfterBoundedStd
 	}
 }
 
+func TestReadPrivateReceiptExecOutputClassifiesSignalTerminationAsUncertainty(t *testing.T) {
+	terminal := func(exitCode int) func() (mobyclient.ExecInspectResult, error) {
+		return func() (mobyclient.ExecInspectResult, error) {
+			return mobyclient.ExecInspectResult{ExitCode: exitCode}, nil
+		}
+	}
+
+	for _, exitCode := range []int{128, 137, 255} {
+		t.Run(fmt.Sprintf("signal class %d", exitCode), func(t *testing.T) {
+			got, err := readPrivateReceiptExecOutput(bytes.NewReader(nil), 1024, terminal(exitCode))
+			if len(got) != 0 || !errors.Is(err, errPrivateReceiptOutcomeUncertain) {
+				t.Fatalf("readPrivateReceiptExecOutput() = %q, %v", got, err)
+			}
+		})
+	}
+
+	for _, exitCode := range []int{2, 127} {
+		t.Run(fmt.Sprintf("logical exit %d", exitCode), func(t *testing.T) {
+			got, err := readPrivateReceiptExecOutput(bytes.NewReader(nil), 1024, terminal(exitCode))
+			if len(got) != 0 || err == nil {
+				t.Fatalf("readPrivateReceiptExecOutput() = %q, %v", got, err)
+			}
+			if errors.Is(err, errPrivateReceiptOutcomeUncertain) || errors.Is(err, errdefs.ErrNotFound) {
+				t.Fatalf("logical exit became retryable: %v", err)
+			}
+		})
+	}
+}
+
 func TestReadPrivateReceiptExecOutputPreservesCandidateAcrossTerminalRaces(t *testing.T) {
 	receipt := []byte(`{"receipt":"exact-candidate"}`)
 	stream := multiplexedOutput(receipt, nil)

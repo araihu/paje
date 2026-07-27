@@ -59,6 +59,32 @@ func TestExecuteRetriesUncertainReceiptPrefixThenAcceptsExactCanonical(t *testin
 	}
 }
 
+func TestExecuteRetriesSignalTerminatedReceiptReaderThenAcceptsExactCanonical(t *testing.T) {
+	api := newFakeEngine()
+	api.blockWait = true
+	api.receiptReads = []fakeReceiptRead{
+		{
+			transform: func([]byte) []byte { return nil },
+			err:       errPrivateReceiptOutcomeUncertain,
+		},
+		{afterState: engineContainerExited},
+	}
+	target := newExecutorForTest(t, api)
+	request := dockerRequest(t, "none", nil)
+	defer request.Destroy()
+
+	result, err := target.Execute(context.Background(), request)
+	if err != nil || !result.Started || !result.Completed || result.ChildStartReceipt == nil {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	api.mu.Lock()
+	reads := api.receiptReadCount
+	api.mu.Unlock()
+	if reads != 2 {
+		t.Fatalf("receipt reads = %d, want 2", reads)
+	}
+}
+
 func TestExecuteUncertainReceiptPrefixFailsClosedWhenContainerTerminates(t *testing.T) {
 	api := newFakeEngine()
 	api.receiptReads = []fakeReceiptRead{{
