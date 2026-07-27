@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -53,6 +55,25 @@ function assertLink(html, rel, attribute, value, href) {
   );
   assert.match(html, tag);
 }
+
+test("publishes the exact canonical Pajé v3 identity", async () => {
+  const assets = {
+    "paje-logo.svg": "74136ff1442d73bbea62cf20af9c63e6a3cd7c0e0f9f2656bde6e7723513f803",
+    "paje-mark.svg": "8c2402780d11874e3b7fa0ae31a55c9e0ceb5ac8765c2b6a36c8dfa24dc88451",
+    "paje-favicon.svg": "41fa3913afcf10d0abced60f7ff84f6f07c5ac765e7b5edc37fbdca4de0f4d57",
+    "paje-mark-reverse.svg": "fc15cfcf4eee5678ece76411e0002e04afa508121aa6ed9aea94528569838ad6",
+  };
+
+  for (const [name, expected] of Object.entries(assets)) {
+    const contents = await readFile(new URL(`../public/${name}`, import.meta.url)).catch(() => Buffer.alloc(0));
+    assert.equal(createHash("sha256").update(contents).digest("hex"), expected, name);
+  }
+
+  const { html } = await render("en");
+  assert.equal((html.match(/src="\/paje-mark\.svg"/g) ?? []).length, 3);
+  assert.match(html, /<link[^>]*rel="icon"[^>]*href="(?:https:\/\/paje\.araihu\.com)?\/paje-favicon\.svg"/i);
+  assert.doesNotMatch(html, /src="\/paje-logo\.svg"|>P\/<\/span>/i);
+});
 
 test("negotiates the root locale with q-values, wildcards, and policy fallbacks", async (t) => {
   const cases = [

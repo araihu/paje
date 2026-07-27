@@ -50,16 +50,9 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 .brand-mark {
   width: 34px;
   height: 34px;
-  display: grid;
-  place-items: center;
-  background: var(--blue);
-  color: white;
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: -0.08em;
-  border-radius: 3px;
-  box-shadow: 4px 4px 0 var(--signal);
+  display: block;
+  object-fit: contain;
+  flex: 0 0 auto;
 }
 
 .desktop-nav { display: flex; align-items: center; gap: 32px; color: #494e53; font-size: 14px; }
@@ -334,7 +327,7 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 .boundary-top { display: flex; justify-content: space-between; color: #d7dfff; font-family: var(--font-geist-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: .1em; padding: 5px 4px 17px; }
 .boundary-agent { background: white; color: var(--ink); padding: 25px; }
 .boundary-agent > div { display: flex; align-items: center; gap: 13px; padding-bottom: 21px; border-bottom: 1px solid #dedbd4; }
-.mini-mark { display: grid; place-items: center; width: 32px; height: 32px; background: var(--blue); color: white; font-family: var(--font-geist-mono), monospace; font-size: 10px; }
+.mini-mark { display: block; width: 32px; height: 32px; object-fit: contain; flex: 0 0 auto; }
 .boundary-agent ul { list-style: none; padding: 8px 0 0; margin: 0; }
 .boundary-agent li { display: flex; align-items: center; gap: 11px; padding: 11px 0; border-bottom: 1px solid #eeebe4; font-family: var(--font-geist-mono), monospace; font-size: 11px; }
 .boundary-agent li span { color: var(--green); }
@@ -366,7 +359,6 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 .closing-actions { display: flex; align-items: center; gap: 34px; margin-top: 48px; position: relative; z-index: 1; }
 
 footer { width: min(1440px, calc(100% - 64px)); margin: 0 auto; min-height: 132px; display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center; gap: 20px; }
-.footer-brand .brand-mark { box-shadow: 3px 3px 0 var(--signal); }
 footer > p { text-align: center; color: #73787c; font-size: 11px; }
 footer > div { display: flex; justify-content: flex-end; align-items: center; gap: 22px; color: #73787c; font-family: var(--font-geist-mono), monospace; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
 footer > div a { color: var(--ink); display: inline-flex; gap: 7px; }

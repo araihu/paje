@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Pajé mark</title>
+  <desc id="desc">A durable rectilinear workflow loop with five checkpoints.</desc>
+  <path d="M12 64h24V28h60v72H52V64h64" fill="none" stroke="#07111f" stroke-width="12" stroke-linecap="square" stroke-linejoin="miter" />
+  <g fill="#31588f">
+    <circle cx="20" cy="64" r="8" />
+    <circle cx="36" cy="28" r="8" />
+    <circle cx="96" cy="28" r="8" />
+    <circle cx="116" cy="64" r="8" />
+  </g>
+  <circle cx="96" cy="100" r="9" fill="#c7ff4a" />
+</svg>

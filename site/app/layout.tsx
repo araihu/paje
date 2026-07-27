@@ -43,6 +43,7 @@ export async function generateMetadata(): Promise<Metadata> {
     title: copy.metadata.title,
     description: copy.metadata.description,
     applicationName: "Pajé",
+    icons: { icon: "/paje-favicon.svg" },
     alternates: {
       canonical,
       languages: {

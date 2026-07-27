@@ -67,6 +67,12 @@ function Arrow() {
   return <span aria-hidden="true">↗</span>;
 }
 
+function PajeMark({ className }: { className: string }) {
+  // The canonical SVG is already compact and must remain byte-identical to araihu/assets.
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img className={className} src="/paje-mark.svg" alt="" aria-hidden="true" />;
+}
+
 function BetaCopy({ text }: { text: string }) {
   const [before, after] = text.split("code-change@v1");
 
@@ -86,7 +92,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
     <div className="site-shell">
       <header className="topbar">
         <a className="brand" href="#inicio" aria-label={copy.navigation.brandLabel}>
-          <span className="brand-mark" aria-hidden="true">P/</span>
+          <PajeMark className="brand-mark" />
           <span>Pajé</span>
         </a>
         <nav className="desktop-nav" aria-label={copy.navigation.primaryLabel}>
@@ -321,7 +327,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
               <code>{copy.security.credentials}</code>
             </div>
             <div className="boundary-agent">
-              <div><span className="mini-mark">P/</span><strong>{copy.security.runtime}</strong></div>
+              <div><PajeMark className="mini-mark" /><strong>{copy.security.runtime}</strong></div>
               <ul>
                 <li><span>✓</span> {copy.security.selectedMemory}</li>
                 <li><span>✓</span> {copy.security.isolatedWorktree}</li>
@@ -390,7 +396,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
 
       <footer>
         <a className="brand footer-brand" href="#inicio" aria-label={copy.footer.brandLabel}>
-          <span className="brand-mark" aria-hidden="true">P/</span><span>Pajé</span>
+          <PajeMark className="brand-mark" /><span>Pajé</span>
         </a>
         <p>{copy.footer.text}</p>
         <div><span>Open source · MIT</span><a href={githubUrl} target="_blank" rel="noreferrer">GitHub <Arrow /></a></div>
