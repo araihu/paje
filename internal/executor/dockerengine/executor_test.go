@@ -368,6 +368,8 @@ type fakeEngine struct {
 	receipt                    []byte
 	receiptErr                 error
 	receiptTransform           func([]byte) []byte
+	receiptReads               []fakeReceiptRead
+	receiptReadCount           int
 	releaseReceiptPublication  chan struct{}
 	childStartAckErr           error
 	childStartAcknowledgements int
@@ -407,6 +409,12 @@ type fakeEngine struct {
 	killCalls            int
 	removeContainerCalls int
 	removeNetworkCalls   int
+}
+
+type fakeReceiptRead struct {
+	transform  func([]byte) []byte
+	err        error
+	afterState engineContainerState
 }
 
 func newFakeEngine() *fakeEngine {
@@ -647,6 +655,21 @@ func (api *fakeEngine) CopyFile(_ context.Context, _ string, sourcePath string, 
 		return nil, errdefs.ErrNotFound
 	}
 	receipt := slices.Clone(api.receipt)
+	api.receiptReadCount++
+	if len(api.receiptReads) != 0 {
+		read := api.receiptReads[0]
+		api.receiptReads = api.receiptReads[1:]
+		if read.transform != nil {
+			receipt = read.transform(receipt)
+		}
+		if read.afterState != "" {
+			api.containerState = read.afterState
+			if containerTerminated(read.afterState) {
+				api.exitOnce.Do(func() { close(api.exited) })
+			}
+		}
+		return receipt, read.err
+	}
 	if api.receiptTransform != nil {
 		receipt = api.receiptTransform(receipt)
 	}

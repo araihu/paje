@@ -28,6 +28,8 @@ const (
 	maxRegistryAuth     = 1 << 20
 )
 
+var errPrivateReceiptOutcomeUncertain = errors.New("Docker private receipt reader outcome is uncertain")
+
 type Config struct {
 	Endpoint     string
 	RegistryAuth string
@@ -345,7 +347,7 @@ func readPrivateReceiptExecOutput(
 			return nil, errors.New("Docker private receipt reader outcome is uncertain")
 		}
 		return candidate, errors.Join(
-			errors.New("Docker private receipt reader outcome is uncertain"),
+			errPrivateReceiptOutcomeUncertain,
 			inspectErr,
 		)
 	}
@@ -369,6 +371,7 @@ func readPrivateReceiptExecOutput(
 	}
 	if streamErr != nil {
 		return candidate, errors.Join(
+			errPrivateReceiptOutcomeUncertain,
 			errors.New("Docker private receipt stream ended after output"),
 			streamErr,
 		)

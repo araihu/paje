@@ -31,6 +31,119 @@ func TestExecuteAcceptsExactReceiptAfterTerminalReaderUncertainty(t *testing.T) 
 	}
 }
 
+func TestExecuteRetriesUncertainReceiptPrefixThenAcceptsExactCanonical(t *testing.T) {
+	api := newFakeEngine()
+	api.blockWait = true
+	api.receiptReads = []fakeReceiptRead{
+		{
+			transform: func(encoded []byte) []byte {
+				return append([]byte(nil), encoded[:len(encoded)/2]...)
+			},
+			err: errors.Join(errPrivateReceiptOutcomeUncertain, net.ErrClosed),
+		},
+		{err: errors.Join(errPrivateReceiptOutcomeUncertain, net.ErrClosed), afterState: engineContainerExited},
+	}
+	target := newExecutorForTest(t, api)
+	request := dockerRequest(t, "none", nil)
+	defer request.Destroy()
+
+	result, err := target.Execute(context.Background(), request)
+	if err != nil || !result.Started || !result.Completed || result.ChildStartReceipt == nil {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	api.mu.Lock()
+	reads := api.receiptReadCount
+	api.mu.Unlock()
+	if reads != 2 {
+		t.Fatalf("receipt reads = %d, want 2", reads)
+	}
+}
+
+func TestExecuteUncertainReceiptPrefixFailsClosedWhenContainerTerminates(t *testing.T) {
+	api := newFakeEngine()
+	api.receiptReads = []fakeReceiptRead{{
+		transform: func(encoded []byte) []byte {
+			return append([]byte(nil), encoded[:len(encoded)/2]...)
+		},
+		err: errors.Join(errPrivateReceiptOutcomeUncertain, net.ErrClosed),
+	}}
+	target := newExecutorForTest(t, api)
+	request := dockerRequest(t, "none", nil)
+	defer request.Destroy()
+
+	result, err := target.Execute(context.Background(), request)
+	if result.Started || result.ChildStartReceipt != nil || providerCause(err) != "ambiguous_attempt" {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	if _, retryErr := target.Execute(context.Background(), request); !errors.Is(retryErr, executor.ErrAttemptExists) {
+		t.Fatalf("terminal uncertain prefix was rerunnable: %v", retryErr)
+	}
+}
+
+func TestExecuteDoesNotRetryCleanMalformedOrValidReboundReceipt(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		transform func([]byte) []byte
+		err       error
+	}{
+		{
+			name: "clean malformed",
+			transform: func([]byte) []byte {
+				return []byte(`{"incomplete":`)
+			},
+		},
+		{
+			name: "malformed with arbitrary provider error",
+			transform: func([]byte) []byte {
+				return []byte(`{"incomplete":`)
+			},
+			err: errors.New("provider receipt read failed"),
+		},
+		{
+			name: "valid rebound with uncertainty",
+			transform: func(encoded []byte) []byte {
+				var receipt executor.ChildStartReceipt
+				if err := json.Unmarshal(encoded, &receipt); err != nil {
+					t.Fatal(err)
+				}
+				receipt.Attempt.Sequence++
+				rebound, err := json.Marshal(receipt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return rebound
+			},
+			err: net.ErrClosed,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := newFakeEngine()
+			api.blockWait = true
+			api.receiptReads = []fakeReceiptRead{
+				{transform: test.transform, err: test.err},
+				{afterState: engineContainerExited},
+			}
+			target := newExecutorForTest(t, api)
+			request := dockerRequest(t, "none", nil)
+			defer request.Destroy()
+
+			result, err := target.Execute(context.Background(), request)
+			if result.Started || result.ChildStartReceipt != nil || providerCause(err) != "ambiguous_attempt" {
+				t.Fatalf("Execute() = %#v, %v", result, err)
+			}
+			api.mu.Lock()
+			reads := api.receiptReadCount
+			api.mu.Unlock()
+			if reads != 1 {
+				t.Fatalf("receipt reads = %d, want 1", reads)
+			}
+			if err := target.Destroy(context.Background(), request.Attempt); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestExecuteRejectsUnprovenReceiptAfterTerminalReaderUncertainty(t *testing.T) {
 	for _, encoded := range [][]byte{
 		{},
