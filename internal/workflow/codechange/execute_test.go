@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -140,6 +141,82 @@ func TestExecuteUsesDistinctSecretFreeAndAgentSandboxes(t *testing.T) {
 	}
 	if got := fixture.secrets.Revocations(); !reflect.DeepEqual(got, []string{"fixture-codex-lease"}) {
 		t.Fatalf("secret revocations = %#v", got)
+	}
+}
+
+func TestExecuteCodexSandboxAuthorityMatchesPersistedRuntime(t *testing.T) {
+	tests := []struct {
+		name        string
+		runtimeKind string
+		wantArgs    []string
+		forbidden   string
+	}{
+		{
+			name:        "outer OCI executor",
+			runtimeKind: workerprofile.RuntimeOCI,
+			wantArgs: []string{
+				"exec", "--json", "--ephemeral", "--ignore-user-config",
+				"--dangerously-bypass-approvals-and-sandbox",
+			},
+			forbidden: "--sandbox",
+		},
+		{
+			name:        "host development executor",
+			runtimeKind: workerprofile.RuntimeHost,
+			wantArgs: []string{
+				"exec", "--json", "--ephemeral", "--ignore-user-config",
+				"--sandbox", "workspace-write",
+			},
+			forbidden: "--dangerously-bypass-approvals-and-sandbox",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := resolvedCodexAuthorityFixture(t, test.runtimeKind)
+			result, err := fixture.service.Execute(context.Background(), "run-123")
+			if err != nil || result.Artifact == nil {
+				t.Fatalf("Execute() result=%#v error=%v", result, err)
+			}
+			var agentRequest executor.Request
+			for _, request := range fixture.executor.Requests() {
+				if request.Attempt.Purpose == executor.PurposeAgent {
+					agentRequest = request.Clone()
+					break
+				}
+			}
+			defer agentRequest.Destroy()
+			got := agentRequest.Command.Args
+			if len(got) != len(test.wantArgs)+1 || !slices.Equal(got[:len(test.wantArgs)], test.wantArgs) {
+				t.Fatalf("agent args = %#v, want prefix %#v plus prompt", got, test.wantArgs)
+			}
+			if slices.Contains(got, test.forbidden) {
+				t.Fatalf("agent args contain forbidden %q: %#v", test.forbidden, got)
+			}
+			record, loadErr := fixture.runs.Load(context.Background(), "run-123")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if record.WorkerProfile == nil || !reflect.DeepEqual(agentRequest.Profile, *record.WorkerProfile) ||
+				agentRequest.Profile.Runtime.Kind != test.runtimeKind {
+				t.Fatalf("agent request profile=%#v persisted=%#v", agentRequest.Profile, record.WorkerProfile)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsReboundHarnessAuthorityBeforeSecretsOrProvider(t *testing.T) {
+	fixture := resolvedServiceFixture(t)
+	fixture.harness.id = "rebound"
+
+	result, err := fixture.service.Execute(context.Background(), "run-123")
+	if err == nil || result.FailureClass != run.FailureEnvironment || result.Retryable {
+		t.Fatalf("Execute() result=%#v error=%v", result, err)
+	}
+	if got := len(fixture.secrets.Requests()); got != 0 {
+		t.Fatalf("secret acquisitions = %d, want 0", got)
+	}
+	if got := len(fixture.executor.Requests()); got != 0 {
+		t.Fatalf("executor requests = %d, want 0", got)
 	}
 }
 
@@ -3227,6 +3304,66 @@ func resolvedServiceFixture(t *testing.T) *serviceFixture {
 	fixture := newServiceFixture(t)
 	fixture.profile.result = repository.ProfileResult{Facts: map[string]string{"base_sha": fixture.resolver.revision.SHA}}
 	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "execute")); err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	return fixture
+}
+
+func resolvedCodexAuthorityFixture(t *testing.T, runtimeKind string) *serviceFixture {
+	t.Helper()
+	fixture := newServiceFixture(t)
+	profile := resolvedWorkerProfile(t)
+	if runtimeKind == workerprofile.RuntimeHost {
+		profile.Runtime = workerprofile.Runtime{Kind: workerprofile.RuntimeHost}
+		profile.Resources = workerprofile.Resources{}
+		profile.Secrets = nil
+		profile.Digest = ""
+		var err error
+		profile, err = workerprofile.Canonicalize(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.workerProfiles.Set(profile)
+	}
+	executors, err := executor.NewRegistry(executor.Registration{
+		RuntimeKind: runtimeKind,
+		Executor:    fixture.executor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := harnesscodex.New(harnesscodex.SupportedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harnesses, err := harness.NewRegistry(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.executors = executors
+	fixture.service.harnesses = harnesses
+	fixture.profile.result = repository.ProfileResult{Facts: map[string]string{"base_sha": fixture.resolver.revision.SHA}}
+	fixture.executor.SetBeforeExecute(func(_ context.Context, request executor.Request) {
+		result := executor.Result{
+			Created: true, Started: true, Completed: true,
+			SafeFacts: portableSafeFacts(request.Profile),
+		}
+		switch request.Attempt.Purpose {
+		case executor.PurposeProbe:
+			if request.Command.Executable == "codex" {
+				result.Stdout = []byte("codex 0.144.5")
+			} else {
+				result.Stdout = []byte("ok")
+			}
+		case executor.PurposeAgent:
+			result.Stdout = []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n{\"type\":\"turn.completed\"}")
+		}
+		fixture.executor.SetResult(request.Attempt, result, nil)
+	})
+	fixture.capturer.capture = func(context.Context, gitcapture.Request) (gitcapture.Result, error) {
+		return capturedChange(), nil
+	}
+	if _, err := fixture.service.Resolve(context.Background(), validRawInput("Change docs", "authority")); err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
 	return fixture

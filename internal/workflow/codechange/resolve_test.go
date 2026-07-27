@@ -1015,6 +1015,8 @@ func (registry *recordingSecretRegistry) Requests() []secret.ResolveRequest {
 
 type recordingHarness struct {
 	mu                    sync.Mutex
+	id                    string
+	version               string
 	probeCalls            int
 	agentCalls            int
 	parseCalls            int
@@ -1023,8 +1025,22 @@ type recordingHarness struct {
 	agentEnvironment      func([]workerprofile.SecretRequirement) (map[string]string, error)
 }
 
-func (*recordingHarness) ID() string      { return "codex" }
-func (*recordingHarness) Version() string { return "0.144.5" }
+func (adapter *recordingHarness) ID() string {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if adapter.id != "" {
+		return adapter.id
+	}
+	return "codex"
+}
+func (adapter *recordingHarness) Version() string {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if adapter.version != "" {
+		return adapter.version
+	}
+	return "0.144.5"
+}
 func (adapter *recordingHarness) Probe() executor.Command {
 	adapter.mu.Lock()
 	adapter.probeCalls++
@@ -1042,6 +1058,12 @@ func (adapter *recordingHarness) AgentCommand(prompt string) (executor.Command, 
 		Executable: "codex", Args: []string{"exec", prompt},
 		Directory: executor.SandboxWorkspaceRoot,
 	}, nil
+}
+func (adapter *recordingHarness) AgentCommandFor(context harness.AgentExecutionContext, prompt string) (executor.Command, error) {
+	if _, err := context.AuthorityFor(adapter.ID(), adapter.Version()); err != nil {
+		return executor.Command{}, err
+	}
+	return adapter.AgentCommand(prompt)
 }
 func (adapter *recordingHarness) Parse(result executor.Result) (string, error) {
 	adapter.mu.Lock()

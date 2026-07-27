@@ -79,6 +79,33 @@ func TestRegistryDerivesAgentEnvironmentFromDefensiveRequirementAndMapCopies(t *
 	}
 }
 
+func TestResolvedAgentBindsExactProfileAndProtectsContextFromMutation(t *testing.T) {
+	adapter := stubAdapter{id: "codex", version: "0.144.5"}
+	registry, err := NewRegistry(adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := profileWithHarness(t, "codex", "0.144.5", "")
+	boundProfile := profile.Clone()
+	resolved, _, err := registry.ResolveAgent(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profile.Runtime.Network = workerprofile.NetworkOutbound
+	profile.Digest = ""
+	profile, err = workerprofile.Canonicalize(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolved.AgentCommand(profile, "change the file"); err == nil {
+		t.Fatal("rebound worker profile accepted by resolved harness")
+	}
+	if _, err := resolved.AgentCommand(boundProfile, "change the file"); err != nil {
+		t.Fatalf("original bound profile rejected: %v", err)
+	}
+}
+
 type stubAdapter struct {
 	id               string
 	version          string
@@ -90,6 +117,9 @@ func (adapter stubAdapter) ID() string              { return adapter.id }
 func (adapter stubAdapter) Version() string         { return adapter.version }
 func (adapter stubAdapter) Probe() executor.Command { return executor.Command{} }
 func (adapter stubAdapter) AgentCommand(string) (executor.Command, error) {
+	return executor.Command{}, nil
+}
+func (adapter stubAdapter) AgentCommandFor(AgentExecutionContext, string) (executor.Command, error) {
 	return executor.Command{}, nil
 }
 func (adapter stubAdapter) Parse(executor.Result) (string, error) { return "", nil }

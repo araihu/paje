@@ -366,11 +366,30 @@ type Adapter interface {
     Version() string
     Probe() executor.Command
     AgentCommand(string) (executor.Command, error)
+    AgentCommandFor(AgentExecutionContext, string) (executor.Command, error)
     AgentEnvironment([]workerprofile.SecretRequirement) (map[string]string, error)
     Parse(executor.Result) (string, error)
     AcceptsCapability(string) bool
 }
 ```
+
+`AgentExecutionContext` is an opaque registry-issued authority grant bound to
+the exact canonical persisted profile digest, runtime kind, harness ID, and
+harness version. The workflow resolves the executor and this context from the
+same profile snapshot, validates the binding before any secret acquisition or
+provider side effect, and constructs the executor request from that snapshot.
+A zero, unknown, or profile/harness-rebound context fails closed. The direct
+`AgentCommand` compatibility path is always host-safe and can never select an
+outer-sandbox bypass.
+
+For `runtime.kind: oci`, the hardened OCI executor is the sandbox authority.
+The Codex adapter therefore emits exactly `codex exec --json --ephemeral
+--ignore-user-config --dangerously-bypass-approvals-and-sandbox <prompt>` and
+does not request an inner Codex sandbox. This flag is permitted only through
+the exact registry-bound external-OCI context; it is not a global Codex mode.
+For `runtime.kind: host`, Codex remains the sandbox authority and the adapter
+emits exactly `codex exec --json --ephemeral --ignore-user-config --sandbox
+workspace-write <prompt>`. Host execution never emits the dangerous bypass.
 
 The registry gives the adapter an independent requirement slice and returns an
 independent environment map. The Codex adapter maps only the exact persisted
@@ -845,6 +864,12 @@ For each one-shot sandbox the adapter:
 9. Cancels by stopping and then force-killing within bounded intervals.
 10. Removes the container and attempt-owned network resources idempotently.
 
+For a Codex agent command, this outer OCI boundary is the sole sandbox
+authority. Running Codex's Linux namespace sandbox inside the already
+unprivileged container is unsupported and must not be used as layered
+security evidence. The profile-bound harness context selects the narrow
+externally-sandboxed CLI form; no host or unknown runtime may select it.
+
 The workload never receives the engine socket. Docker resource names, IDs,
 inspect payloads, and host bind paths are ephemeral adapter state and are
 scrubbed from durable diagnostics.
@@ -864,7 +889,8 @@ filtering.
 Host profiles cannot declare secrets, cannot be labeled isolated or certified,
 and are rejected when production-only mode is enabled. They exist for fast
 unit, integration, and contributor workflows, not as the target security
-boundary.
+boundary. Host Codex always retains `--sandbox workspace-write` and never uses
+`--dangerously-bypass-approvals-and-sandbox`.
 
 ## Images and Packaging
 
@@ -958,7 +984,10 @@ a fixed session or criterion count.
   inverse, and drift.
 - `PW-AC01` — live acceptance uses the standard rendered `codex-go@1`
   production profile with no acceptance-only command, image, path, secret, or
-  runtime workaround; support/current claims wait for this evidence.
+  runtime workaround; its exact persisted OCI profile grants only the
+  registry-bound outer-sandbox authority, so Codex runs without an inner
+  namespace sandbox while the host path never receives that bypass;
+  support/current claims wait for this evidence.
 - `PW-AC02` — a real coordinator process is `SIGKILL`ed and restarted through
   production recovery, proving conclusive pre-child retry, post-receipt
   ambiguity/no rerun, and simultaneous unrelated-run progress.

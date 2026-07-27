@@ -48,6 +48,11 @@ regression suite.
   `paje-sandbox-init`, never Docker container configuration.
 - Commands use exact executable and argument arrays. No agent, probe,
   verification, init, or publisher-verification path invokes a shell.
+- Codex sandbox selection is bound to an opaque registry-issued execution
+  context derived from the same exact persisted profile used by the executor
+  registry and request. OCI emits only the externally sandboxed bypass form;
+  host retains `--sandbox workspace-write`; unknown or rebound authority fails
+  before secret acquisition or provider side effects.
 - Every sandbox is one-shot. Retry is permitted only after conclusive agent
   non-start; post-start uncertainty is nonretryable `ambiguous_attempt`.
 - `Inspect`, `Cancel`, `Destroy`, and secret `Revoke` are idempotent. Cleanup
@@ -849,11 +854,17 @@ git commit -m "feat: define isolated executor lifecycle"
 
 ```go
 func TestAgentCommandIsExact(t *testing.T) {
-    adapter := New("0.144.5")
-    command, err := adapter.AgentCommand("change the file")
+    profile := exactOCIProfile(t)
+    adapter, err := New("0.144.5")
+    if err != nil { t.Fatal(err) }
+    registry, err := harness.NewRegistry(adapter)
+    if err != nil { t.Fatal(err) }
+    resolved, _, err := registry.ResolveAgent(profile)
+    if err != nil { t.Fatal(err) }
+    command, err := resolved.AgentCommand(profile, "change the file")
     if err != nil { t.Fatal(err) }
     want := []string{"exec", "--json", "--ephemeral", "--ignore-user-config",
-        "--sandbox", "workspace-write", "change the file"}
+        "--dangerously-bypass-approvals-and-sandbox", "change the file"}
     if command.Executable != "codex" || !slices.Equal(command.Args, want) {
         t.Fatalf("command = %#v", command)
     }
@@ -883,6 +894,7 @@ type Adapter interface {
     Version() string
     Probe() executor.Command
     AgentCommand(prompt string) (executor.Command, error)
+    AgentCommandFor(AgentExecutionContext, prompt string) (executor.Command, error)
     Parse(executor.Result) (string, error)
     AcceptsCapability(string) bool
 }
@@ -891,8 +903,12 @@ type Adapter interface {
 The registry requires exact ID/version matches from the persisted profile.
 Codex recognizes only `harness.codex-auth`, probes with `codex --version`, uses
 the existing deterministic JSONL protocol, and requires one final completed
-agent message. Keep `internal/runner/codex` as a thin compatibility wrapper for
-the separate legacy workflow, delegating parsing to this adapter.
+agent message. The registry returns an opaque profile-bound execution context:
+external OCI uses `--dangerously-bypass-approvals-and-sandbox` with no
+`--sandbox`, while host and the direct compatibility call use exact `--sandbox
+workspace-write`. Unknown, zero, mutated-adapter, or profile-rebound context is
+rejected. Keep `internal/runner/codex` as a thin host-safe compatibility wrapper
+for the separate legacy workflow, delegating parsing to this adapter.
 
 - [ ] **Step 4: Implement and test the private init document**
 
@@ -1642,7 +1658,11 @@ image, path, secret, or runtime override. Bind a disposable Codex auth
 directory, run a real code change, verify in a fresh secret-free sandbox,
 reproduce the exact Git tree from the artifact, and assert source/sibling/
 engine/secret/descendant cleanup. Missing auth is explicit unverified evidence
-and blocks current/support claims; never print or persist auth.
+and blocks current/support claims; never print or persist auth. Assert that the
+same exact persisted OCI profile selects the outer executor as sandbox authority
+and emits the exact no-inner-sandbox Codex arguments. A host-profile companion
+test must retain `--sandbox workspace-write` and reject the dangerous bypass;
+unknown or inconsistent authority must fail before broker or executor effects.
 
 - [ ] **Step 6: Run all final gates**
 

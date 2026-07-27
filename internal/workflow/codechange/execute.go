@@ -339,11 +339,14 @@ func (s *Service) executePrepared(
 		return outcome.withFailure(ambiguousAttemptFailure(), errors.New("resolved worker profile is missing"))
 	}
 	outcome.profileSnapshot = record.WorkerProfile.Clone()
-	target, err := s.executors.Resolve(outcome.profileSnapshot)
+	adapter, agentEnvironment, err := s.harnesses.ResolveAgent(outcome.profileSnapshot)
 	if err != nil {
 		return outcome.withFailure(executorUnavailableFailure(), err)
 	}
-	adapter, agentEnvironment, err := s.harnesses.ResolveAgent(outcome.profileSnapshot)
+	if err := adapter.ValidateProfile(outcome.profileSnapshot); err != nil {
+		return outcome.withFailure(executorUnavailableFailure(), err)
+	}
+	target, err := s.executors.Resolve(outcome.profileSnapshot)
 	if err != nil {
 		return outcome.withFailure(executorUnavailableFailure(), err)
 	}
@@ -442,7 +445,7 @@ func (s *Service) executePrepared(
 		return outcome.withFailure(failure, err)
 	}
 
-	agentCommand, err := adapter.AgentCommand(prompt)
+	agentCommand, err := adapter.AgentCommand(outcome.profileSnapshot, prompt)
 	if err != nil {
 		return outcome.withFailure(agentProtocolFailure(), err)
 	}

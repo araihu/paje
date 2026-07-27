@@ -52,16 +52,35 @@ func (*Adapter) Probe() executor.Command {
 }
 
 func (*Adapter) AgentCommand(prompt string) (executor.Command, error) {
+	return buildAgentCommand(prompt, harness.SandboxAuthorityHost)
+}
+
+func (adapter *Adapter) AgentCommandFor(context harness.AgentExecutionContext, prompt string) (executor.Command, error) {
+	authority, err := context.AuthorityFor(adapter.ID(), adapter.Version())
+	if err != nil {
+		return executor.Command{}, err
+	}
+	return buildAgentCommand(prompt, authority)
+}
+
+func buildAgentCommand(prompt string, authority harness.SandboxAuthority) (executor.Command, error) {
 	if strings.TrimSpace(prompt) == "" || len(prompt) > maxPromptBytes || strings.IndexByte(prompt, 0) >= 0 {
 		return executor.Command{}, errors.New("Codex agent prompt is invalid")
 	}
+	args := []string{"exec", "--json", "--ephemeral", "--ignore-user-config"}
+	switch authority {
+	case harness.SandboxAuthorityExternalOCI:
+		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	case harness.SandboxAuthorityHost:
+		args = append(args, "--sandbox", "workspace-write")
+	default:
+		return executor.Command{}, errors.New("Codex sandbox authority is unknown")
+	}
+	args = append(args, prompt)
 	return executor.Command{
 		Executable: "codex",
-		Args: []string{
-			"exec", "--json", "--ephemeral", "--ignore-user-config",
-			"--sandbox", "workspace-write", prompt,
-		},
-		Directory: executor.SandboxWorkspaceRoot,
+		Args:       args,
+		Directory:  executor.SandboxWorkspaceRoot,
 	}, nil
 }
 
