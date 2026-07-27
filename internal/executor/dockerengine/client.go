@@ -2,6 +2,7 @@ package dockerengine
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -12,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/araihu/paje/internal/executil"
 	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/sandboxinit"
 	"github.com/containerd/errdefs"
@@ -334,26 +334,15 @@ func readPrivateReceiptExecOutput(
 	limit int64,
 	inspect func() (mobyclient.ExecInspectResult, error),
 ) ([]byte, error) {
-	stdout, err := executil.NewLimitedBuffer(limit)
-	if err != nil {
-		return nil, err
-	}
-	stderr, err := executil.NewLimitedBuffer(4096)
-	if err != nil {
-		return nil, err
-	}
-	_, streamErr := stdcopy.StdCopy(stdout, stderr, reader)
-	if stderr.Truncated() || len(stderr.Bytes()) != 0 || stdout.Truncated() {
-		return nil, errors.New("Docker private receipt reader failed")
-	}
+	stdout, stderr, stdoutTruncated, stderrTruncated, streamErr := readPrivateReceiptStreams(reader, limit)
 	if streamErr != nil && !benignReceiptStreamClose(streamErr) {
 		return nil, errors.New("read Docker private receipt")
 	}
-	candidate := stdout.Bytes()
+	candidate := stdout
 	inspected, inspectErr := inspect()
 	if inspectErr != nil {
-		if len(candidate) == 0 {
-			return nil, inspectErr
+		if len(candidate) == 0 || stdoutTruncated || stderrTruncated || len(stderr) != 0 {
+			return nil, errors.New("Docker private receipt reader outcome is uncertain")
 		}
 		return candidate, errors.Join(
 			errors.New("Docker private receipt reader outcome is uncertain"),
@@ -364,21 +353,77 @@ func readPrivateReceiptExecOutput(
 		return nil, errors.New("Docker private receipt reader remains running")
 	}
 	if inspected.ExitCode == 1 {
-		return nil, errdefs.ErrNotFound
+		if len(candidate) == 0 && !stdoutTruncated && !stderrTruncated {
+			return nil, errdefs.ErrNotFound
+		}
+		return nil, errors.New("Docker private receipt reader failed")
+	}
+	if stderrTruncated || len(stderr) != 0 || stdoutTruncated {
+		return nil, errors.New("Docker private receipt reader failed")
 	}
 	if inspected.ExitCode != 0 {
 		return nil, errors.New("Docker private receipt reader failed")
 	}
+	if len(candidate) == 0 {
+		return nil, errors.New("Docker private receipt reader returned no receipt")
+	}
 	if streamErr != nil {
-		if len(candidate) == 0 {
-			return nil, errors.New("read Docker private receipt")
-		}
 		return candidate, errors.Join(
 			errors.New("Docker private receipt stream ended after output"),
 			streamErr,
 		)
 	}
 	return candidate, nil
+}
+
+func readPrivateReceiptStreams(reader io.Reader, stdoutLimit int64) (
+	stdout []byte,
+	stderr []byte,
+	stdoutTruncated bool,
+	stderrTruncated bool,
+	returnedErr error,
+) {
+	if stdoutLimit <= 0 || stdoutLimit > maxChildReceiptBytes {
+		return nil, nil, false, false, errors.New("Docker private receipt limit is invalid")
+	}
+	const (
+		frameHeaderBytes = 8
+		stderrLimit      = 4096
+	)
+	var header [frameHeaderBytes]byte
+	for {
+		_, err := io.ReadFull(reader, header[:])
+		if errors.Is(err, io.EOF) {
+			return stdout, stderr, false, false, nil
+		}
+		if err != nil {
+			return stdout, stderr, false, false, err
+		}
+		if header[1] != 0 || header[2] != 0 || header[3] != 0 {
+			return stdout, stderr, false, false, errors.New("Docker private receipt stream header is invalid")
+		}
+		frameSize := int64(binary.BigEndian.Uint32(header[4:]))
+		var target *[]byte
+		switch stdcopy.StdType(header[0]) {
+		case stdcopy.Stdout:
+			if frameSize > stdoutLimit-int64(len(stdout)) {
+				return stdout, stderr, true, false, errors.New("Docker private receipt stdout exceeds limit")
+			}
+			target = &stdout
+		case stdcopy.Stderr:
+			if frameSize > stderrLimit-int64(len(stderr)) {
+				return stdout, stderr, false, true, errors.New("Docker private receipt stderr exceeds limit")
+			}
+			target = &stderr
+		default:
+			return stdout, stderr, false, false, errors.New("Docker private receipt stream type is invalid")
+		}
+		start := len(*target)
+		*target = append(*target, make([]byte, int(frameSize))...)
+		if _, err := io.ReadFull(reader, (*target)[start:]); err != nil {
+			return stdout, stderr, false, false, err
+		}
+	}
 }
 
 func benignReceiptStreamClose(err error) bool {

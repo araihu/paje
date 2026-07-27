@@ -2,6 +2,7 @@ package dockerengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -10,7 +11,9 @@ import (
 	"time"
 
 	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/sandboxinit"
 	"github.com/araihu/paje/internal/workerprofile"
+	"github.com/containerd/errdefs"
 	mobyclient "github.com/moby/moby/client"
 )
 
@@ -157,5 +160,84 @@ func TestRealDockerPrivateReceiptReaderRepeated(t *testing.T) {
 			t.Fatalf("receipt-reader network cleanup(sequence %d) = %#v, %v", sequence, networks, networkErr)
 		}
 		result.Destroy()
+	}
+}
+
+func TestRealDockerPrivateReceiptReaderBeforePublication(t *testing.T) {
+	endpoint := os.Getenv("PAJE_DOCKER_TEST_ENDPOINT")
+	image := os.Getenv("PAJE_DOCKER_TEST_IMAGE")
+	if endpoint == "" || image == "" {
+		t.Skip("set PAJE_DOCKER_TEST_ENDPOINT and PAJE_DOCKER_TEST_IMAGE to opt in to the real Docker receipt-reader probe")
+	}
+	if !strings.Contains(image, "@sha256:") {
+		t.Fatal("PAJE_DOCKER_TEST_IMAGE must be an exact digest reference")
+	}
+
+	raw, err := mobyclient.New(mobyclient.WithHost(endpoint))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &mobyEngine{client: raw}
+	t.Cleanup(func() { _ = engine.Close() })
+	workspaceParent, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := os.MkdirTemp(workspaceParent, ".paje-receipt-reader-early-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workspace) })
+
+	request := dockerRequest(t, workerprofile.NetworkNone, nil)
+	request.Workspace.HostPath = workspace
+	request.Attempt = executor.AttemptID{
+		RunID: fmt.Sprintf("real-docker-receipt-early-%d", os.Getpid()),
+		Stage: "execute", Attempt: 1, StartedAt: time.Now().UTC(),
+		Purpose: executor.PurposeVerification, Sequence: 1,
+	}
+	request.Profile.Runtime.Image = image
+	request.Profile.Runtime.Platform = "linux/" + runtime.GOARCH
+	request.Profile.Digest = ""
+	request.Profile, err = workerprofile.Canonicalize(request.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := newBootstrapDocument(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err := containerOptions(
+		request,
+		"",
+		boundContainerLabels(request.Attempt, document.ChildStartReceipt),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	containerID, err := engine.CreateContainer(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = engine.RemoveContainer(cleanupCtx, containerID)
+	})
+	attached, err := engine.AttachContainer(ctx, containerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = attached.Close() })
+	if err := engine.StartContainer(ctx, containerID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := engine.CopyFile(ctx, containerID, sandboxinit.ChildStartReceiptPath, maxChildReceiptBytes)
+	if len(got) != 0 || !errors.Is(err, errdefs.ErrNotFound) {
+		t.Fatalf("pre-publication receipt read = %q, %v", got, err)
 	}
 }
