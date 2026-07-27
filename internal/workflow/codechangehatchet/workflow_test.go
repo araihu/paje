@@ -98,7 +98,7 @@ func TestNewProducesSDKDeclarationWithoutServer(t *testing.T) {
 				t.Fatalf("publish concurrency count = %d", len(task.GetConcurrency()))
 			}
 			concurrency := task.GetConcurrency()[0]
-			if concurrency.GetExpression() != "input.input.repository_uri + ':' + input.input.publication.target_branch" ||
+			if concurrency.GetExpression() != "input.input.repository_uri" ||
 				concurrency.GetMaxRuns() != 1 || concurrency.GetLimitStrategy().String() != "GROUP_ROUND_ROBIN" {
 				t.Fatalf("publish concurrency = %v", concurrency)
 			}
@@ -122,7 +122,7 @@ func TestDeclareWorkflowBuildsFivePhaseDAG(t *testing.T) {
 			name: "publish", parents: []string{"approval"}, retries: 2,
 			backoffFactor: 2, maxBackoffSeconds: 60, timeout: 15 * time.Minute,
 			concurrency: &types.Concurrency{
-				Expression: "input.input.repository_uri + ':' + input.input.publication.target_branch",
+				Expression: "input.input.repository_uri",
 				MaxRuns:    pointer(int32(1)), LimitStrategy: pointer(types.GroupRoundRobin),
 			},
 		},
@@ -131,6 +131,25 @@ func TestDeclareWorkflowBuildsFivePhaseDAG(t *testing.T) {
 	if !reflect.DeepEqual(declaration.tasks, want) {
 		t.Fatalf("declaration mismatch\n got: %#v\nwant: %#v", declaration.tasks, want)
 	}
+}
+
+func TestPublishConcurrencyUsesOnlyRequiredArtifactInputFields(t *testing.T) {
+	declaration := &recordingDeclaration{}
+	declareWorkflow(declaration, &fakeService{})
+
+	for _, task := range declaration.tasks {
+		if task.name != "publish" {
+			continue
+		}
+		if task.concurrency == nil {
+			t.Fatal("publish concurrency is missing")
+		}
+		if got, want := task.concurrency.Expression, "input.input.repository_uri"; got != want {
+			t.Fatalf("publish concurrency expression = %q, want artifact-safe %q", got, want)
+		}
+		return
+	}
+	t.Fatal("publish task is missing")
 }
 
 func TestResolveHandlerUnwrapsExactTemplateInputWithPreallocatedRunID(t *testing.T) {

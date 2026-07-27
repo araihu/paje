@@ -90,7 +90,7 @@ func declareWorkflow(workflow workflowDeclaration, service phaseService) {
 		parents: []string{"approval"}, retries: publishRetries, retryBackoffFactor: 2,
 		retryMaxBackoffSeconds: 60, executionTimeout: 15 * time.Minute,
 		concurrency: &types.Concurrency{
-			Expression: "input.input.repository_uri + ':' + input.input.publication.target_branch",
+			Expression: "input.input.repository_uri",
 			MaxRuns:    &maxRuns, LimitStrategy: &strategy,
 		},
 	})
