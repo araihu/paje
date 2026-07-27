@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/araihu/paje/internal/run"
 	"github.com/google/uuid"
 	legacyclient "github.com/hatchet-dev/hatchet/pkg/client"
 	"github.com/hatchet-dev/hatchet/pkg/client/rest"
@@ -111,11 +112,15 @@ func (c *SDKClient) Details(ctx context.Context, externalRunID string) (Details,
 	if details == nil {
 		return Details{}, fmt.Errorf("Hatchet returned empty workflow details")
 	}
+	input, err := canonicalWorkflowDetailsInput(details.Input)
+	if err != nil {
+		return Details{}, fmt.Errorf("canonicalize Hatchet workflow details input: %w", err)
+	}
 
 	result := Details{
 		ExternalRunID: details.ExternalId.String(),
 		Status:        RunStatus(details.Status),
-		Input:         append(json.RawMessage(nil), details.Input...),
+		Input:         input,
 		Done:          details.Done,
 	}
 	if finalize, exists := details.TaskRuns["finalize"]; exists && finalize != nil {
@@ -125,6 +130,21 @@ func (c *SDKClient) Details(ctx context.Context, externalRunID string) (Details,
 		}
 	}
 	return result, nil
+}
+
+func canonicalWorkflowDetailsInput(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 || len(raw) > maxEnvelopeBytes {
+		return nil, fmt.Errorf("Hatchet workflow details input size is invalid")
+	}
+	canonical, err := run.CanonicalInput(raw)
+	if err != nil {
+		return nil, fmt.Errorf("Hatchet workflow details input is invalid: %w", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(canonical, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("Hatchet workflow details input must be an object")
+	}
+	return canonical, nil
 }
 
 func (c *SDKClient) Cancel(ctx context.Context, externalRunID string) error {
