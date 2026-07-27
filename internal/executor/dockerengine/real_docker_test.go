@@ -63,7 +63,7 @@ func TestRealDockerCreateProbe(t *testing.T) {
 	if inspected.OS != platform.OS || inspected.Architecture != platform.Architecture {
 		t.Fatalf("probe image platform = %s/%s", inspected.OS, inspected.Architecture)
 	}
-	options, err := containerOptions(request, "")
+	options, err := containerOptions(request, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

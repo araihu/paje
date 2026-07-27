@@ -26,11 +26,17 @@ const (
 	ScenarioBoundedOutput   Scenario = "bounded_output"
 	ScenarioWorkspace       Scenario = "workspace_isolation"
 	ScenarioSecretIsolation Scenario = "secret_stage_isolation"
+	ScenarioCanonicalPath   Scenario = "canonical_path"
 )
 
 type Fixture struct {
 	Executor executor.Executor
 	Request  executor.Request
+	// ReceiptEnvironment and ReceiptEnvironmentFiles describe the exact child
+	// declaration when an adapter applies a documented canonical transform
+	// before exec (for example, the OCI sandbox PATH).
+	ReceiptEnvironment      map[string]string
+	ReceiptEnvironmentFiles map[string]string
 
 	// Started is closed by a fixture when a cancellable process and its
 	// descendants are running. It is required by cancellation scenarios.
@@ -58,6 +64,7 @@ func Run(t *testing.T, factory Factory) {
 		ScenarioBoundedOutput,
 		ScenarioWorkspace,
 		ScenarioSecretIsolation,
+		ScenarioCanonicalPath,
 	}
 	for _, scenario := range scenarios {
 		t.Run(string(scenario), func(t *testing.T) {
@@ -70,33 +77,58 @@ func Run(t *testing.T, factory Factory) {
 			if fixture.Executor == nil {
 				t.Fatal("executor contract fixture has nil executor")
 			}
-			if err := request.Validate(); err != nil && scenario != ScenarioWorkspace && scenario != ScenarioSecretIsolation {
+			if err := request.Validate(); err != nil && scenario != ScenarioWorkspace &&
+				scenario != ScenarioSecretIsolation && scenario != ScenarioCanonicalPath {
 				t.Fatalf("executor contract fixture request is invalid: %v", err)
 			}
 			switch scenario {
 			case ScenarioComplete:
-				runComplete(t, fixture.Executor, request)
+				runComplete(t, fixture, request)
 			case ScenarioStartFailure:
 				runStartFailure(t, fixture.Executor, request)
 			case ScenarioNonzero:
-				runNonzero(t, fixture.Executor, request)
+				runNonzero(t, fixture, request)
 			case ScenarioTimeout:
-				runTimeout(t, fixture.Executor, request)
+				runTimeout(t, fixture, request)
 			case ScenarioCancellation, ScenarioDescendantDeath:
 				runCancellation(t, fixture, scenario == ScenarioDescendantDeath)
 			case ScenarioBoundedOutput:
-				runBoundedOutput(t, fixture.Executor, request)
+				runBoundedOutput(t, fixture, request)
 			case ScenarioWorkspace:
 				runWorkspaceIsolation(t, fixture.Executor, request)
 			case ScenarioSecretIsolation:
 				runSecretIsolation(t, fixture.Executor, request)
+			case ScenarioCanonicalPath:
+				runCanonicalPath(t, fixture.Executor, request)
 			}
 		})
 	}
 }
 
-func runComplete(t *testing.T, target executor.Executor, request executor.Request) {
+func runCanonicalPath(t *testing.T, target executor.Executor, request executor.Request) {
 	t.Helper()
+	request.Environment = cloneEnvironment(request.Environment)
+	request.Environment["PATH"] = "/tmp/paje-untrusted-bin"
+	if err := request.ValidateDeclaration(); err == nil {
+		t.Fatal("ValidateDeclaration accepted noncanonical PATH")
+	}
+	result, err := target.Execute(context.Background(), request)
+	if err == nil || result.Created || result.BootstrapStarted || result.Started {
+		t.Fatalf("noncanonical PATH reached executor side effects: %#v, %v", result, err)
+	}
+}
+
+func cloneEnvironment(values map[string]string) map[string]string {
+	cloned := make(map[string]string, len(values)+1)
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func runComplete(t *testing.T, fixture Fixture, request executor.Request) {
+	t.Helper()
+	target := fixture.Executor
 	result, err := target.Execute(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +136,7 @@ func runComplete(t *testing.T, target executor.Executor, request executor.Reques
 	if !result.Created || !result.Started || !result.Completed || result.ExitCode != 0 {
 		t.Fatalf("successful lifecycle evidence = %#v", result)
 	}
+	assertBoundChildStart(t, fixture, request, result)
 	for range 2 {
 		state, inspectErr := target.Inspect(context.Background(), request.Attempt)
 		if inspectErr != nil || state != executor.StateCompleted {
@@ -144,22 +177,26 @@ func runStartFailure(t *testing.T, target executor.Executor, request executor.Re
 	}
 }
 
-func runNonzero(t *testing.T, target executor.Executor, request executor.Request) {
+func runNonzero(t *testing.T, fixture Fixture, request executor.Request) {
 	t.Helper()
+	target := fixture.Executor
 	result, err := target.Execute(context.Background(), request)
 	if err != nil || !result.Created || !result.Started || !result.Completed || result.ExitCode == 0 {
 		t.Fatalf("nonzero lifecycle = %#v, %v", result, err)
 	}
+	assertBoundChildStart(t, fixture, request, result)
 }
 
-func runTimeout(t *testing.T, target executor.Executor, request executor.Request) {
+func runTimeout(t *testing.T, fixture Fixture, request executor.Request) {
 	t.Helper()
+	target := fixture.Executor
 	result, err := target.Execute(context.Background(), request)
 	var providerError *executor.ProviderError
 	if !result.Started || err == nil || !errors.As(err, &providerError) ||
 		providerError.Class != "environment" || providerError.CauseCode != "timeout" {
 		t.Fatalf("timeout lifecycle = %#v, %v", result, err)
 	}
+	assertBoundChildStart(t, fixture, request, result)
 }
 
 func runCancellation(t *testing.T, fixture Fixture, descendants bool) {
@@ -194,6 +231,7 @@ func runCancellation(t *testing.T, fixture Fixture, descendants bool) {
 		if !got.result.Started || got.err == nil {
 			t.Fatalf("canceled lifecycle = %#v, %v", got.result, got.err)
 		}
+		assertBoundChildStart(t, fixture, fixture.Request, got.result)
 	case <-time.After(5 * time.Second):
 		t.Fatal("canceled Execute did not return")
 	}
@@ -205,8 +243,9 @@ func runCancellation(t *testing.T, fixture Fixture, descendants bool) {
 	}
 }
 
-func runBoundedOutput(t *testing.T, target executor.Executor, request executor.Request) {
+func runBoundedOutput(t *testing.T, fixture Fixture, request executor.Request) {
 	t.Helper()
+	target := fixture.Executor
 	result, err := target.Execute(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -214,6 +253,31 @@ func runBoundedOutput(t *testing.T, target executor.Executor, request executor.R
 	if int64(len(result.Stdout)) > request.OutputLimit || int64(len(result.Stderr)) > request.OutputLimit ||
 		!result.StdoutTruncated || !result.StderrTruncated {
 		t.Fatalf("bounded output evidence = stdout %d stderr %d %#v", len(result.Stdout), len(result.Stderr), result)
+	}
+	assertBoundChildStart(t, fixture, request, result)
+}
+
+func assertBoundChildStart(t *testing.T, fixture Fixture, request executor.Request, result executor.Result) {
+	t.Helper()
+	if result.ChildStartReceipt == nil {
+		t.Fatal("conclusive Started result has no child-start receipt")
+	}
+	environment := fixture.ReceiptEnvironment
+	if environment == nil {
+		environment = request.Environment
+	}
+	expected, err := executor.NewChildStartReceipt(
+		request.Attempt,
+		request.Command,
+		environment,
+		fixture.ReceiptEnvironmentFiles,
+		result.ChildStartReceipt.Challenge,
+	)
+	if err != nil {
+		t.Fatalf("construct expected child-start receipt: %v", err)
+	}
+	if !result.ChildStartReceipt.Matches(expected) {
+		t.Fatalf("child-start receipt is rebound: got %#v want %#v", result.ChildStartReceipt, expected)
 	}
 }
 

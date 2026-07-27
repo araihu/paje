@@ -1,10 +1,13 @@
 package dockerengine
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/sandboxinit"
 	"github.com/araihu/paje/internal/workerprofile"
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
@@ -95,7 +99,7 @@ func TestExecuteUsesExactImageAndHardenedOneShotContainer(t *testing.T) {
 		imagePlatforms[1].OS != "linux" || imagePlatforms[1].Architecture != "amd64" {
 		t.Fatalf("image inspect platforms = %#v", imagePlatforms)
 	}
-	if strings.Join(operations, ",") != "ping,inspect-image,pull-image,inspect-image,list-networks,list-containers,create-container,attach,start,wait" {
+	if strings.Join(operations, ",") != "ping,inspect-image,pull-image,inspect-image,list-networks,list-containers,create-container,attach,start,signal:SIGUSR1,wait" {
 		t.Fatalf("engine operations = %v", operations)
 	}
 	assertHardenedCreate(t, created, request)
@@ -312,7 +316,7 @@ func dockerRequest(t *testing.T, network string, requirements []workerprofile.Se
 		Workspace: executor.Workspace{
 			HostPath: t.TempDir(), SandboxPath: executor.SandboxWorkspaceRoot, Writable: true,
 		},
-		Environment: map[string]string{"PATH": "/usr/local/bin:/usr/bin:/bin"},
+		Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH},
 		Timeout:     5 * time.Second,
 		OutputLimit: 1024,
 	}
@@ -345,25 +349,32 @@ type fakeEngine struct {
 	imagePlatforms    []ocispec.Platform
 	pull              pullRequest
 
-	created               client.ContainerCreateOptions
-	createCount           int
-	createErr             error
-	createPersistsOnError bool
-	createEntered         chan struct{}
-	releaseCreate         chan struct{}
-	delayedCreateRelease  chan struct{}
-	delayedCreateDone     chan struct{}
-	containerListEntered  chan struct{}
-	archive               []byte
-	attached              []byte
-	blockBootstrap        chan struct{}
-	bootstrapWriteErr     error
-	closeWriteErr         error
+	created                    client.ContainerCreateOptions
+	createCount                int
+	createErr                  error
+	createPersistsOnError      bool
+	createEntered              chan struct{}
+	releaseCreate              chan struct{}
+	delayedCreateRelease       chan struct{}
+	delayedCreateDone          chan struct{}
+	containerListEntered       chan struct{}
+	archive                    []byte
+	attached                   []byte
+	blockBootstrap             chan struct{}
+	bootstrapWriteErr          error
+	closeWriteErr              error
+	receiptMissing             bool
+	receiptOverride            []byte
+	receipt                    []byte
+	releaseReceiptPublication  chan struct{}
+	childStartAckErr           error
+	childStartAcknowledgements int
 
-	containerExists bool
-	containerState  engineContainerState
-	containerLabels map[string]string
-	extraContainers int
+	containerExists     bool
+	containerState      engineContainerState
+	containerLabels     map[string]string
+	containerInspectErr error
+	extraContainers     int
 
 	networkExists          bool
 	networkLabels          map[string]string
@@ -466,7 +477,7 @@ func (api *fakeEngine) ListContainers(_ context.Context, labels map[string]strin
 		result = append(result, engineContainer{ID: "provider-detail-extra"})
 	}
 	if api.containerExists && labelsContain(api.containerLabels, labels) {
-		result = append(result, engineContainer{ID: "provider-detail-container"})
+		result = append(result, engineContainer{ID: "provider-detail-container", Labels: cloneStrings(api.containerLabels)})
 	}
 	return result, nil
 }
@@ -542,11 +553,17 @@ func (stream *fakeAttachedStream) Write(value []byte) (int, error) {
 func (*fakeAttachedStream) Close() error { return nil }
 func (stream *fakeAttachedStream) CloseWrite() error {
 	stream.api.mu.Lock()
-	defer stream.api.mu.Unlock()
 	if stream.api.closeWriteErr == nil {
+		stream.api.receipt = receiptFromBootstrapArchive(stream.api.archive)
 		stream.api.agentStartOnce.Do(func() { close(stream.api.started) })
 	}
-	return stream.api.closeWriteErr
+	release := stream.api.releaseReceiptPublication
+	err := stream.api.closeWriteErr
+	stream.api.mu.Unlock()
+	if release != nil {
+		<-release
+	}
+	return err
 }
 func (*fakeAttachedStream) SetWriteDeadline(time.Time) error { return nil }
 
@@ -606,7 +623,28 @@ func (api *fakeEngine) WaitContainer(ctx context.Context, _ string) (int64, erro
 func (api *fakeEngine) InspectContainer(context.Context, string) (engineContainerState, error) {
 	api.mu.Lock()
 	defer api.mu.Unlock()
+	if api.containerInspectErr != nil {
+		return "", api.containerInspectErr
+	}
+	if !api.containerExists {
+		return "", errdefs.ErrNotFound
+	}
 	return api.containerState, nil
+}
+
+func (api *fakeEngine) CopyFile(_ context.Context, _ string, sourcePath string, _ int64) ([]byte, error) {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if !api.containerExists || sourcePath != sandboxinit.ChildStartReceiptPath || api.receiptMissing {
+		return nil, errdefs.ErrNotFound
+	}
+	if api.receiptOverride != nil {
+		return slices.Clone(api.receiptOverride), nil
+	}
+	if api.receipt == nil {
+		return nil, errdefs.ErrNotFound
+	}
+	return slices.Clone(api.receipt), nil
 }
 
 func (api *fakeEngine) StopContainer(context.Context, string, time.Duration) error {
@@ -626,15 +664,27 @@ func (api *fakeEngine) StopContainer(context.Context, string, time.Duration) err
 	return nil
 }
 
-func (api *fakeEngine) KillContainer(context.Context, string) error {
+func (api *fakeEngine) SignalContainer(_ context.Context, _ string, signal string) error {
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	api.killCalls++
-	if api.containerExists && !api.killLeavesRunning {
-		api.containerState = engineContainerExited
-		api.exitOnce.Do(func() { close(api.exited) })
+	api.record("signal:" + signal)
+	if signal == "SIGUSR1" {
+		api.childStartAcknowledgements++
+		return api.childStartAckErr
 	}
-	return nil
+	if signal == "SIGKILL" {
+		api.killCalls++
+		if api.containerExists && !api.killLeavesRunning {
+			api.containerState = engineContainerExited
+			api.exitOnce.Do(func() { close(api.exited) })
+		}
+		return nil
+	}
+	return errors.New("unsupported fake Docker signal")
+}
+
+func (api *fakeEngine) KillContainer(ctx context.Context, id string) error {
+	return api.SignalContainer(ctx, id, "SIGKILL")
 }
 
 func (api *fakeEngine) RemoveContainer(context.Context, string) error {
@@ -739,6 +789,35 @@ func cloneStrings(values map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+func receiptFromBootstrapArchive(encoded []byte) []byte {
+	archive := tar.NewReader(bytes.NewReader(encoded))
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil || header == nil {
+			return nil
+		}
+		if header.Name != "run/paje/command.json" {
+			continue
+		}
+		value, err := io.ReadAll(archive)
+		if err != nil {
+			return nil
+		}
+		var document sandboxinit.Document
+		if err := json.Unmarshal(value, &document); err != nil {
+			return nil
+		}
+		receipt, err := json.Marshal(document.ChildStartReceipt)
+		if err != nil {
+			return nil
+		}
+		return receipt
+	}
 }
 
 var _ engineClient = (*fakeEngine)(nil)

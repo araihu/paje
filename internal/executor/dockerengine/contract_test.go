@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/executor/contracttest"
 	"github.com/araihu/paje/internal/workerprofile"
 )
@@ -16,7 +17,14 @@ func TestExecutorContract(t *testing.T) {
 		api := newFakeEngine()
 		target := newExecutorForTest(t, api)
 		request := dockerRequest(t, workerprofile.NetworkNone, nil)
-		fixture := contracttest.Fixture{Executor: target, Request: request}
+		receiptEnvironment := make(map[string]string, len(request.Environment))
+		for key, value := range request.Environment {
+			receiptEnvironment[key] = value
+		}
+		receiptEnvironment["PATH"] = executor.CanonicalSandboxPATH
+		fixture := contracttest.Fixture{
+			Executor: target, Request: request, ReceiptEnvironment: receiptEnvironment,
+		}
 		switch scenario {
 		case contracttest.ScenarioStartFailure:
 			api.startErr = errors.New("provider-detail start failure")

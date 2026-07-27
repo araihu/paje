@@ -17,6 +17,7 @@ import (
 
 const (
 	DocumentPath             = "/run/paje/command.json"
+	ChildStartReceiptPath    = "/run/paje/child-start.json"
 	SecretRoot               = "/run/paje/secrets"
 	MaxDocumentBytes         = 1 << 20
 	MaxEnvironmentBytes      = 1 << 20
@@ -32,10 +33,34 @@ var (
 )
 
 type Document struct {
-	WorkspaceRoot    string            `json:"workspace_root"`
-	Command          executor.Command  `json:"command"`
-	Environment      map[string]string `json:"environment"`
-	EnvironmentFiles map[string]string `json:"environment_files,omitempty"`
+	WorkspaceRoot     string                     `json:"workspace_root"`
+	Command           executor.Command           `json:"command"`
+	Environment       map[string]string          `json:"environment"`
+	EnvironmentFiles  map[string]string          `json:"environment_files,omitempty"`
+	ChildStartReceipt executor.ChildStartReceipt `json:"child_start_receipt"`
+}
+
+// BindChildStartReceipt freezes the exact command/environment declaration and
+// private challenge that sandbox-init must acknowledge after OS exec success.
+func (document *Document) BindChildStartReceipt(attempt executor.AttemptID, challenge string) error {
+	if document == nil {
+		return errors.New("sandbox command document is nil")
+	}
+	if document.Environment["PATH"] != executor.CanonicalSandboxPATH {
+		return errors.New("sandbox command exact canonical PATH is required")
+	}
+	receipt, err := executor.NewChildStartReceipt(
+		attempt,
+		document.Command,
+		document.Environment,
+		document.EnvironmentFiles,
+		challenge,
+	)
+	if err != nil {
+		return err
+	}
+	document.ChildStartReceipt = receipt
+	return nil
 }
 
 func Decode(reader io.Reader) (Document, error) {
@@ -107,8 +132,18 @@ func (document Document) Validate() error {
 		return errors.New("sandbox command environment is too large")
 	}
 	pathValue, ok := document.Environment["PATH"]
-	if !ok || !validPath(pathValue) {
-		return errors.New("sandbox command exact PATH is required")
+	if !ok || pathValue != executor.CanonicalSandboxPATH || !validPath(pathValue) {
+		return errors.New("sandbox command exact canonical PATH is required")
+	}
+	expected, err := executor.NewChildStartReceipt(
+		document.ChildStartReceipt.Attempt,
+		document.Command,
+		document.Environment,
+		document.EnvironmentFiles,
+		document.ChildStartReceipt.Challenge,
+	)
+	if err != nil || !document.ChildStartReceipt.Matches(expected) {
+		return errors.New("sandbox command child-start receipt binding is invalid")
 	}
 	return nil
 }

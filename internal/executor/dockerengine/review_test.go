@@ -26,7 +26,7 @@ func TestCanonicalGoTestGetsExecutableDefaultBuildTempAndPrivateBootstrapTmpfs(t
 	defer request.Destroy()
 	request.Command.Executable = "go"
 	request.Command.Args = []string{"test", "./..."}
-	options, err := containerOptions(request, "")
+	options, err := containerOptions(request, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

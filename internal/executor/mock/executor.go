@@ -67,6 +67,17 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 		configured.result = executor.Result{Created: true, Started: true, Completed: true}
 	}
 	result := configured.result.Clone()
+	if result.Started {
+		receipt, receiptErr := boundReceipt(request, result.ChildStartReceipt)
+		if receiptErr != nil {
+			result.Started = false
+			result.Completed = false
+			result.ChildStartReceipt = nil
+			target.states[key] = executor.StateUnknown
+			return result, executor.WrapError("internal", "ambiguous_attempt", receiptErr)
+		}
+		result.ChildStartReceipt = &receipt
+	}
 	if configured.err != nil {
 		if state := stateForResult(result); state != executor.StateAbsent {
 			target.states[key] = state
@@ -75,6 +86,31 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 	}
 	target.states[key] = stateForResult(result)
 	return result, nil
+}
+
+func boundReceipt(request executor.Request, configured *executor.ChildStartReceipt) (executor.ChildStartReceipt, error) {
+	if configured == nil {
+		return executor.NewRandomChildStartReceipt(
+			request.Attempt,
+			request.Command,
+			request.Environment,
+			nil,
+		)
+	}
+	expected, err := executor.NewChildStartReceipt(
+		request.Attempt,
+		request.Command,
+		request.Environment,
+		nil,
+		configured.Challenge,
+	)
+	if err != nil {
+		return executor.ChildStartReceipt{}, err
+	}
+	if !configured.Matches(expected) {
+		return executor.ChildStartReceipt{}, errors.New("mock child-start receipt was rebound")
+	}
+	return configured.Clone(), nil
 }
 
 func (target *Executor) Inspect(ctx context.Context, attempt executor.AttemptID) (executor.State, error) {

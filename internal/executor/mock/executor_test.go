@@ -113,6 +113,37 @@ func TestExecutorPreservesCreatedStateWhenStartFails(t *testing.T) {
 	request.Destroy()
 }
 
+func TestExecutorRejectsConfiguredReceiptReboundToAnotherAttempt(t *testing.T) {
+	target := New()
+	request := validRequest(t)
+	defer request.Destroy()
+	reboundAttempt := request.Attempt
+	reboundAttempt.Sequence++
+	rebound, err := executor.NewRandomChildStartReceipt(
+		reboundAttempt,
+		request.Command,
+		request.Environment,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.SetResult(request.Attempt, executor.Result{
+		Created: true, Started: true, ChildStartReceipt: &rebound,
+	}, nil)
+
+	result, err := target.Execute(context.Background(), request)
+	var providerError *executor.ProviderError
+	if result.Started || result.ChildStartReceipt != nil || !errors.As(err, &providerError) ||
+		providerError.CauseCode != "ambiguous_attempt" {
+		t.Fatalf("rebound Execute() = %#v, %v", result, err)
+	}
+	state, inspectErr := target.Inspect(context.Background(), request.Attempt)
+	if inspectErr != nil || state != executor.StateUnknown {
+		t.Fatalf("Inspect() after rebound = %q, %v", state, inspectErr)
+	}
+}
+
 func validRequest(t *testing.T) executor.Request {
 	t.Helper()
 	profile, err := workerprofile.Canonicalize(workerprofile.Snapshot{
@@ -133,7 +164,7 @@ func validRequest(t *testing.T) executor.Request {
 		Profile:     profile,
 		Command:     executor.Command{Executable: "go", Args: []string{"version"}, Directory: "/workspace"},
 		Workspace:   executor.Workspace{HostPath: t.TempDir(), SandboxPath: "/workspace"},
-		Environment: map[string]string{"PATH": "/usr/bin:/bin"},
+		Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH},
 		Timeout:     time.Minute, OutputLimit: 1024,
 	}
 }

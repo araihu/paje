@@ -239,6 +239,91 @@ func TestWorkspaceCleanupRejectsSymlinkEscapingManagedRoot(t *testing.T) {
 	}
 }
 
+func TestPreparedWorkspaceIsSelfContainedInsideSingleBind(t *testing.T) {
+	requireGit(t)
+	source := newRepository(t)
+	manager, err := gitworktree.New(filepath.Join(t.TempDir(), "paje-workspaces"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := manager.Resolve(context.Background(), source, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := manager.Prepare(context.Background(), source, revision.SHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = prepared.Cleanup(context.Background()) })
+
+	gitMetadata := filepath.Join(prepared.Path(), ".git")
+	info, err := os.Lstat(gitMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("workspace .git is not an in-bind directory: mode=%v", info.Mode())
+	}
+	for _, args := range [][]string{
+		{"rev-parse", "--absolute-git-dir"},
+		{"rev-parse", "--path-format=absolute", "--git-common-dir"},
+		{"rev-parse", "--path-format=absolute", "--git-path", "objects"},
+	} {
+		resolved := gitOutput(t, prepared.Path(), args...)
+		if err := pathWithinForTest(prepared.Path(), resolved); err != nil {
+			t.Fatalf("git %s escaped the single workspace bind: %q: %v", strings.Join(args, " "), resolved, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(gitMetadata, "objects", "info", "alternates")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace uses object alternates: %v", err)
+	}
+	command := exec.Command("git", "config", "--local", "--get-regexp", `^(remote\.|credential\.)`)
+	command.Dir = prepared.Path()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			t.Fatalf("inspect local remotes/credentials: %v\n%s", err, output)
+		}
+	}
+	if len(output) != 0 {
+		t.Fatalf("workspace retains live remote or credential config: %s", output)
+	}
+}
+
+func TestWorkspaceCleanupRefusesReboundDirectoryIdentity(t *testing.T) {
+	requireGit(t)
+	source := newRepository(t)
+	manager, err := gitworktree.New(filepath.Join(t.TempDir(), "paje-workspaces"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := manager.Resolve(context.Background(), source, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := manager.Prepare(context.Background(), source, revision.SHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := prepared.Path()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(path, "replacement-must-remain")
+	if err := os.WriteFile(marker, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepared.Cleanup(context.Background()); err == nil {
+		t.Fatal("Cleanup() accepted a rebound workspace directory")
+	}
+	assertFileContent(t, marker, "safe")
+}
+
 func requireGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -295,4 +380,20 @@ func assertFileContent(t *testing.T, path, want string) {
 func repositoryKeyForTest(repoURI string) string {
 	sum := sha256.Sum256([]byte(repoURI))
 	return hex.EncodeToString(sum[:])
+}
+
+func pathWithinForTest(root, candidate string) error {
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	candidate, err = filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("path escapes root")
+	}
+	return nil
 }

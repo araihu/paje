@@ -29,6 +29,7 @@ const (
 
 type attemptRecord struct {
 	state            executor.State
+	receipt          *executor.ChildStartReceipt
 	cancelRequested  bool
 	destroyRequested bool
 	destroyRecorded  bool
@@ -73,6 +74,11 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 	if err := target.ValidateProfile(request.Profile); err != nil {
 		return executor.Result{}, err
 	}
+	document, err := newBootstrapDocument(request)
+	if err != nil {
+		return executor.Result{}, err
+	}
+	expectedReceipt := document.ChildStartReceipt.Clone()
 
 	key := request.Attempt.Key()
 	record := &attemptRecord{state: executor.StateAbsent}
@@ -131,7 +137,8 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 		}
 	}
 
-	options, err := containerOptions(request, networkName)
+	containerLabels := boundContainerLabels(request.Attempt, expectedReceipt)
+	options, err := containerOptions(request, networkName, containerLabels)
 	if err != nil {
 		return executor.Result{}, target.cleanupCreateFailure(request.Attempt, "", networkID,
 			wrapProvider("input", "container_config", err))
@@ -140,7 +147,12 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 		return executor.Result{}, target.cleanupCreateFailure(request.Attempt, "", networkID,
 			lifecycleRequestedError())
 	}
-	containerID, err := target.createContainer(ctx, options, attemptLabels(request.Attempt, resourceContainer))
+	containerID, err := target.createContainer(
+		ctx,
+		options,
+		attemptLabels(request.Attempt, resourceContainer),
+		expectedReceipt,
+	)
 	if err != nil {
 		if isAmbiguousAttempt(err) {
 			target.markAmbiguous(key, record)
@@ -159,7 +171,7 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 			lifecycleRequestedError())
 	}
 
-	archive, err := buildArchive(request)
+	archive, err := buildArchiveForDocument(request, document)
 	if err != nil {
 		return result, target.cleanupCreateFailure(request.Attempt, containerID, networkID,
 			wrapProvider("environment", "materialize", err))
@@ -185,8 +197,7 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 		archive.Destroy()
 		_ = attached.Close()
 		_, _, _, _, _ = capture.finish(target.killTimeout)
-		return result, target.cleanupCreateFailure(request.Attempt, containerID, networkID,
-			lifecycleRequestedError())
+		return result, lifecycleRequestedError()
 	}
 	startErr := target.engine.StartContainer(executionCtx, containerID)
 	if startErr != nil {
@@ -195,12 +206,17 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 		_ = attached.Close()
 		stdout, stderr, stdoutTruncated, stderrTruncated, _ := capture.finish(target.killTimeout)
 		setOutput(&result, stdout, stderr, stdoutTruncated, stderrTruncated, request.Secrets)
-		reconciled := target.reconcileStartFailure(executionCtx, request.Attempt, containerID, startErr)
+		bootstrapStarted, reconciled := target.reconcileStartFailure(executionCtx, request.Attempt, containerID, startErr)
+		result.BootstrapStarted = bootstrapStarted
 		if isAmbiguousAttempt(reconciled) {
 			target.setState(key, record, executor.StateUnknown)
+		} else if bootstrapStarted {
+			target.setState(key, record, executor.StateBootstrapStarted)
 		}
 		return result, reconciled
 	}
+	result.BootstrapStarted = true
+	target.setState(key, record, executor.StateBootstrapStarted)
 	if target.lifecycleRequested(key, record) {
 		archive.Destroy()
 		_ = attached.Close()
@@ -210,22 +226,63 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 	}
 	deliveryErr := deliverBootstrap(executionCtx, attached, archive)
 	archive.Destroy()
-	if deliveryErr != nil {
+	receipt, receiptErr := target.waitForChildStart(executionCtx, containerID, expectedReceipt)
+	if receiptErr != nil && (executionCtx.Err() != nil || target.lifecycleRequested(key, record)) {
+		recoveryCtx, recoveryCancel := target.lifecycleContext()
+		recoveredReceipt, recoveryErr := target.waitForChildStart(recoveryCtx, containerID, expectedReceipt)
+		recoveryCancel()
+		if recoveryErr == nil {
+			receipt = recoveredReceipt
+			receiptErr = nil
+		} else {
+			receiptErr = errors.Join(receiptErr, recoveryErr)
+		}
+	}
+	if receiptErr != nil {
 		result.Duration = time.Since(startedAt)
 		_ = attached.Close()
 		stdout, stderr, stdoutTruncated, stderrTruncated, logErr := capture.finish(target.killTimeout)
 		setOutput(&result, stdout, stderr, stdoutTruncated, stderrTruncated, request.Secrets)
+		if target.lifecycleRequested(key, record) {
+			return result, target.cleanupCreateFailure(request.Attempt, containerID, networkID,
+				lifecycleRequestedError())
+		}
 		target.setState(key, record, executor.StateUnknown)
-		return result, ambiguousAttempt(errors.Join(deliveryErr, logErr))
+		return result, ambiguousAttempt(errors.Join(deliveryErr, receiptErr, logErr))
+	}
+	result.Started = true
+	result.ChildStartReceipt = &receipt
+	target.rememberChildStart(key, record, receipt)
+	acknowledgementCtx := executionCtx
+	acknowledgementCancel := func() {}
+	if executionCtx.Err() != nil || target.lifecycleRequested(key, record) {
+		acknowledgementCtx, acknowledgementCancel = target.lifecycleContext()
+	}
+	acknowledgementErr := target.engine.SignalContainer(acknowledgementCtx, containerID, "SIGUSR1")
+	acknowledgementCancel()
+	if acknowledgementErr != nil {
+		result.Duration = time.Since(startedAt)
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(), target.stopTimeout+target.killTimeout+time.Second,
+		)
+		cancelErr := target.Cancel(cleanupCtx, request.Attempt)
+		cleanupCancel()
+		_ = attached.Close()
+		stdout, stderr, stdoutTruncated, stderrTruncated, logErr := capture.finish(target.killTimeout)
+		setOutput(&result, stdout, stderr, stdoutTruncated, stderrTruncated, request.Secrets)
+		target.setState(key, record, executor.StateUnknown)
+		return result, ambiguousAttempt(errors.Join(
+			acknowledgementErr,
+			cancelErr,
+			logErr,
+			errors.New("Docker child-start receipt acknowledgement is uncertain"),
+		))
 	}
 	if target.lifecycleRequested(key, record) {
 		_ = attached.Close()
 		_, _, _, _, _ = capture.finish(target.killTimeout)
-		return result, target.cleanupCreateFailure(request.Attempt, containerID, networkID,
-			lifecycleRequestedError())
+		return result, lifecycleRequestedError()
 	}
-	result.Started = true
-	target.setState(key, record, executor.StateRunning)
 
 	exitCode, waitErr := target.engine.WaitContainer(executionCtx, containerID)
 	if waitErr == nil && executionCtx.Err() != nil {
@@ -285,39 +342,139 @@ func (target *Executor) Inspect(ctx context.Context, attempt executor.AttemptID)
 	if len(containers) == 0 {
 		target.mu.Lock()
 		record := target.attempts[key]
-		state := executor.StateAbsent
-		if record != nil {
-			state = record.state
-		}
-		target.mu.Unlock()
-		if record == nil {
-			return executor.StateAbsent, nil
-		}
-		if state == executor.StateDestroyed {
+		if record != nil && record.state == executor.StateDestroyed {
+			target.mu.Unlock()
 			return executor.StateDestroyed, nil
 		}
-		if state != executor.StateAbsent {
-			return executor.StateUnknown, nil
+		if record == nil {
+			record = &attemptRecord{}
+			target.attempts[key] = record
 		}
-		return executor.StateAbsent, nil
+		record.state = executor.StateUnknown
+		record.cleanupRequired = true
+		target.mu.Unlock()
+		return executor.StateUnknown, ambiguousAttempt(
+			errors.New("Docker attempt identity is missing without conclusive non-start proof"),
+		)
 	}
-	state, err := target.engine.InspectContainer(ctx, containers[0].ID)
+	container := containers[0]
+	state, err := target.engine.InspectContainer(ctx, container.ID)
 	if providerNotFound(err) {
-		return executor.StateUnknown, nil
+		target.rememberAmbiguousInspection(key)
+		return executor.StateUnknown, ambiguousAttempt(
+			errors.New("Docker container disappeared after exact attempt discovery"),
+		)
 	}
 	if err != nil {
 		return executor.StateUnknown, wrapProvider("internal", "inspect", err)
 	}
-	mapped, ok := mapContainerState(state)
-	if !ok {
+	if state == engineContainerCreated {
+		target.rememberInspectedState(key, executor.StateResourceCreated)
+		return executor.StateResourceCreated, nil
+	}
+	receipt, receiptErr := target.readChildStartReceipt(ctx, container.ID)
+	if receiptErr != nil {
+		target.mu.Lock()
+		known := target.attempts[key]
+		knownState := executor.StateAbsent
+		var observed *executor.ChildStartReceipt
+		if known != nil {
+			knownState = known.state
+			if known.receipt != nil {
+				cloned := known.receipt.Clone()
+				observed = &cloned
+			}
+		}
+		target.mu.Unlock()
+		if state == engineContainerExited && knownState == executor.StateTerminalComplete && observed != nil {
+			if observed.Attempt.Key() != attempt.Key() || !observed.Matches(*observed) {
+				target.rememberInspectedState(key, executor.StateUnknown)
+				return executor.StateUnknown, ambiguousAttempt(errors.New("cached Docker child-start receipt is invalid"))
+			}
+			if err := validateReceiptLabels(container, *observed); err != nil {
+				target.rememberInspectedState(key, executor.StateUnknown)
+				return executor.StateUnknown, ambiguousAttempt(err)
+			}
+			return executor.StateTerminalComplete, nil
+		}
+		if providerNotFound(receiptErr) && knownState == executor.StateBootstrapStarted &&
+			(state == engineContainerRunning || state == engineContainerPaused || state == engineContainerRestarting) {
+			return executor.StateBootstrapStarted, nil
+		}
+		target.rememberInspectedState(key, executor.StateUnknown)
+		return executor.StateUnknown, ambiguousAttempt(errors.Join(
+			receiptErr,
+			errors.New("Docker child-start receipt cannot be validated"),
+		))
+	}
+	if receipt.Attempt.Key() != attempt.Key() {
+		target.rememberInspectedState(key, executor.StateUnknown)
+		return executor.StateUnknown, ambiguousAttempt(errors.New("Docker child-start receipt attempt was rebound"))
+	}
+	if err := validateReceiptLabels(container, receipt); err != nil {
+		target.rememberInspectedState(key, executor.StateUnknown)
+		return executor.StateUnknown, ambiguousAttempt(err)
+	}
+	var mapped executor.State
+	switch state {
+	case engineContainerRunning, engineContainerPaused, engineContainerRestarting:
+		mapped = executor.StateChildStarted
+	case engineContainerExited:
+		target.mu.Lock()
+		known := target.attempts[key]
+		knownTerminal := known != nil && known.state == executor.StateTerminalComplete
+		target.mu.Unlock()
+		if !knownTerminal {
+			target.rememberInspectedState(key, executor.StateUnknown)
+			return executor.StateUnknown, ambiguousAttempt(
+				errors.New("Docker terminal state is not bound to an observed declared-child exit"),
+			)
+		}
+		mapped = executor.StateTerminalComplete
+	case engineContainerDead, engineContainerRemoving:
+		target.rememberInspectedState(key, executor.StateUnknown)
+		return executor.StateUnknown, ambiguousAttempt(errors.New("Docker container terminal state is uncertain"))
+	default:
 		return executor.StateUnknown, wrapProvider("internal", "malformed_state", errors.New("unsupported Docker container state"))
 	}
+	target.rememberInspectedState(key, mapped)
+	return mapped, nil
+}
+
+func (target *Executor) rememberInspectedState(key string, state executor.State) {
 	target.mu.Lock()
 	if record := target.attempts[key]; record != nil && record.state != executor.StateDestroyed {
-		record.state = mapped
+		record.state = state
 	}
 	target.mu.Unlock()
-	return mapped, nil
+}
+
+func (target *Executor) rememberAmbiguousInspection(key string) {
+	target.mu.Lock()
+	record := target.attempts[key]
+	if record == nil {
+		record = &attemptRecord{}
+		target.attempts[key] = record
+	}
+	if record.state != executor.StateDestroyed {
+		record.state = executor.StateUnknown
+		record.cleanupRequired = true
+	}
+	target.mu.Unlock()
+}
+
+func (target *Executor) rememberChildStart(
+	key string,
+	expected *attemptRecord,
+	receipt executor.ChildStartReceipt,
+) {
+	target.mu.Lock()
+	if target.attempts[key] == expected && expected.state != executor.StateDestroyed {
+		cloned := receipt.Clone()
+		expected.receipt = &cloned
+		expected.state = executor.StateChildStarted
+	}
+	target.mu.Unlock()
 }
 
 func (target *Executor) Cancel(ctx context.Context, attempt executor.AttemptID) error {
@@ -337,8 +494,9 @@ func (target *Executor) Cancel(ctx context.Context, attempt executor.AttemptID) 
 		record = &attemptRecord{state: executor.StateAbsent}
 		target.attempts[key] = record
 	}
-	record.cancelRequested = true
+	alreadyRequested := record.cancelRequested || record.destroyRequested
 	knownState := record.state
+	record.cancelRequested = true
 	target.mu.Unlock()
 
 	containers, err := target.exactContainers(ctx, attemptLabels(attempt, resourceContainer))
@@ -346,9 +504,13 @@ func (target *Executor) Cancel(ctx context.Context, attempt executor.AttemptID) 
 		return err
 	}
 	if len(containers) == 0 {
-		if knownState == executor.StateRunning || knownState == executor.StateUnknown {
+		// Cancel's desired terminal condition is resource absence. Another
+		// concurrent cancellation/compensation may have removed the exact
+		// attempt between calls, so absence is an idempotent success here even
+		// though Inspect would preserve ambiguity for recovery decisions.
+		if !alreadyRequested && (knownState == executor.StateChildStarted || knownState == executor.StateUnknown) {
 			return wrapProvider("internal", "ambiguous_attempt",
-				errors.New("known running Docker attempt resource disappeared"))
+				errors.New("known started Docker attempt resource disappeared"))
 		}
 		return nil
 	}
@@ -422,6 +584,9 @@ func (target *Executor) Destroy(ctx context.Context, attempt executor.AttemptID)
 	record.destroyRequested = true
 	cleanupRequired := record.cleanupRequired
 	target.mu.Unlock()
+	if err := target.Cancel(ctx, attempt); err != nil {
+		return err
+	}
 
 	window := time.Duration(0)
 	if cleanupRequired {
@@ -546,6 +711,7 @@ func (target *Executor) createContainer(
 	ctx context.Context,
 	options client.ContainerCreateOptions,
 	labels map[string]string,
+	expectedReceipt executor.ChildStartReceipt,
 ) (string, error) {
 	id, createErr := target.engine.CreateContainer(ctx, options)
 	if createErr == nil && id != "" {
@@ -565,6 +731,9 @@ func (target *Executor) createContainer(
 		return "", ambiguousAttempt(errors.Join(createErr, discoveryErr))
 	}
 	if len(containers) == 1 {
+		if err := validateReceiptLabels(containers[0], expectedReceipt); err != nil {
+			return "", ambiguousAttempt(errors.Join(createErr, err))
+		}
 		state, inspectErr := target.engine.InspectContainer(ctx, containers[0].ID)
 		if inspectErr != nil || state != engineContainerCreated {
 			return "", ambiguousAttempt(errors.Join(createErr, inspectErr,
@@ -586,17 +755,18 @@ func (target *Executor) reconcileStartFailure(
 	attempt executor.AttemptID,
 	containerID string,
 	startErr error,
-) error {
+) (bool, error) {
 	containers, discoveryErr := target.exactContainers(ctx, attemptLabels(attempt, resourceContainer))
 	if discoveryErr != nil || len(containers) != 1 || containers[0].ID != containerID {
-		return ambiguousAttempt(errors.Join(startErr, discoveryErr,
+		return false, ambiguousAttempt(errors.Join(startErr, discoveryErr,
 			errors.New("Docker container start outcome cannot be reconciled")))
 	}
 	state, inspectErr := target.engine.InspectContainer(ctx, containerID)
 	if inspectErr == nil && state == engineContainerCreated {
-		return wrapProvider("environment", "start", startErr)
+		return false, wrapProvider("environment", "start", startErr)
 	}
-	return ambiguousAttempt(errors.Join(startErr, inspectErr,
+	started := inspectErr == nil && state != engineContainerCreated
+	return started, ambiguousAttempt(errors.Join(startErr, inspectErr,
 		errors.New("Docker container may have started")))
 }
 
@@ -667,6 +837,13 @@ func (target *Executor) lifecycleRequested(key string, expected *attemptRecord) 
 	record := target.attempts[key]
 	return record != expected || record.cancelRequested || record.destroyRequested ||
 		record.state == executor.StateDestroyed
+}
+
+func (target *Executor) lifecycleContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(
+		context.Background(),
+		target.stopTimeout+target.killTimeout+time.Second,
+	)
 }
 
 func (target *Executor) releaseReservation(key string, expected *attemptRecord) {
@@ -757,6 +934,10 @@ func (target *Executor) markDestroyedLocked(key string, record *attemptRecord) {
 		return
 	}
 	record.state = executor.StateDestroyed
+	if record.receipt != nil {
+		*record.receipt = executor.ChildStartReceipt{}
+		record.receipt = nil
+	}
 	if record.destroyRecorded {
 		return
 	}
@@ -765,7 +946,7 @@ func (target *Executor) markDestroyedLocked(key string, record *attemptRecord) {
 	target.trimDestroyedHistory()
 }
 
-func containerOptions(request executor.Request, networkName string) (client.ContainerCreateOptions, error) {
+func containerOptions(request executor.Request, networkName string, labels map[string]string) (client.ContainerCreateOptions, error) {
 	platform, err := parsePlatform(request.Profile.Runtime.Platform)
 	if err != nil {
 		return client.ContainerCreateOptions{}, err
@@ -783,7 +964,7 @@ func containerOptions(request executor.Request, networkName string) (client.Cont
 			Entrypoint:   []string{"/usr/local/bin/paje-sandbox-init"},
 			Cmd:          []string{"--bootstrap-stdin"},
 			WorkingDir:   "/",
-			Labels:       attemptLabels(request.Attempt, resourceContainer),
+			Labels:       cloneStringMap(labels),
 		},
 		HostConfig: &container.HostConfig{
 			LogConfig:      container.LogConfig{Type: "none"},

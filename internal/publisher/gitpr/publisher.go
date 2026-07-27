@@ -407,7 +407,7 @@ func publisherVerificationAttemptKey(identity executor.AttemptID, index int) str
 
 func publisherSandboxEnvironment() map[string]string {
 	return map[string]string{
-		"HOME": "/home/paje", "PATH": "/usr/local/bin:/usr/bin:/bin", "TMPDIR": "/tmp",
+		"HOME": "/home/paje", "PATH": "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin", "TMPDIR": "/tmp",
 	}
 }
 

@@ -44,7 +44,7 @@ func TestPublisherVerifiesPersistedProfileInSecretFreeSandboxBeforeCredentials(t
 		}
 		if len(request.Secrets) != 0 || len(request.Environment) != 3 ||
 			request.Environment["HOME"] != "/home/paje" ||
-			request.Environment["PATH"] != "/usr/local/bin:/usr/bin:/bin" ||
+			request.Environment["PATH"] != "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" ||
 			request.Environment["TMPDIR"] != "/tmp" {
 			t.Errorf("verification request carries ambient values or secrets: %#v", request)
 		}

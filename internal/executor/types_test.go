@@ -159,17 +159,35 @@ func TestRequestCloneDefensivelyCopiesAndDestroyClearsSecrets(t *testing.T) {
 }
 
 func TestResultCloneAndSafeFactsDoNotAlias(t *testing.T) {
+	receipt, err := NewRandomChildStartReceipt(
+		validAttemptID(),
+		Command{Executable: "go", Args: []string{"version"}, Directory: SandboxWorkspaceRoot},
+		map[string]string{"PATH": CanonicalSandboxPATH},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	result := Result{
 		Created: true, Started: true, Completed: true, ExitCode: 0,
 		Stdout: []byte("out"), Stderr: []byte("err"),
-		SafeFacts: map[string]string{"certified": "false"},
+		SafeFacts: map[string]string{"certified": "false"}, ChildStartReceipt: &receipt,
 	}
 	clone := result.Clone()
 	clone.Stdout[0] = 'X'
 	clone.Stderr[0] = 'Y'
 	clone.SafeFacts["certified"] = "true"
+	clone.ChildStartReceipt.Challenge = strings.Repeat("f", 64)
 	if string(result.Stdout) != "out" || string(result.Stderr) != "err" || result.SafeFacts["certified"] != "false" {
 		t.Fatal("Result.Clone aliases caller-owned values")
+	}
+	if result.ChildStartReceipt.Challenge == clone.ChildStartReceipt.Challenge {
+		t.Fatal("Result.Clone aliases child-start receipt")
+	}
+	originalReceipt := result.ChildStartReceipt
+	result.Destroy()
+	if result.ChildStartReceipt != nil || !reflect.DeepEqual(*originalReceipt, ChildStartReceipt{}) {
+		t.Fatal("Result.Destroy retained private child-start receipt")
 	}
 }
 
@@ -334,7 +352,7 @@ func validHostRequest(t *testing.T) Request {
 			Environment: map[string]string{"GOWORK": "off"},
 		},
 		Workspace:   Workspace{HostPath: t.TempDir(), SandboxPath: "/workspace", Writable: true},
-		Environment: map[string]string{"PATH": "/usr/bin:/bin"},
+		Environment: map[string]string{"PATH": CanonicalSandboxPATH},
 		Timeout:     time.Minute,
 		OutputLimit: 1 << 20,
 	}
@@ -419,7 +437,15 @@ func validHostProfile(t *testing.T) workerprofile.Snapshot {
 }
 
 func TestStateValidationCoversStableLifecycle(t *testing.T) {
-	want := []State{StateAbsent, StateCreated, StateRunning, StateCompleted, StateDestroyed, StateUnknown}
+	want := []State{
+		StateAbsent,
+		StateResourceCreated,
+		StateBootstrapStarted,
+		StateChildStarted,
+		StateTerminalComplete,
+		StateDestroyed,
+		StateUnknown,
+	}
 	for _, state := range want {
 		if err := state.Validate(); err != nil {
 			t.Fatalf("state %q rejected: %v", state, err)
@@ -430,5 +456,120 @@ func TestStateValidationCoversStableLifecycle(t *testing.T) {
 	}
 	if !reflect.DeepEqual(want, StableStates()) {
 		t.Fatalf("StableStates() = %#v", StableStates())
+	}
+}
+
+func TestChildStartReceiptBindsAttemptCommandAndEnvironmentDeclaration(t *testing.T) {
+	attempt := validAttemptID()
+	command := Command{
+		Executable: "codex",
+		Args:       []string{"exec", "change the repository"},
+		Directory:  SandboxWorkspaceRoot,
+		Environment: map[string]string{
+			"GOWORK": "off",
+		},
+	}
+	environment := map[string]string{
+		"HOME": "/home/paje",
+		"PATH": CanonicalSandboxPATH,
+	}
+	environmentFiles := map[string]string{
+		"CODEX_TOKEN": "/run/paje/secrets/environment/token",
+	}
+	challenge := strings.Repeat("a", 64)
+
+	receipt, err := NewChildStartReceipt(attempt, command, environment, environmentFiles, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("receipt validation failed: %v", err)
+	}
+	if receipt.Attempt != attempt || receipt.Command.Executable != "codex" ||
+		!reflect.DeepEqual(receipt.Command.Args, command.Args) ||
+		receipt.Command.Directory != SandboxWorkspaceRoot ||
+		receipt.CommandDigest == "" || receipt.EnvironmentDigest == "" ||
+		receipt.Challenge != challenge || receipt.BindingDigest() == "" {
+		t.Fatalf("receipt = %#v", receipt)
+	}
+
+	tests := map[string]func(*AttemptID, *Command, map[string]string, map[string]string, *string){
+		"attempt": func(attempt *AttemptID, _ *Command, _ map[string]string, _ map[string]string, _ *string) {
+			attempt.Sequence++
+		},
+		"executable": func(_ *AttemptID, command *Command, _ map[string]string, _ map[string]string, _ *string) {
+			command.Executable = "go"
+		},
+		"argument": func(_ *AttemptID, command *Command, _ map[string]string, _ map[string]string, _ *string) {
+			command.Args[1] = "different"
+		},
+		"baseline environment": func(_ *AttemptID, _ *Command, environment map[string]string, _ map[string]string, _ *string) {
+			environment["HOME"] = "/different"
+		},
+		"command environment": func(_ *AttemptID, command *Command, _ map[string]string, _ map[string]string, _ *string) {
+			command.Environment["GOWORK"] = "on"
+		},
+		"environment materialization": func(_ *AttemptID, _ *Command, _ map[string]string, environmentFiles map[string]string, _ *string) {
+			environmentFiles["CODEX_TOKEN"] = "/run/paje/secrets/environment/other"
+		},
+		"challenge": func(_ *AttemptID, _ *Command, _ map[string]string, _ map[string]string, challenge *string) {
+			*challenge = strings.Repeat("b", 64)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			otherAttempt := attempt
+			otherCommand := command.Clone()
+			otherEnvironment := cloneMap(environment)
+			otherEnvironmentFiles := cloneMap(environmentFiles)
+			otherChallenge := challenge
+			mutate(&otherAttempt, &otherCommand, otherEnvironment, otherEnvironmentFiles, &otherChallenge)
+			other, err := NewChildStartReceipt(
+				otherAttempt,
+				otherCommand,
+				otherEnvironment,
+				otherEnvironmentFiles,
+				otherChallenge,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Matches(other) {
+				t.Fatalf("receipt matched rebound %s declaration", name)
+			}
+		})
+	}
+}
+
+func TestRequestDeclarationRejectsEnvironmentSecretCollisionBeforeAcquire(t *testing.T) {
+	request := validEnvironmentSecretRequest(t)
+	request.Destroy()
+	request.Environment["WORKLOAD_TOKEN"] = "non-secret-caller-value"
+
+	if err := request.ValidateDeclaration(); err == nil {
+		t.Fatal("pre-acquire declaration accepted environment materialization collision")
+	}
+}
+
+func TestRequestDeclarationRequiresCanonicalSandboxPATHBeforeAcquire(t *testing.T) {
+	for name, mutate := range map[string]func(*Request){
+		"missing": func(request *Request) {
+			delete(request.Environment, "PATH")
+		},
+		"arbitrary": func(request *Request) {
+			request.Environment["PATH"] = "/tmp/paje-untrusted-bin"
+		},
+		"command override": func(request *Request) {
+			request.Command.Environment["PATH"] = CanonicalSandboxPATH
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := validHostRequest(t)
+			defer request.Destroy()
+			mutate(&request)
+			if err := request.ValidateDeclaration(); err == nil {
+				t.Fatal("pre-acquire declaration accepted noncanonical PATH")
+			}
+		})
 	}
 }

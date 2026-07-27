@@ -2,6 +2,7 @@ package executor
 
 import (
 	"errors"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 
 const (
 	SandboxWorkspaceRoot = "/workspace"
+	CanonicalSandboxPATH = "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin"
 
 	maxArgumentCount   = 256
 	maxArgumentBytes   = 1 << 16
@@ -43,6 +45,16 @@ func (id AttemptID) Validate() error {
 }
 
 func (request Request) Validate() error {
+	if err := request.ValidateDeclaration(); err != nil {
+		return err
+	}
+	return validateSecrets(request)
+}
+
+// ValidateDeclaration checks every command, environment, profile target, and
+// materialization declaration without requiring acquired secret bytes. A
+// caller can therefore fail closed before its first broker Acquire.
+func (request Request) ValidateDeclaration() error {
 	if err := request.Attempt.Validate(); err != nil {
 		return err
 	}
@@ -59,6 +71,9 @@ func (request Request) Validate() error {
 	if err := validateEnvironment(request.Environment); err != nil {
 		return err
 	}
+	if request.Environment["PATH"] != CanonicalSandboxPATH {
+		return errors.New("executor request requires exact canonical PATH")
+	}
 	if environmentBytes(request.Environment)+environmentBytes(request.Command.Environment) > maxEnvironmentByte {
 		return errors.New("executor environment is too large")
 	}
@@ -70,7 +85,22 @@ func (request Request) Validate() error {
 	if request.Timeout <= 0 || request.Timeout > maxExecutionTime || request.OutputLimit <= 0 || request.OutputLimit > maxOutputBytes {
 		return errors.New("executor request limits are invalid")
 	}
-	return validateSecrets(request)
+	return validateSecretDeclarations(request)
+}
+
+func validateSecretDeclarations(request Request) error {
+	for _, requirement := range request.Profile.Secrets {
+		if requirement.Delivery != workerprofile.DeliveryEnvironment {
+			continue
+		}
+		if _, collision := request.Environment[requirement.Target]; collision {
+			return errors.New("executor secret environment target collides with baseline environment")
+		}
+		if _, collision := request.Command.Environment[requirement.Target]; collision {
+			return errors.New("executor secret environment target collides with command environment")
+		}
+	}
+	return nil
 }
 
 func validateWorkspace(workspace Workspace) error {
@@ -166,6 +196,32 @@ func validateSecrets(request Request) error {
 		if !found {
 			return errors.New("executor secret materialization is not declared by profile")
 		}
+	}
+	return nil
+}
+
+func validateEnvironmentFileDeclarations(
+	environment map[string]string,
+	commandEnvironment map[string]string,
+	files map[string]string,
+) error {
+	seen := make(map[string]struct{}, len(files))
+	for key, file := range files {
+		if !environmentPattern.MatchString(key) || file == "" || strings.IndexByte(file, 0) >= 0 ||
+			!strings.HasPrefix(file, "/") || path.Clean(file) != file ||
+			!pathWithin("/run/paje/secrets", file) || file == "/run/paje/secrets" {
+			return errors.New("child-start environment materialization declaration is invalid")
+		}
+		if _, collision := environment[key]; collision {
+			return errors.New("child-start environment materialization collides with baseline")
+		}
+		if _, collision := commandEnvironment[key]; collision {
+			return errors.New("child-start environment materialization collides with command environment")
+		}
+		if _, duplicate := seen[file]; duplicate {
+			return errors.New("child-start environment materialization path is duplicated")
+		}
+		seen[file] = struct{}{}
 	}
 	return nil
 }

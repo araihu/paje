@@ -75,7 +75,7 @@ func TestPrivateArchiveContainsCommandAndPrivateSecretMaterial(t *testing.T) {
 	if document.Command.Executable != "codex" ||
 		!slices.Equal(document.Command.Args, []string{"exec", "task"}) ||
 		document.Command.Environment["CODEX_HOME"] != "/home/paje" ||
-		document.Environment["PATH"] != "/usr/local/bin:/usr/bin:/bin" {
+		document.Environment["PATH"] != executor.CanonicalSandboxPATH {
 		t.Fatalf("command document = %#v", document)
 	}
 	environmentFile := document.EnvironmentFiles["WORKLOAD_TOKEN"]
@@ -206,7 +206,7 @@ func TestInspectTreatsPostStartDisappearanceAsUnknown(t *testing.T) {
 	api.containerExists = false
 	api.mu.Unlock()
 	state, err := target.Inspect(context.Background(), request.Attempt)
-	if err != nil || state != executor.StateUnknown {
+	if providerCause(err) != "ambiguous_attempt" || state != executor.StateUnknown {
 		t.Fatalf("Inspect() after disappearance = %q, %v", state, err)
 	}
 }

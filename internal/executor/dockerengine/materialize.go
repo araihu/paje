@@ -46,11 +46,103 @@ func (archive *privateArchive) Destroy() {
 	archive.bytes = nil
 }
 
-func buildArchive(request executor.Request) (_ *privateArchive, returnedErr error) {
+func buildArchive(request executor.Request) (*privateArchive, error) {
+	if err := preflightMaterializationBounds(request.Secrets); err != nil {
+		return nil, err
+	}
+	document, err := newBootstrapDocument(request)
+	if err != nil {
+		return nil, err
+	}
+	return buildArchiveForDocument(request, document)
+}
+
+// preflightMaterializationBounds rejects oversized retained material before
+// allocating the randomized bootstrap declaration or cloning any rejected
+// secret payload. buildArchiveForDocument repeats the accounting while it
+// constructs the archive so callers that already have a bound document remain
+// protected by the same limits.
+func preflightMaterializationBounds(materializations []secret.Materialization) error {
+	if len(materializations) > sandboxinit.MaxBootstrapEntries-1 {
+		return errors.New("private Docker archive has too many materializations")
+	}
+	remainingEntries := sandboxinit.MaxBootstrapEntries - 1
+	remainingBytes := int64(sandboxinit.MaxBootstrapArchiveBytes - sandboxinit.MaxDocumentBytes)
+	for _, materialization := range materializations {
+		switch materialization.Delivery() {
+		case workerprofile.DeliveryFile, workerprofile.DeliveryEnvironment:
+			if remainingEntries <= 0 {
+				return errors.New("private Docker archive has too many entries")
+			}
+			value, err := materialization.ValueBounded(min(remainingBytes, int64(sandboxinit.MaxBootstrapEntryBytes)))
+			if err != nil {
+				return err
+			}
+			remainingEntries--
+			remainingBytes -= int64(len(value))
+			clear(value)
+		case workerprofile.DeliveryDirectory:
+			if remainingEntries <= 1 {
+				return errors.New("private Docker archive has too many entries")
+			}
+			remainingEntries--
+			files, err := materialization.FilesBounded(
+				remainingEntries, remainingBytes, sandboxinit.MaxBootstrapEntryBytes,
+			)
+			if err != nil {
+				return err
+			}
+			remainingEntries -= len(files)
+			for index := range files {
+				contents := files[index].Bytes()
+				remainingBytes -= int64(len(contents))
+				clear(contents)
+			}
+			zeroSecretFiles(files)
+		default:
+			return errors.New("unsupported Docker secret materialization")
+		}
+	}
+	return nil
+}
+
+func newBootstrapDocument(request executor.Request) (sandboxinit.Document, error) {
+	if request.Environment["PATH"] != executor.CanonicalSandboxPATH {
+		return sandboxinit.Document{}, errors.New("sandbox command exact canonical PATH is required")
+	}
+	if _, collision := request.Command.Environment["PATH"]; collision {
+		return sandboxinit.Document{}, errors.New("sandbox command cannot override canonical PATH")
+	}
 	document := sandboxinit.Document{
 		WorkspaceRoot: executor.SandboxWorkspaceRoot,
 		Command:       request.Command.Clone(),
 		Environment:   cloneStringMap(request.Environment),
+	}
+	for _, materialization := range request.Secrets {
+		if materialization.Delivery() != workerprofile.DeliveryEnvironment {
+			continue
+		}
+		if document.EnvironmentFiles == nil {
+			document.EnvironmentFiles = make(map[string]string)
+		}
+		document.EnvironmentFiles[materialization.Target()] = environmentMaterializationPath(materialization.Target())
+	}
+	receipt, err := executor.NewRandomChildStartReceipt(
+		request.Attempt,
+		document.Command,
+		document.Environment,
+		document.EnvironmentFiles,
+	)
+	if err != nil {
+		return sandboxinit.Document{}, err
+	}
+	document.ChildStartReceipt = receipt
+	return document, nil
+}
+
+func buildArchiveForDocument(request executor.Request, document sandboxinit.Document) (_ *privateArchive, returnedErr error) {
+	if err := document.Validate(); err != nil {
+		return nil, err
 	}
 	if len(request.Secrets) > sandboxinit.MaxBootstrapEntries-1 {
 		return nil, errors.New("private Docker archive has too many materializations")
@@ -105,11 +197,10 @@ func buildArchive(request executor.Request) (_ *privateArchive, returnedErr erro
 			}
 			remainingBytes -= int64(len(value))
 		case workerprofile.DeliveryEnvironment:
-			if document.EnvironmentFiles == nil {
-				document.EnvironmentFiles = make(map[string]string)
-			}
 			file := environmentMaterializationPath(materialization.Target())
-			document.EnvironmentFiles[materialization.Target()] = file
+			if document.EnvironmentFiles[materialization.Target()] != file {
+				return nil, errors.New("private Docker environment declaration drifted")
+			}
 			if remainingEntries <= 0 {
 				return nil, errors.New("private Docker archive has too many entries")
 			}
@@ -149,9 +240,6 @@ func buildArchive(request executor.Request) (_ *privateArchive, returnedErr erro
 		default:
 			return nil, errors.New("unsupported Docker secret materialization")
 		}
-	}
-	if err := document.Validate(); err != nil {
-		return nil, err
 	}
 	encodedDocument, err := json.Marshal(document)
 	if err != nil {

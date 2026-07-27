@@ -41,6 +41,7 @@ type Executor struct {
 	mu             sync.Mutex
 	attempts       map[string]*attemptRecord
 	destroyedOrder []string
+	resolve        func(string, string, map[string]string) (string, error)
 }
 
 func New(config Config) (*Executor, error) {
@@ -53,6 +54,7 @@ func New(config Config) (*Executor, error) {
 	return &Executor{
 		attempts:       make(map[string]*attemptRecord),
 		destroyedOrder: make([]string, 0, destroyedHistoryLimit),
+		resolve:        verification.ResolveExecutable,
 	}, nil
 }
 
@@ -105,7 +107,7 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 	}()
 
 	result = executor.Result{Created: true, SafeFacts: hostSafeFacts()}
-	directory, environment, executable, err := prepare(request)
+	directory, environment, executable, err := target.prepare(request)
 	if err != nil {
 		return result, executor.WrapError("environment", "prepare", err)
 	}
@@ -126,6 +128,15 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 	command.Env = environment
 	command.Stdout = stdout
 	command.Stderr = stderr
+	receipt, err := executor.NewRandomChildStartReceipt(
+		request.Attempt,
+		request.Command,
+		request.Environment,
+		nil,
+	)
+	if err != nil {
+		return result, executor.WrapError("internal", "receipt_binding", err)
+	}
 
 	startedAt := time.Now()
 	target.mu.Lock()
@@ -139,6 +150,7 @@ func (target *Executor) Execute(ctx context.Context, request executor.Request) (
 	if startErr == nil {
 		record.state = executor.StateRunning
 		result.Started = true
+		result.ChildStartReceipt = &receipt
 	}
 	target.mu.Unlock()
 	if startErr != nil {
@@ -271,7 +283,7 @@ func (target *Executor) Destroy(ctx context.Context, attempt executor.AttemptID)
 	return nil
 }
 
-func prepare(request executor.Request) (string, []string, string, error) {
+func (target *Executor) prepare(request executor.Request) (string, []string, string, error) {
 	workspace, err := filepath.EvalSymlinks(request.Workspace.HostPath)
 	if err != nil {
 		return "", nil, "", err
@@ -296,7 +308,10 @@ func prepare(request executor.Request) (string, []string, string, error) {
 		values[key] = value
 	}
 	environment := exactEnvironment(values)
-	executable, err := verification.ResolveExecutable(request.Command.Executable, directory, values)
+	if target.resolve == nil {
+		return "", nil, "", errors.New("host executable resolver is unavailable")
+	}
+	executable, err := target.resolve(request.Command.Executable, directory, values)
 	if err != nil {
 		return "", nil, "", err
 	}

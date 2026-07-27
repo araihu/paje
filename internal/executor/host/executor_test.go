@@ -176,7 +176,7 @@ func hostRequest(t *testing.T) executor.Request {
 			Executable: "paje-host-helper", Directory: executor.SandboxWorkspaceRoot,
 		},
 		Workspace:   executor.Workspace{HostPath: t.TempDir(), SandboxPath: executor.SandboxWorkspaceRoot, Writable: true},
-		Environment: map[string]string{"PATH": "/usr/bin:/bin"},
+		Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH},
 		Timeout:     5 * time.Second, OutputLimit: 1024,
 	}
 }

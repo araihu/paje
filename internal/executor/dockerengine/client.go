@@ -10,7 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/araihu/paje/internal/executil"
 	"github.com/araihu/paje/internal/executor"
+	"github.com/araihu/paje/internal/sandboxinit"
+	"github.com/containerd/errdefs"
+	"github.com/moby/moby/api/pkg/stdcopy"
 	mobyclient "github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -48,7 +52,8 @@ type pullRequest struct {
 }
 
 type engineContainer struct {
-	ID string
+	ID     string
+	Labels map[string]string
 }
 
 type engineNetwork struct {
@@ -77,6 +82,8 @@ type engineClient interface {
 	StartContainer(context.Context, string) error
 	WaitContainer(context.Context, string) (int64, error)
 	InspectContainer(context.Context, string) (engineContainerState, error)
+	CopyFile(context.Context, string, string, int64) ([]byte, error)
+	SignalContainer(context.Context, string, string) error
 	StopContainer(context.Context, string, time.Duration) error
 	KillContainer(context.Context, string) error
 	RemoveContainer(context.Context, string) error
@@ -206,7 +213,7 @@ func (engine *mobyEngine) ListContainers(ctx context.Context, labels map[string]
 	}
 	containers := make([]engineContainer, len(result.Items))
 	for index := range result.Items {
-		containers[index] = engineContainer{ID: result.Items[index].ID}
+		containers[index] = engineContainer{ID: result.Items[index].ID, Labels: cloneStringMap(result.Items[index].Labels)}
 	}
 	return containers, nil
 }
@@ -292,6 +299,56 @@ func (engine *mobyEngine) InspectContainer(ctx context.Context, id string) (engi
 	return engineContainerState(result.Container.State.Status), nil
 }
 
+func (engine *mobyEngine) CopyFile(ctx context.Context, id, sourcePath string, limit int64) ([]byte, error) {
+	if limit <= 0 || sourcePath != sandboxinit.ChildStartReceiptPath || !filepath.IsAbs(sourcePath) ||
+		filepath.Clean(sourcePath) != sourcePath || strings.IndexByte(sourcePath, 0) >= 0 {
+		return nil, errors.New("Docker copy limit is invalid")
+	}
+	created, err := engine.client.ExecCreate(ctx, id, mobyclient.ExecCreateOptions{
+		User:         "65532:65532",
+		AttachStdout: true,
+		AttachStderr: true,
+		Env:          []string{"LC_ALL=C"},
+		Cmd:          []string{"/usr/local/bin/paje-sandbox-init", "--emit-child-start-receipt"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if created.ID == "" {
+		return nil, errors.New("Docker receipt reader exec has no identity")
+	}
+	attached, err := engine.client.ExecAttach(ctx, created.ID, mobyclient.ExecAttachOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer attached.Close()
+	stdout, err := executil.NewLimitedBuffer(limit)
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := executil.NewLimitedBuffer(4096)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := stdcopy.StdCopy(stdout, stderr, attached.Reader); err != nil {
+		return nil, errors.New("read Docker private receipt")
+	}
+	inspected, err := engine.client.ExecInspect(ctx, created.ID, mobyclient.ExecInspectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if inspected.Running {
+		return nil, errors.New("Docker private receipt reader remains running")
+	}
+	if inspected.ExitCode == 1 {
+		return nil, errdefs.ErrNotFound
+	}
+	if inspected.ExitCode != 0 || stderr.Truncated() || len(stderr.Bytes()) != 0 || stdout.Truncated() {
+		return nil, errors.New("Docker private receipt reader failed")
+	}
+	return stdout.Bytes(), nil
+}
+
 func (engine *mobyEngine) StopContainer(ctx context.Context, id string, timeout time.Duration) error {
 	seconds := int(timeout / time.Second)
 	if timeout > 0 && timeout%time.Second != 0 {
@@ -301,9 +358,16 @@ func (engine *mobyEngine) StopContainer(ctx context.Context, id string, timeout 
 	return err
 }
 
-func (engine *mobyEngine) KillContainer(ctx context.Context, id string) error {
-	_, err := engine.client.ContainerKill(ctx, id, mobyclient.ContainerKillOptions{Signal: "SIGKILL"})
+func (engine *mobyEngine) SignalContainer(ctx context.Context, id, signal string) error {
+	if signal == "" || strings.IndexByte(signal, 0) >= 0 {
+		return errors.New("Docker container signal is invalid")
+	}
+	_, err := engine.client.ContainerKill(ctx, id, mobyclient.ContainerKillOptions{Signal: signal})
 	return err
+}
+
+func (engine *mobyEngine) KillContainer(ctx context.Context, id string) error {
+	return engine.SignalContainer(ctx, id, "SIGKILL")
 }
 
 func (engine *mobyEngine) RemoveContainer(ctx context.Context, id string) error {

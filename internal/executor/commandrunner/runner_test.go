@@ -20,7 +20,7 @@ import (
 func TestNewRejectsTypedNilExecutorAndNoncanonicalProfile(t *testing.T) {
 	config := Config{
 		Profile: commandProfile(t), Attempt: commandAttempt(), Workspace: t.TempDir(),
-		Environment: map[string]string{"PATH": "/usr/bin:/bin"}, OutputLimit: 1024,
+		Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH}, OutputLimit: 1024,
 	}
 	var typedNil *recordingExecutor
 	config.Executor = typedNil
@@ -54,7 +54,7 @@ func TestRunnerDestroysAndSuppressesSecretDetectedOutputEverywhere(t *testing.T)
 	}}
 	runner, err := New(Config{
 		Executor: target, Profile: commandProfile(t), Attempt: commandAttempt(),
-		Workspace: t.TempDir(), Environment: map[string]string{"PATH": "/usr/bin:/bin"}, OutputLimit: 1024,
+		Workspace: t.TempDir(), Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH}, OutputLimit: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestRunnerTranslatesRelativeCommandAndCleansOneShotSandbox(t *testing.T) {
 	}}
 	runner, err := New(Config{
 		Executor: target, Profile: commandProfile(t), Attempt: commandAttempt(),
-		Workspace: t.TempDir(), Environment: map[string]string{"PATH": "/usr/bin:/bin"},
+		Workspace: t.TempDir(), Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH},
 		OutputLimit: 1024, Writable: true,
 	})
 	if err != nil {
@@ -134,7 +134,7 @@ func TestRunnerCleanupFailureOverridesSuccess(t *testing.T) {
 	}
 	runner, err := New(Config{
 		Executor: target, Profile: commandProfile(t), Attempt: commandAttempt(),
-		Workspace: t.TempDir(), Environment: map[string]string{"PATH": "/usr/bin:/bin"}, OutputLimit: 1024,
+		Workspace: t.TempDir(), Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH}, OutputLimit: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ func TestRunnerDoesNotDestroyCollidingAttemptItDidNotCreate(t *testing.T) {
 	target := &recordingExecutor{err: executor.ErrAttemptExists}
 	runner, err := New(Config{
 		Executor: target, Profile: commandProfile(t), Attempt: commandAttempt(),
-		Workspace: t.TempDir(), Environment: map[string]string{"PATH": "/usr/bin:/bin"}, OutputLimit: 1024,
+		Workspace: t.TempDir(), Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH}, OutputLimit: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestRunnerDestroysAmbiguousAttemptWithoutCreatedEvidence(t *testing.T) {
 	}
 	runner, err := New(Config{
 		Executor: target, Profile: commandProfile(t), Attempt: commandAttempt(),
-		Workspace: t.TempDir(), Environment: map[string]string{"PATH": "/usr/bin:/bin"}, OutputLimit: 1024,
+		Workspace: t.TempDir(), Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH}, OutputLimit: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)

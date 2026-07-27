@@ -246,7 +246,7 @@ func TestBuildDependenciesKeepsPortableCodeChangeIndependentFromLegacyRunner(t *
 			sawHarnessProbe := false
 			sawAgent := false
 			for _, request := range requests {
-				if request.Environment["PATH"] != "/usr/local/bin:/usr/bin:/bin" ||
+				if request.Environment["PATH"] != "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" ||
 					request.Environment["CODEX_HOME"] != "" || request.Environment["LEGACY_ONLY"] != "" {
 					t.Errorf("portable request environment = %#v, want fixed secret-free sandbox baseline", request.Environment)
 				}

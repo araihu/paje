@@ -7,24 +7,112 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/araihu/paje/internal/executor"
 	"github.com/araihu/paje/internal/sandboxinit"
 )
 
+func TestRunDocumentUsesSupervisorReceiptAndPreservesChildExitStatus(t *testing.T) {
+	document := sandboxinit.Document{
+		WorkspaceRoot: executor.SandboxWorkspaceRoot,
+		Command: executor.Command{
+			Executable: "codex", Args: []string{"exec"}, Directory: executor.SandboxWorkspaceRoot,
+		},
+		Environment: map[string]string{"PATH": executor.CanonicalSandboxPATH},
+	}
+	attempt := executor.AttemptID{
+		RunID: "run-main-supervisor", Stage: "execute", Attempt: 1,
+		StartedAt: time.Unix(100, 1).UTC(), Purpose: executor.PurposeAgent,
+	}
+	if err := document.BindChildStartReceipt(attempt, strings.Repeat("d", 64)); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var supervised bool
+	ops := operations{
+		readFile: func(string, int64) ([]byte, error) { return slices.Clone(encoded), nil },
+		remove:   func(string) error { return nil },
+		chdir:    func(string) error { return nil },
+		resolve:  func(string, string, map[string]string) (string, error) { return "/usr/bin/codex", nil },
+		supervise: func(config sandboxinit.SuperviseConfig) (int, error) {
+			supervised = true
+			if config.Executable != "/usr/bin/codex" || !config.Receipt.Matches(document.ChildStartReceipt) {
+				t.Fatalf("supervisor config = %#v", config)
+			}
+			return 37, nil
+		},
+	}
+	err = runDocument(sandboxinit.DocumentPath, ops)
+	var exitErr *childExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != 37 || !supervised {
+		t.Fatalf("runDocument() = %v, supervised=%v", err, supervised)
+	}
+}
+
+func TestConfirmChildExecAcceptsSuccessfullyExecedFastChild(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestConfirmChildExecFastChildHelper$")
+	command.Env = append(os.Environ(), "GO_WANT_CONFIRM_EXEC_FAST_CHILD=1")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := command.Process.Pid
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := confirmChildExec(pid); err != nil {
+		t.Fatalf("successfully execed fast child was rejected: %v", err)
+	}
+}
+
+func TestConfirmChildExecFastChildHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_CONFIRM_EXEC_FAST_CHILD") == "1" {
+		os.Exit(0)
+	}
+}
+
+func TestRunEmitsPrivateChildStartReceiptWithoutExternalUtility(t *testing.T) {
+	receipt := []byte(`{"version":"receipt"}`)
+	var emitted []byte
+	ops := operations{
+		readFile: func(path string, limit int64) ([]byte, error) {
+			if path != sandboxinit.ChildStartReceiptPath || limit != sandboxinit.MaxDocumentBytes {
+				t.Fatalf("receipt read = %q limit %d", path, limit)
+			}
+			return slices.Clone(receipt), nil
+		},
+		writeAll: func(value []byte) error {
+			emitted = slices.Clone(value)
+			return nil
+		},
+	}
+	if err := run([]string{"--emit-child-start-receipt"}, bytes.NewReader(nil), ops); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(emitted, receipt) {
+		t.Fatalf("emitted receipt = %q, want %q", emitted, receipt)
+	}
+}
+
 func TestRunBootstrapExtractsLiveArchiveBeforeExecutingDocument(t *testing.T) {
 	document := sandboxinit.Document{
 		WorkspaceRoot: "/workspace",
 		Command:       executor.Command{Executable: "codex", Directory: "/workspace"},
-		Environment:   map[string]string{"PATH": "/usr/bin:/bin"},
+		Environment:   map[string]string{"PATH": executor.CanonicalSandboxPATH},
 		EnvironmentFiles: map[string]string{
 			"CODEX_TOKEN": "/run/paje/secrets/token",
 		},
 	}
+	bindTestDocument(t, &document)
 	encoded, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +143,7 @@ func TestRunBootstrapExtractsLiveArchiveBeforeExecutingDocument(t *testing.T) {
 		return "/usr/bin/codex", nil
 	}
 	ops.chdir = func(string) error { return nil }
-	ops.exec = func(string, []string, []string) error { return execReturned }
+	ops.supervise = func(sandboxinit.SuperviseConfig) (int, error) { return 0, execReturned }
 	ops.readFile = func(name string, limit int64) ([]byte, error) {
 		if name == sandboxinit.DocumentPath {
 			name = filepath.Join(root, "run", "paje", "command.json")
@@ -98,9 +186,10 @@ func TestRunDocumentExecutesExactArgvAndEnvironmentThenRemovesMaterial(t *testin
 			Executable: "codex", Args: []string{"exec", "$(touch /tmp/pwn)"}, Directory: "/workspace/site",
 			Environment: map[string]string{"GOWORK": "off"},
 		},
-		Environment:      map[string]string{"PATH": "/usr/bin:/bin", "BASE": "present"},
+		Environment:      map[string]string{"PATH": executor.CanonicalSandboxPATH, "BASE": "present"},
 		EnvironmentFiles: map[string]string{"CODEX_TOKEN": "/run/paje/secrets/codex-token"},
 	}
+	bindTestDocument(t, &document)
 	encoded, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)
@@ -118,14 +207,17 @@ func TestRunDocumentExecutesExactArgvAndEnvironmentThenRemovesMaterial(t *testin
 		remove:   func(path string) error { removed = append(removed, path); return nil },
 		chdir:    func(path string) error { directory = path; return nil },
 		resolve: func(name, dir string, values map[string]string) (string, error) {
-			if name != "codex" || dir != "/workspace/site" || values["PATH"] != "/usr/bin:/bin" {
+			if name != "codex" || dir != "/workspace/site" || values["PATH"] != executor.CanonicalSandboxPATH {
 				t.Fatalf("resolve = %q %q %#v", name, dir, values)
 			}
 			return "/usr/bin/codex", nil
 		},
-		exec: func(path string, args, env []string) error {
-			executable, argv, environment = path, slices.Clone(args), slices.Clone(env)
-			return execReturned
+		supervise: func(config sandboxinit.SuperviseConfig) (int, error) {
+			executable, argv, environment = config.Executable, slices.Clone(config.Arguments), slices.Clone(config.Environment)
+			if !config.Receipt.Matches(document.ChildStartReceipt) {
+				t.Fatalf("receipt = %#v", config.Receipt)
+			}
+			return 0, execReturned
 		},
 	}
 	if err := runDocument(sandboxinit.DocumentPath, ops); !errors.Is(err, execReturned) {
@@ -137,7 +229,7 @@ func TestRunDocumentExecutesExactArgvAndEnvironmentThenRemovesMaterial(t *testin
 	if !reflect.DeepEqual(argv, []string{"codex", "exec", "$(touch /tmp/pwn)"}) {
 		t.Fatalf("argv = %#v", argv)
 	}
-	wantEnvironment := []string{"BASE=present", "CODEX_TOKEN=secret-value", "GOWORK=off", "PATH=/usr/bin:/bin"}
+	wantEnvironment := []string{"BASE=present", "CODEX_TOKEN=secret-value", "GOWORK=off", "PATH=" + executor.CanonicalSandboxPATH}
 	if !reflect.DeepEqual(environment, wantEnvironment) {
 		t.Fatalf("environment = %#v", environment)
 	}
@@ -150,9 +242,9 @@ func TestRunDocumentRemovesMalformedDocumentWithoutExec(t *testing.T) {
 	removed := false
 	executed := false
 	ops := operations{
-		readFile: func(string, int64) ([]byte, error) { return []byte(`{"unknown":true}`), nil },
-		remove:   func(string) error { removed = true; return nil },
-		exec:     func(string, []string, []string) error { executed = true; return nil },
+		readFile:  func(string, int64) ([]byte, error) { return []byte(`{"unknown":true}`), nil },
+		remove:    func(string) error { removed = true; return nil },
+		supervise: func(sandboxinit.SuperviseConfig) (int, error) { executed = true; return 0, nil },
 	}
 	if err := runDocument(sandboxinit.DocumentPath, ops); err == nil {
 		t.Fatal("malformed document succeeded")
@@ -173,11 +265,12 @@ func TestRunDocumentRejectsNULPathsBeforeMaterialAccessOrChdir(t *testing.T) {
 			document := sandboxinit.Document{
 				WorkspaceRoot: "/workspace",
 				Command:       executor.Command{Executable: "codex", Directory: "/workspace"},
-				Environment:   map[string]string{"PATH": "/usr/bin:/bin"},
+				Environment:   map[string]string{"PATH": executor.CanonicalSandboxPATH},
 				EnvironmentFiles: map[string]string{
 					"CODEX_TOKEN": "/run/paje/secrets/codex-token",
 				},
 			}
+			bindTestDocument(t, &document)
 			mutate(&document)
 			encoded, err := json.Marshal(document)
 			if err != nil {
@@ -200,6 +293,17 @@ func TestRunDocumentRejectsNULPathsBeforeMaterialAccessOrChdir(t *testing.T) {
 				t.Fatalf("material reads/chdir = %d/%v, want 1/false", reads, changedDirectory)
 			}
 		})
+	}
+}
+
+func bindTestDocument(t *testing.T, document *sandboxinit.Document) {
+	t.Helper()
+	attempt := executor.AttemptID{
+		RunID: "run-test-document", Stage: "execute", Attempt: 1,
+		StartedAt: time.Unix(100, 1).UTC(), Purpose: executor.PurposeAgent,
+	}
+	if err := document.BindChildStartReceipt(attempt, strings.Repeat("e", 64)); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -58,6 +58,10 @@ func New(config Config) (*Runner, error) {
 		workspace: config.Workspace, environment: cloneMap(config.Environment),
 		outputLimit: config.OutputLimit, writable: config.Writable,
 	}
+	if runner.environment == nil {
+		runner.environment = make(map[string]string)
+	}
+	runner.environment["PATH"] = executor.CanonicalSandboxPATH
 	runner.sequence.Store(int64(config.Attempt.Sequence))
 	return runner, nil
 }

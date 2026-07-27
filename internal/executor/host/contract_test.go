@@ -26,6 +26,12 @@ func TestExecutorContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		target.resolve = func(name, _ string, _ map[string]string) (string, error) {
+			if name == "missing-host-executable" {
+				return "", errors.New("missing host executable")
+			}
+			return os.Args[0], nil
+		}
 		request := helperRequest(t, string(scenario))
 		fixture := contracttest.Fixture{Executor: target, Request: request}
 		switch scenario {
@@ -59,12 +65,8 @@ func TestExecutorContract(t *testing.T) {
 func helperRequest(t *testing.T, scenario string) executor.Request {
 	t.Helper()
 	request := hostRequest(t)
-	bin := t.TempDir()
-	if err := os.Symlink(os.Args[0], filepath.Join(bin, "paje-host-helper")); err != nil {
-		t.Fatal(err)
-	}
 	request.Environment = map[string]string{
-		"PATH": bin, "GO_WANT_HOST_HELPER": "1",
+		"PATH": executor.CanonicalSandboxPATH, "GO_WANT_HOST_HELPER": "1",
 	}
 	request.Command.Args = helperArgs(scenario)
 	return request
