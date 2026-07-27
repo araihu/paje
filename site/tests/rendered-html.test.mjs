@@ -56,12 +56,12 @@ function assertLink(html, rel, attribute, value, href) {
   assert.match(html, tag);
 }
 
-test("publishes the exact canonical Pajé v3 identity", async () => {
+test("publishes the exact canonical Pajé v10 identity", async () => {
   const assets = {
-    "paje-logo.svg": "74136ff1442d73bbea62cf20af9c63e6a3cd7c0e0f9f2656bde6e7723513f803",
-    "paje-mark.svg": "8c2402780d11874e3b7fa0ae31a55c9e0ceb5ac8765c2b6a36c8dfa24dc88451",
-    "paje-favicon.svg": "41fa3913afcf10d0abced60f7ff84f6f07c5ac765e7b5edc37fbdca4de0f4d57",
-    "paje-mark-reverse.svg": "fc15cfcf4eee5678ece76411e0002e04afa508121aa6ed9aea94528569838ad6",
+    "paje-logo.svg": "15e0f814c7ea860ededec50177be7570b899ff3e35a325be2b46d70c2bc38176",
+    "paje-mark.svg": "8a8212e9ad6ce5ea00d57f3f9ce0a82f010ce7a6088999b68623563e2dc68790",
+    "paje-favicon.svg": "d31c6e1b4835d372aea0aa990c02990ba3b54b8baa8764586f6e0d149e4dcaa4",
+    "paje-mark-reverse.svg": "9d55aac513d5c7de97b77422f3827b08d14cc0c29769a438a10cf2f2df3a9120",
   };
 
   for (const [name, expected] of Object.entries(assets)) {
