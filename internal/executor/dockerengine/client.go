@@ -427,8 +427,16 @@ func readPrivateReceiptStreams(reader io.Reader, stdoutLimit int64) (
 }
 
 func benignReceiptStreamClose(err error) bool {
-	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) ||
-		errors.Is(err, syscall.ECONNRESET)
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	const closedNetworkConnection = "use of closed network connection"
+	return err.Error() == closedNetworkConnection ||
+		strings.HasSuffix(err.Error(), ": "+closedNetworkConnection)
 }
 
 func (engine *mobyEngine) StopContainer(ctx context.Context, id string, timeout time.Duration) error {

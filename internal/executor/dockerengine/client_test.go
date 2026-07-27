@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/containerd/errdefs"
@@ -53,11 +55,49 @@ func TestReadPrivateReceiptExecOutputPreservesCandidateAcrossTerminalRaces(t *te
 				return mobyclient.ExecInspectResult{ExitCode: 0}, nil
 			},
 		},
+		{
+			name: "Docker 29 terminal stream closes after output",
+			reader: &readerEndingWithError{
+				data: stream,
+				err:  errors.New("read unix @->/Users/test/.colima/default/docker.sock: use of closed network connection"),
+			},
+			inspect: func() (mobyclient.ExecInspectResult, error) {
+				return mobyclient.ExecInspectResult{ExitCode: 0}, nil
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := readPrivateReceiptExecOutput(test.reader, int64(len(receipt)+1), test.inspect)
 			if !bytes.Equal(got, receipt) || err == nil {
 				t.Fatalf("readPrivateReceiptExecOutput() = %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestBenignReceiptStreamCloseMatchesOnlyTerminalCompatibilityShape(t *testing.T) {
+	dockerTerminal := errors.New("read unix @->/Users/test/.colima/default/docker.sock: use of closed network connection")
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "net closed sentinel", err: net.ErrClosed, want: true},
+		{name: "pipe closed sentinel", err: io.ErrClosedPipe, want: true},
+		{name: "connection reset sentinel", err: syscall.ECONNRESET, want: true},
+		{name: "exact compatibility message", err: errors.New("use of closed network connection"), want: true},
+		{name: "Docker 29 terminal suffix", err: dockerTerminal, want: true},
+		{name: "wrapped Docker 29 terminal suffix", err: fmt.Errorf("read receipt: %w", dockerTerminal), want: true},
+		{name: "substring without delimiter", err: errors.New("prefix use of closed network connection")},
+		{name: "trailing text", err: errors.New("read unix socket: use of closed network connection after output")},
+		{name: "case variant", err: errors.New("read unix socket: Use of closed network connection")},
+		{name: "near miss", err: errors.New("read unix socket: use of a closed network connection")},
+		{name: "arbitrary error", err: errors.New("terminal Docker stream failed")},
+		{name: "nil error", err: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := benignReceiptStreamClose(test.err); got != test.want {
+				t.Fatalf("benignReceiptStreamClose(%v) = %t, want %t", test.err, got, test.want)
 			}
 		})
 	}
