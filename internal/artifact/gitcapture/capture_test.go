@@ -129,6 +129,54 @@ func TestCaptureAndApplyReproduceEveryGitChangeWithoutMutatingSourceIndex(t *tes
 	}
 }
 
+func TestCaptureIncludesAgentStagedChangesWithoutMutatingSourceIndex(t *testing.T) {
+	repo := initializedRepository(t)
+	base := git(t, repo, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(repo, "staged.txt"), []byte("staged by agent\n"), 0o644)
+	git(t, repo, "add", "--", "staged.txt")
+	writeFile(t, filepath.Join(repo, "text.txt"), []byte("unstaged by agent\n"), 0o644)
+	beforeIndex := readIndex(t, repo)
+
+	capturer, err := gitcapture.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := capturer.Capture(context.Background(), gitcapture.Request{
+		Workspace: repo,
+		BaseSHA:   base,
+		MaxBytes:  1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantChanges := []artifact.Change{
+		{Path: "staged.txt", Status: "A", OldMode: "000000", NewMode: "100644"},
+		{Path: "text.txt", Status: "M", OldMode: "100644", NewMode: "100644"},
+	}
+	if !reflect.DeepEqual(result.Changes, wantChanges) {
+		t.Fatalf("Capture() changes = %#v, want %#v", result.Changes, wantChanges)
+	}
+	if got := readIndex(t, repo); !bytes.Equal(got, beforeIndex) {
+		t.Fatal("Capture() mutated the agent-staged source index")
+	}
+
+	target := filepath.Join(t.TempDir(), "target")
+	git(t, repo, "worktree", "add", "--detach", target, base)
+	t.Cleanup(func() { git(t, repo, "worktree", "remove", "--force", target) })
+	if err := capturer.Apply(context.Background(), gitcapture.ApplyRequest{
+		Workspace:       target,
+		BaseSHA:         base,
+		Patch:           result.Patch,
+		ExpectedTreeSHA: result.TreeSHA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantTree, _ := stagedFilesystem(t, repo, base)
+	if gotTree, _ := stagedFilesystem(t, target, base); gotTree != wantTree {
+		t.Fatalf("reproduced tree = %s, want source filesystem tree %s", gotTree, wantTree)
+	}
+}
+
 func TestCaptureRejectsPatchOverConfiguredLimit(t *testing.T) {
 	repo := initializedRepository(t)
 	base := git(t, repo, "rev-parse", "HEAD")

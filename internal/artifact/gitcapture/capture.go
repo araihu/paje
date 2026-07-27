@@ -114,7 +114,7 @@ func (g *Git) Capture(ctx context.Context, request Request) (result Result, retu
 	if err != nil {
 		return Result{}, fmt.Errorf("checksum worktree index: %w", err)
 	}
-	if err := g.assertBaseAndCleanIndex(ctx, workspace, realIndex, base); err != nil {
+	if err := g.assertBase(ctx, workspace, realIndex, base); err != nil {
 		return Result{}, err
 	}
 	temporaryDirectory, cleanupDirectory, err := temporaryDirectory(workspace)
