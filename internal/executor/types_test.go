@@ -541,6 +541,60 @@ func TestChildStartReceiptBindsAttemptCommandAndEnvironmentDeclaration(t *testin
 	}
 }
 
+func TestChildStartReceiptCanonicalizesEmptyEnvironmentDeclarations(t *testing.T) {
+	attempt := validAttemptID()
+	command := Command{
+		Executable: "go",
+		Args:       []string{"test", "./..."},
+		Directory:  SandboxWorkspaceRoot,
+	}
+	environment := map[string]string{"PATH": CanonicalSandboxPATH}
+	challenge := strings.Repeat("c", 64)
+
+	nilDeclaration, err := NewChildStartReceipt(attempt, command, environment, nil, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Environment = map[string]string{}
+	emptyDeclaration, err := NewChildStartReceipt(
+		attempt,
+		command,
+		environment,
+		map[string]string{},
+		challenge,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nilDeclaration.Matches(emptyDeclaration) ||
+		nilDeclaration.EnvironmentDigest != emptyDeclaration.EnvironmentDigest {
+		t.Fatalf("empty declaration digest drifted across nil/empty maps: %q != %q",
+			nilDeclaration.EnvironmentDigest, emptyDeclaration.EnvironmentDigest)
+	}
+
+	command.Environment = map[string]string{"GOWORK": "off"}
+	nonemptyCommand, err := NewChildStartReceipt(attempt, command, environment, nil, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nilDeclaration.Matches(nonemptyCommand) {
+		t.Fatal("empty declaration matched nonempty command environment")
+	}
+	nonemptyFile, err := NewChildStartReceipt(
+		attempt,
+		Command{Executable: "go", Args: []string{"test", "./..."}, Directory: SandboxWorkspaceRoot},
+		environment,
+		map[string]string{"WORKLOAD_TOKEN": "/run/paje/secrets/environment/token"},
+		challenge,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nilDeclaration.Matches(nonemptyFile) {
+		t.Fatal("empty declaration matched nonempty environment-file declaration")
+	}
+}
+
 func TestRequestDeclarationRejectsEnvironmentSecretCollisionBeforeAcquire(t *testing.T) {
 	request := validEnvironmentSecretRequest(t)
 	request.Destroy()

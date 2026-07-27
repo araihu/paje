@@ -152,8 +152,8 @@ func NewChildStartReceipt(
 			Files    map[string]string `json:"files"`
 		}{
 			Baseline: cloneMap(environment),
-			Command:  cloneMap(command.Environment),
-			Files:    cloneMap(environmentFiles),
+			Command:  canonicalReceiptDeclaration(command.Environment),
+			Files:    canonicalReceiptDeclaration(environmentFiles),
 		}),
 		Challenge: challenge,
 	}
@@ -211,6 +211,13 @@ func digestCanonical(value any) string {
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
+}
+
+func canonicalReceiptDeclaration(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	return cloneMap(values)
 }
 
 func validDigest(value string) bool {

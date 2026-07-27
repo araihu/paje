@@ -146,6 +146,57 @@ func TestDocumentRequiresCanonicalPathAndExactChildStartBinding(t *testing.T) {
 	}
 }
 
+func TestDocumentRoundTripPreservesEmptyEnvironmentReceiptBinding(t *testing.T) {
+	document := Document{
+		WorkspaceRoot: executor.SandboxWorkspaceRoot,
+		Command: executor.Command{
+			Executable:  "go",
+			Args:        []string{"test", "./..."},
+			Directory:   executor.SandboxWorkspaceRoot,
+			Environment: map[string]string{},
+		},
+		Environment:      map[string]string{"PATH": executor.CanonicalSandboxPATH},
+		EnvironmentFiles: map[string]string{},
+	}
+	attempt := executor.AttemptID{
+		RunID: "run-empty-environment", Stage: "execute", Attempt: 1,
+		StartedAt: time.Unix(200, 1).UTC(), Purpose: executor.PurposeVerification,
+	}
+	if err := document.BindChildStartReceipt(attempt, strings.Repeat("d", 64)); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(strings.NewReader(string(encoded))); err != nil {
+		t.Fatalf("empty environment declaration failed JSON round trip: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Document){
+		"command value": func(document *Document) {
+			document.Command.Environment = map[string]string{"GOWORK": "off"}
+		},
+		"environment file path": func(document *Document) {
+			document.EnvironmentFiles = map[string]string{
+				"WORKLOAD_TOKEN": "/run/paje/secrets/environment/token",
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rebound := document
+			mutate(&rebound)
+			encoded, err := json.Marshal(rebound)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Decode(strings.NewReader(string(encoded))); err == nil {
+				t.Fatal("document accepted nonempty environment declaration drift")
+			}
+		})
+	}
+}
+
 func validDocument(t *testing.T) Document {
 	t.Helper()
 	document := Document{
