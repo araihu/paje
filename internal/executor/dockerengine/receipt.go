@@ -54,7 +54,7 @@ func (target *Executor) waitForChildStart(
 
 func (target *Executor) readChildStartReceipt(ctx context.Context, containerID string) (executor.ChildStartReceipt, error) {
 	encoded, err := target.engine.CopyFile(ctx, containerID, sandboxinit.ChildStartReceiptPath, maxChildReceiptBytes)
-	if err != nil {
+	if err != nil && len(encoded) == 0 {
 		return executor.ChildStartReceipt{}, err
 	}
 	defer clear(encoded)
@@ -70,6 +70,14 @@ func (target *Executor) readChildStartReceipt(ctx context.Context, containerID s
 	}
 	if err := receipt.Validate(); err != nil {
 		return executor.ChildStartReceipt{}, err
+	}
+	canonical, err := json.Marshal(receipt)
+	if err != nil {
+		return executor.ChildStartReceipt{}, errors.New("encode canonical Docker child-start receipt")
+	}
+	defer clear(canonical)
+	if !bytes.Equal(encoded, canonical) {
+		return executor.ChildStartReceipt{}, errors.New("Docker child-start receipt is not canonical")
 	}
 	return receipt, nil
 }

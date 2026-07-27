@@ -366,6 +366,8 @@ type fakeEngine struct {
 	receiptMissing             bool
 	receiptOverride            []byte
 	receipt                    []byte
+	receiptErr                 error
+	receiptTransform           func([]byte) []byte
 	releaseReceiptPublication  chan struct{}
 	childStartAckErr           error
 	childStartAcknowledgements int
@@ -639,12 +641,16 @@ func (api *fakeEngine) CopyFile(_ context.Context, _ string, sourcePath string, 
 		return nil, errdefs.ErrNotFound
 	}
 	if api.receiptOverride != nil {
-		return slices.Clone(api.receiptOverride), nil
+		return slices.Clone(api.receiptOverride), api.receiptErr
 	}
 	if api.receipt == nil {
 		return nil, errdefs.ErrNotFound
 	}
-	return slices.Clone(api.receipt), nil
+	receipt := slices.Clone(api.receipt)
+	if api.receiptTransform != nil {
+		receipt = api.receiptTransform(receipt)
+	}
+	return receipt, api.receiptErr
 }
 
 func (api *fakeEngine) StopContainer(context.Context, string, time.Duration) error {

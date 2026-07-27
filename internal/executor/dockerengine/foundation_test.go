@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,63 @@ import (
 	"github.com/araihu/paje/internal/executor"
 	"github.com/containerd/errdefs"
 )
+
+func TestExecuteAcceptsExactReceiptAfterTerminalReaderUncertainty(t *testing.T) {
+	for _, transportErr := range []error{errdefs.ErrNotFound, net.ErrClosed} {
+		t.Run(transportErr.Error(), func(t *testing.T) {
+			api := newFakeEngine()
+			api.receiptErr = transportErr
+			target := newExecutorForTest(t, api)
+			request := dockerRequest(t, "none", nil)
+			defer request.Destroy()
+
+			result, err := target.Execute(context.Background(), request)
+			if err != nil || !result.Started || !result.Completed || result.ChildStartReceipt == nil {
+				t.Fatalf("Execute() = %#v, %v", result, err)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsUnprovenReceiptAfterTerminalReaderUncertainty(t *testing.T) {
+	for _, encoded := range [][]byte{
+		{},
+		[]byte("partial"),
+		[]byte(`{"attempt":{}}`),
+		append([]byte(nil), append([]byte(`{"unexpected":true}`), '\n')...),
+	} {
+		api := newFakeEngine()
+		api.receiptOverride = encoded
+		api.receiptErr = net.ErrClosed
+		target := newExecutorForTest(t, api)
+		request := dockerRequest(t, "none", nil)
+		defer request.Destroy()
+
+		result, err := target.Execute(context.Background(), request)
+		if result.Started || result.ChildStartReceipt != nil || providerCause(err) != "ambiguous_attempt" {
+			t.Fatalf("Execute(%q) = %#v, %v", encoded, result, err)
+		}
+	}
+}
+
+func TestExecuteRejectsNoncanonicalReceiptAfterTerminalReaderUncertainty(t *testing.T) {
+	for _, transform := range []func([]byte) []byte{
+		func(encoded []byte) []byte { return append([]byte{' '}, encoded...) },
+		func(encoded []byte) []byte { return append(encoded, '\n') },
+	} {
+		api := newFakeEngine()
+		api.receiptTransform = transform
+		api.receiptErr = net.ErrClosed
+		target := newExecutorForTest(t, api)
+		request := dockerRequest(t, "none", nil)
+		defer request.Destroy()
+
+		result, executeErr := target.Execute(context.Background(), request)
+		if result.Started || result.ChildStartReceipt != nil || providerCause(executeErr) != "ambiguous_attempt" {
+			t.Fatalf("Execute(noncanonical receipt) = %#v, %v", result, executeErr)
+		}
+	}
+}
 
 func TestExecuteDistinguishesBootstrapFromBoundChildStart(t *testing.T) {
 	api := newFakeEngine()
@@ -196,6 +254,7 @@ func TestInspectRejectsReceiptReboundToAnotherAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	api.receiptErr = net.ErrClosed
 	state, inspectErr := target.Inspect(context.Background(), request.Attempt)
 	if state != executor.StateUnknown || providerCause(inspectErr) != "ambiguous_attempt" {
 		t.Fatalf("Inspect(rebound receipt) = %q, %v", state, inspectErr)

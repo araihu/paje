@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/araihu/paje/internal/executil"
@@ -322,6 +324,16 @@ func (engine *mobyEngine) CopyFile(ctx context.Context, id, sourcePath string, l
 		return nil, err
 	}
 	defer attached.Close()
+	return readPrivateReceiptExecOutput(attached.Reader, limit, func() (mobyclient.ExecInspectResult, error) {
+		return engine.client.ExecInspect(ctx, created.ID, mobyclient.ExecInspectOptions{})
+	})
+}
+
+func readPrivateReceiptExecOutput(
+	reader io.Reader,
+	limit int64,
+	inspect func() (mobyclient.ExecInspectResult, error),
+) ([]byte, error) {
 	stdout, err := executil.NewLimitedBuffer(limit)
 	if err != nil {
 		return nil, err
@@ -330,12 +342,23 @@ func (engine *mobyEngine) CopyFile(ctx context.Context, id, sourcePath string, l
 	if err != nil {
 		return nil, err
 	}
-	if _, err := stdcopy.StdCopy(stdout, stderr, attached.Reader); err != nil {
+	_, streamErr := stdcopy.StdCopy(stdout, stderr, reader)
+	if stderr.Truncated() || len(stderr.Bytes()) != 0 || stdout.Truncated() {
+		return nil, errors.New("Docker private receipt reader failed")
+	}
+	if streamErr != nil && !benignReceiptStreamClose(streamErr) {
 		return nil, errors.New("read Docker private receipt")
 	}
-	inspected, err := engine.client.ExecInspect(ctx, created.ID, mobyclient.ExecInspectOptions{})
-	if err != nil {
-		return nil, err
+	candidate := stdout.Bytes()
+	inspected, inspectErr := inspect()
+	if inspectErr != nil {
+		if len(candidate) == 0 {
+			return nil, inspectErr
+		}
+		return candidate, errors.Join(
+			errors.New("Docker private receipt reader outcome is uncertain"),
+			inspectErr,
+		)
 	}
 	if inspected.Running {
 		return nil, errors.New("Docker private receipt reader remains running")
@@ -343,10 +366,24 @@ func (engine *mobyEngine) CopyFile(ctx context.Context, id, sourcePath string, l
 	if inspected.ExitCode == 1 {
 		return nil, errdefs.ErrNotFound
 	}
-	if inspected.ExitCode != 0 || stderr.Truncated() || len(stderr.Bytes()) != 0 || stdout.Truncated() {
+	if inspected.ExitCode != 0 {
 		return nil, errors.New("Docker private receipt reader failed")
 	}
-	return stdout.Bytes(), nil
+	if streamErr != nil {
+		if len(candidate) == 0 {
+			return nil, errors.New("read Docker private receipt")
+		}
+		return candidate, errors.Join(
+			errors.New("Docker private receipt stream ended after output"),
+			streamErr,
+		)
+	}
+	return candidate, nil
+}
+
+func benignReceiptStreamClose(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 func (engine *mobyEngine) StopContainer(ctx context.Context, id string, timeout time.Duration) error {
