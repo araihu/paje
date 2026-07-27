@@ -68,6 +68,7 @@ type APIError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	retryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -165,19 +166,19 @@ func (c *Client) Wait(ctx context.Context, runID string) (View, error) {
 	for {
 		view, err := c.Status(ctx, runID)
 		if err != nil {
-			return View{}, err
+			var apiError *APIError
+			if !errors.As(err, &apiError) || apiError.StatusCode != http.StatusServiceUnavailable || apiError.Code != "provider_unavailable" {
+				return View{}, err
+			}
+			if err := c.sleep(ctx, boundedRetry(apiError.retryAfter)); err != nil {
+				return View{}, err
+			}
+			continue
 		}
 		if terminal(view.Status) {
 			return view, nil
 		}
-		delay := view.retryAfter
-		if delay < time.Second {
-			delay = time.Second
-		}
-		if delay > 15*time.Second {
-			delay = 15 * time.Second
-		}
-		if err := c.sleep(ctx, delay); err != nil {
+		if err := c.sleep(ctx, boundedRetry(view.retryAfter)); err != nil {
 			return View{}, err
 		}
 	}
@@ -237,7 +238,10 @@ func (c *Client) request(
 		if json.Unmarshal(contents, &failure) != nil || failure.Error.Code == "" || failure.Error.Message == "" {
 			return View{}, &APIError{StatusCode: response.StatusCode, Code: "invalid_response", Message: "gateway returned an invalid error"}
 		}
-		return View{}, &APIError{StatusCode: response.StatusCode, Code: failure.Error.Code, Message: failure.Error.Message}
+		return View{}, &APIError{
+			StatusCode: response.StatusCode, Code: failure.Error.Code, Message: failure.Error.Message,
+			retryAfter: parseRetryAfter(response.Header.Get("Retry-After")),
+		}
 	}
 	var view View
 	decoder := json.NewDecoder(bytes.NewReader(contents))
@@ -324,6 +328,16 @@ func parseRetryAfter(value string) time.Duration {
 		return time.Second
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func boundedRetry(delay time.Duration) time.Duration {
+	if delay < time.Second {
+		return time.Second
+	}
+	if delay > 15*time.Second {
+		return 15 * time.Second
+	}
+	return delay
 }
 
 func sleepContext(ctx context.Context, duration time.Duration) error {

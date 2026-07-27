@@ -119,6 +119,43 @@ func TestWaitHonorsRetryAfterAndNeverResubmits(t *testing.T) {
 	}
 }
 
+func TestWaitRetriesTransientProviderUnavailableWithoutResubmitting(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/submissions/paje_run" {
+			t.Fatalf("request = %s %s", request.Method, request.URL.Path)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			writer.Header().Set("Retry-After", "3")
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = writer.Write([]byte(`{"error":{"code":"provider_unavailable","message":"a required provider is unavailable"}}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"api_version":"v1","run_id":"paje_run","status":"succeeded","depth":0,"root_run_id":"paje_run","result":{"run_id":"paje_run","status":"succeeded"}}`))
+	}))
+	defer server.Close()
+	var slept []time.Duration
+	client, err := agentclient.New(agentclient.Config{
+		BaseURL: server.URL, Token: clientTestToken, HTTPClient: server.Client(),
+		Sleep: func(_ context.Context, duration time.Duration) error {
+			slept = append(slept, duration)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := client.Wait(context.Background(), "paje_run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "succeeded" || requests != 2 || len(slept) != 1 || slept[0] != 3*time.Second {
+		t.Fatalf("view/requests/sleep = %#v / %d / %#v", view, requests, slept)
+	}
+}
+
 func TestStatusRejectsMismatchedTerminalResult(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
