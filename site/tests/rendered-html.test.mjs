@@ -37,6 +37,8 @@ test("serves static localized documents", async () => {
     assert.equal(response.headers.get("content-language"), locale === "pt-br" ? "pt-BR" : locale);
     const html = await response.text();
     assert.match(html, /\/assets\/styles\.css/);
+    assert.match(html, /<html[^>]*data-theme="araihu"/);
+    assert.match(html, /\/araihu\.css/);
     assert.match(html, /<title>[^<]+ · Pajé<\/title>/);
     assert.match(html, /paje-logo-transparent\.svg/);
     assert.match(html, /paje-icon-background\.svg/);
@@ -51,7 +53,13 @@ test("serves static localized documents", async () => {
 
 test("keeps static navigation accessible across themes and viewports", async () => {
   const css = await readFile(new URL("../dist/client/site.css", import.meta.url), "utf8");
-  assert.match(css, /--on-primary:\s*#07111f/);
+  const theme = await readFile(new URL("../dist/client/araihu.css", import.meta.url), "utf8");
+  assert.match(theme, /\[data-theme="araihu"\]/);
+  assert.match(theme, /--color-primary: #173b72/);
+  assert.match(theme, /--color-primary-dark: #c7ff4a/);
+  assert.match(css, /--surface:\s*var\(--color-surface\)/);
+  assert.match(css, /--on-primary:\s*var\(--color-on-primary\)/);
+  assert.match(css, /--surface:\s*var\(--color-surface-dark\)/);
   assert.match(css, /--run-muted:\s*#d5ddeb/);
   assert.match(css, /\.languages a\s*\{[^}]*min-height:\s*44px/s);
   assert.match(css, /a:focus-visible\s*\{/);
