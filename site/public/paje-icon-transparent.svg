@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc" class="araihu-brand-v11">
+  <title id="title">Pajé v11 icon</title>
+  <desc id="desc">Adaptive Pajé icon on a transparent surface; colors respond to light and dark themes.</desc>
+  <style>.v11-surface {
+  fill: var(--araihu-logo-surface, var(--araihu-logo-auto-surface, #f3f2e9));
+}
+.v11-ink {
+  fill: var(--araihu-logo-ink, var(--araihu-logo-auto-ink, #07111f));
+}
+.v11-signal {
+  fill: var(--araihu-logo-signal, var(--araihu-logo-auto-signal, #c7ff4a));
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --araihu-logo-auto-surface: #07111f;
+    --araihu-logo-auto-ink: #f3f2e9;
+    --araihu-logo-auto-signal: #c7ff4a;
+  }
+}</style>
+  <path d="M511.296 282.94c15.789-3.301 44.668 16.126 53.751 28.501 6.223 8.479 12.277 17.26 18.109 26.051l27.545 41.826c4.483 6.828 24.428 36.251 26.735 42.165 2.253 2.887 6.268 9.274 8.433 12.482l17.79 26.546a8052 8052 0 0 1 51.102 78.092 4450 4450 0 0 0 36.015 54.619c8.096 12.185 15.957 23.912 23.442 36.538 25.538 43.08.146 101.568-48.763 112.37-12.777 2.822-26.247 1.949-39.368 1.983l-45.06.061-157.954-.101-115.79-.004-34.325.059c-7.234.021-14.634.26-21.722-.31-34.699-2.79-62.939-27.905-69.483-62.117-2.79-14.587-1.275-28.736 4.933-42.366 7.207-15.822 17.657-30.165 27.307-44.551a3760 3760 0 0 0 33.246-50.178l139.375-212.463c19.699-29.844 27.413-41.57 64.682-49.203" class="v11-ink" />
+  <path d="M511.296 282.94c15.789-3.301 44.668 16.126 53.751 28.501 6.223 8.479 12.277 17.26 18.109 26.051l27.545 41.826c4.483 6.828 24.428 36.251 26.735 42.165-7.351-1.294-12.711-1.765-20.277-3.615a148.24 148.24 0 0 1-68.198-38.226c-19.798-19.306-36.976-46.423-38.735-74.627a77 77 0 0 1 .275-13.258c.316-2.968.915-5.832.795-8.817" class="v11-signal" />
+</svg>

@@ -1,5 +1,7 @@
 import { catalogs, type Locale } from "./i18n/catalogs";
+import { PajeIcon, PajeLogo } from "./brand";
 import { LanguageSwitcher } from "./i18n/language-switcher";
+import { ThemeToggle } from "./theme-toggle";
 
 const githubUrl = "https://github.com/araihu/paje";
 
@@ -67,12 +69,6 @@ function Arrow() {
   return <span aria-hidden="true">↗</span>;
 }
 
-function PajeMark({ className }: { className: string }) {
-  // The canonical SVG is already compact and must remain byte-identical to araihu/assets.
-  // eslint-disable-next-line @next/next/no-img-element
-  return <img className={className} src="/paje-mark.svg" alt="" aria-hidden="true" />;
-}
-
 function BetaCopy({ text }: { text: string }) {
   const [before, after] = text.split("code-change@v1");
 
@@ -92,8 +88,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
     <div className="site-shell">
       <header className="topbar">
         <a className="brand" href="#inicio" aria-label={copy.navigation.brandLabel}>
-          <PajeMark className="brand-mark" />
-          <span>Pajé</span>
+          <PajeLogo className="brand-logo" />
         </a>
         <nav className="desktop-nav" aria-label={copy.navigation.primaryLabel}>
           <a href="#produto">{copy.navigation.product}</a>
@@ -111,6 +106,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
               es: copy.languageSwitcher.spanish,
             }}
           />
+          <ThemeToggle />
           <a className="github-button" href={githubUrl} target="_blank" rel="noreferrer">
             GitHub <Arrow />
           </a>
@@ -327,7 +323,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
               <code>{copy.security.credentials}</code>
             </div>
             <div className="boundary-agent">
-              <div><PajeMark className="mini-mark" /><strong>{copy.security.runtime}</strong></div>
+              <div><PajeIcon className="mini-mark" /><strong>{copy.security.runtime}</strong></div>
               <ul>
                 <li><span>✓</span> {copy.security.selectedMemory}</li>
                 <li><span>✓</span> {copy.security.isolatedWorktree}</li>
@@ -396,7 +392,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
 
       <footer>
         <a className="brand footer-brand" href="#inicio" aria-label={copy.footer.brandLabel}>
-          <PajeMark className="brand-mark" /><span>Pajé</span>
+          <PajeLogo className="brand-logo" />
         </a>
         <p>{copy.footer.text}</p>
         <div><span>Open source · MIT</span><a href={githubUrl} target="_blank" rel="noreferrer">GitHub <Arrow /></a></div>

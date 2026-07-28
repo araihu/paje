@@ -43,7 +43,7 @@ export async function generateMetadata(): Promise<Metadata> {
     title: copy.metadata.title,
     description: copy.metadata.description,
     applicationName: "Pajé",
-    icons: { icon: "/paje-favicon.svg" },
+    icons: { icon: "/paje-icon-background.svg" },
     alternates: {
       canonical,
       languages: {
@@ -80,7 +80,7 @@ export async function generateMetadata(): Promise<Metadata> {
 }
 
 export const viewport: Viewport = {
-  colorScheme: "light",
+  colorScheme: "light dark",
   themeColor: "#f2efe7",
 };
 
