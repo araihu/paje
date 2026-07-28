@@ -27,9 +27,9 @@ async function fetchSite(path, acceptLanguage) {
 
 test("serves static localized documents", async () => {
   const expectations = {
-    en: ["lang=\"en\"", "From request to pull request", "A run is a record"],
-    "pt-br": ["lang=\"pt-BR\"", "Do pedido ao pull request", "Um run é um registro"],
-    es: ["lang=\"es\"", "De la solicitud al pull request", "Una ejecución es un registro"],
+    en: ["lang=\"en\"", "From request to pull request", "A run is a record", "Execution boundary", "Beta scope"],
+    "pt-br": ["lang=\"pt-BR\"", "Do pedido ao pull request", "Um run é um registro", "Limite de execução", "Escopo do beta"],
+    es: ["lang=\"es\"", "De la solicitud al pull request", "Una ejecución es un registro", "Límite de ejecución", "Alcance de la beta"],
   };
   for (const [locale, landmarks] of Object.entries(expectations)) {
     const response = await fetchSite(`/${locale}`, "fr");
@@ -40,9 +40,33 @@ test("serves static localized documents", async () => {
     assert.match(html, /<title>[^<]+ · Pajé<\/title>/);
     assert.match(html, /paje-logo-transparent\.svg/);
     assert.match(html, /paje-icon-background\.svg/);
+    assert.equal((html.match(/rel="alternate" hreflang=/g) ?? []).length, 4);
+    assert.match(html, new RegExp(`rel="canonical" href="https://paje\\.araihu\\.com/${locale}"`));
+    assert.doesNotMatch(html, /alpine(?:js)?|htmx/i);
+    assert.match(html, /\/assets\/js\/combobox\.js/);
     assert.doesNotMatch(html, /paje-(favicon|mark|mark-reverse)\.svg/);
     for (const landmark of landmarks) assert.match(html, new RegExp(landmark));
   }
+});
+
+test("keeps static navigation accessible across themes and viewports", async () => {
+  const css = await readFile(new URL("../dist/client/site.css", import.meta.url), "utf8");
+  assert.match(css, /--on-primary:\s*#07111f/);
+  assert.match(css, /--run-muted:\s*#d5ddeb/);
+  assert.match(css, /\.languages a\s*\{[^}]*min-height:\s*44px/s);
+  assert.match(css, /a:focus-visible\s*\{/);
+  assert.match(css, /prefers-reduced-motion:\s*no-preference/);
+});
+
+test("omits unused third-party runtime from the static artifact", async () => {
+  for (const path of [
+    "../dist/client/assets/js/runtime/alpinejs/3.14.9/alpine.min.js",
+    "../dist/client/assets/js/runtime/htmx.org/2.0.8/htmx.min.js",
+  ]) {
+    await assert.rejects(readFile(new URL(path, import.meta.url)));
+  }
+  const combobox = await readFile(new URL("../dist/client/assets/js/combobox.js", import.meta.url), "utf8");
+  assert.ok(combobox.length > 0);
 });
 
 test("packages the approved Pajé v11 brand assets", async () => {

@@ -18,6 +18,12 @@ npm run build
 packages the static Worker and asset tree. `npm run dev` serves the generated
 files locally after one build.
 
+The page uses Goshtoso's supported minimal dependency component with Alpine and
+HTMX disabled because the generated documents contain no interactive widgets.
+Goshtoso v0.0.13 does not expose a CSS-only head option, so the minimal
+component still emits its small first-party `combobox.js` helper; removing that
+last script requires an upstream Goshtoso API rather than hand-written tags.
+
 ## Validation
 
 ```bash
