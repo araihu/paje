@@ -56,12 +56,12 @@ function assertLink(html, rel, attribute, value, href) {
   assert.match(html, tag);
 }
 
-test("publishes the exact canonical Pajé v10 identity", async () => {
+test("publishes the exact approved Pajé v11 identity", async () => {
   const assets = {
-    "paje-logo.svg": "15e0f814c7ea860ededec50177be7570b899ff3e35a325be2b46d70c2bc38176",
-    "paje-mark.svg": "8a8212e9ad6ce5ea00d57f3f9ce0a82f010ce7a6088999b68623563e2dc68790",
-    "paje-favicon.svg": "d31c6e1b4835d372aea0aa990c02990ba3b54b8baa8764586f6e0d149e4dcaa4",
-    "paje-mark-reverse.svg": "9d55aac513d5c7de97b77422f3827b08d14cc0c29769a438a10cf2f2df3a9120",
+    "paje-icon-background.svg": "de25626916504d5804cc1656e334e8e1949c533edc09eed59b91d36f6a5fa69e",
+    "paje-icon-transparent.svg": "37e75b4eb1e164a88fe7fb6211195d0be27f5063619dd1524188b0d2109e6193",
+    "paje-logo-background.svg": "255f4481aca59d19a04e76e4f9731fd87ddae93ed0d47623ec7be7db4f2e4268",
+    "paje-logo-transparent.svg": "0359d4cd3542c1d03c9ef59266e33671b83ceaf3a1c240278e4a46e195fc25e8",
   };
 
   for (const [name, expected] of Object.entries(assets)) {
@@ -70,9 +70,16 @@ test("publishes the exact canonical Pajé v10 identity", async () => {
   }
 
   const { html } = await render("en");
-  assert.equal((html.match(/src="\/paje-mark\.svg"/g) ?? []).length, 3);
-  assert.match(html, /<link[^>]*rel="icon"[^>]*href="(?:https:\/\/paje\.araihu\.com)?\/paje-favicon\.svg"/i);
-  assert.doesNotMatch(html, /src="\/paje-logo\.svg"|>P\/<\/span>/i);
+  assert.match(html, /<link[^>]*rel="icon"[^>]*href="(?:https:\/\/paje\.araihu\.com)?\/paje-icon-background\.svg"/i);
+  assert.equal((html.match(/aria-label="Pajé"/g) ?? []).length, 2);
+  assert.doesNotMatch(html, /paje-(favicon|logo|mark)\.svg|>P\/<\/span>/i);
+});
+
+test("keeps the v11 semantic logo contract under Goshtoso-style .dark", async () => {
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /\.dark\s*\{[\s\S]*--araihu-logo-surface: var\(--surface\)/);
+  assert.match(css, /\.brand-ink\s*\{\s*fill: var\(--araihu-logo-ink\)/);
+  assert.match(css, /\.brand-signal\s*\{\s*fill: var\(--araihu-logo-signal\)/);
 });
 
 test("negotiates the root locale with q-values, wildcards, and policy fallbacks", async (t) => {
