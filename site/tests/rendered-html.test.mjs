@@ -37,8 +37,23 @@ test("serves static localized documents", async () => {
     assert.equal(response.headers.get("content-language"), locale === "pt-br" ? "pt-BR" : locale);
     const html = await response.text();
     assert.match(html, /\/assets\/styles\.css/);
-    assert.match(html, /paje-mark\.svg/);
+    assert.match(html, /<title>[^<]+ · Pajé<\/title>/);
+    assert.match(html, /paje-logo-transparent\.svg/);
+    assert.match(html, /paje-icon-background\.svg/);
+    assert.doesNotMatch(html, /paje-(favicon|mark|mark-reverse)\.svg/);
     for (const landmark of landmarks) assert.match(html, new RegExp(landmark));
+  }
+});
+
+test("packages the approved Pajé v11 brand assets", async () => {
+  for (const name of [
+    "paje-icon-background.svg",
+    "paje-icon-transparent.svg",
+    "paje-logo-background.svg",
+    "paje-logo-transparent.svg",
+  ]) {
+    const contents = await readFile(new URL(`../dist/client/${name}`, import.meta.url), "utf8");
+    assert.match(contents, /araihu-brand-v11/);
   }
 });
 

@@ -52,10 +52,9 @@ preferences, wildcards that resolve to the default, and missing headers use
 English. `es` and regional `es-*` preferences use Spanish.
 
 An explicit locale URL always wins over browser preferences. The visible
-language controls keep that choice stable across navigation and preserve the
-current query string and fragment when switching catalogs. The root redirect
-preserves query strings; browsers retain an existing fragment across the
-same-origin redirect.
+language controls link directly to the canonical locale routes. The root
+redirect preserves query strings; browsers retain an existing fragment across
+the same-origin redirect.
 
 ## Deploy
 
