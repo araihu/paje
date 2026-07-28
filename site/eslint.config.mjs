@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Goshtoso runtime files are copied byte-for-byte into the static output.
+    "public/assets/**",
   ]),
 ]);
 

@@ -1,18 +1,22 @@
 # Pajé site
 
-The public product and documentation site for Pajé, built with vinext and
-published with OpenAI Sites.
+The public product and documentation site for Pajé. A small Go generator uses
+Goshtoso's version-matched dependencies and components to write static locale
+documents; a Cloudflare Worker only negotiates the root locale and serves those
+files. Published with OpenAI Sites.
 
 ## Local development
 
-Node.js 22.13 or newer is required.
+Go 1.26.5 or newer and Node.js 22.13 or newer are required.
 
 ```bash
 npm install
-npm run dev
+npm run build
 ```
 
-The development server starts at `http://localhost:3000` by default.
+`npm run build` regenerates `public/en`, `public/pt-br`, and `public/es`, then
+packages the static Worker and asset tree. `npm run dev` serves the generated
+files locally after one build.
 
 ## Validation
 
