@@ -54,7 +54,7 @@ jobs:
         run: npm test
 
       - name: Upload static site
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: paje-site-dist
           path: site/dist
@@ -84,7 +84,7 @@ jobs:
         run: npm ci
 
       - name: Download validated site
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: paje-site-dist
           path: site/dist
