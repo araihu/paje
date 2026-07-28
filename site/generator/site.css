@@ -370,12 +370,24 @@ a:focus-visible {
     padding: 5rem 0;
   }
 
+  .hero-copy,
+  .run {
+    min-width: 0;
+  }
+
   .hero h1 {
-    font-size: clamp(3.25rem, 15vw, 5rem);
+    font-size: clamp(2.75rem, 12vw, 3.5rem);
+    overflow-wrap: anywhere;
   }
 
   .actions {
-    align-items: stretch;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .actions .quiet-link {
+    width: 100%;
   }
 
   .run {

@@ -62,6 +62,8 @@ test("keeps static navigation accessible across themes and viewports", async () 
   assert.match(css, /--surface:\s*var\(--color-surface-dark\)/);
   assert.match(css, /--run-muted:\s*#d5ddeb/);
   assert.match(css, /\.languages a\s*\{[^}]*min-height:\s*44px/s);
+  assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*?\.hero h1\s*\{[^}]*font-size:\s*clamp\(2\.75rem, 12vw, 3\.5rem\)[^}]*overflow-wrap:\s*anywhere/s);
+  assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*?\.actions\s*\{[^}]*flex-direction:\s*column/s);
   assert.match(css, /a:focus-visible\s*\{/);
   assert.match(css, /prefers-reduced-motion:\s*no-preference/);
 });

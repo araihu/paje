@@ -1,18 +1,18 @@
 :root {
   color-scheme: light;
-  --surface: #f3f2e9;
-  --surface-raised: #fcfbf7;
-  --surface-offset: #e4e8eb;
-  --ink: #07111f;
-  --muted: #243348;
+  --surface: var(--color-surface);
+  --surface-raised: color-mix(in srgb, var(--color-surface) 94%, white 6%);
+  --surface-offset: var(--color-surface-alt);
+  --ink: var(--color-on-surface-strong);
+  --muted: var(--color-on-surface);
   --subtle: #4d5967;
-  --outline: #a3b0bf;
-  --outline-soft: #d2d8dd;
-  --primary: #173b72;
-  --primary-hover: #102b55;
-  --on-primary: #f7f8f3;
-  --signal: #c7ff4a;
-  --success: #258256;
+  --outline: var(--color-outline);
+  --outline-soft: color-mix(in srgb, var(--color-outline) 55%, var(--color-surface) 45%);
+  --primary: var(--color-primary);
+  --primary-hover: var(--color-secondary);
+  --on-primary: var(--color-on-primary);
+  --signal: var(--araihu-logo-signal);
+  --success: var(--color-success);
   --night: #07111f;
   --on-night: #f7f8f3;
   --night-muted: #d5ddeb;
@@ -25,19 +25,19 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --surface: #07111f;
-    --surface-raised: #10233d;
-    --surface-offset: #10233d;
-    --ink: #f7f8f3;
-    --muted: #d5ddeb;
+    --surface: var(--color-surface-dark);
+    --surface-raised: var(--color-surface-dark-alt);
+    --surface-offset: var(--color-surface-dark-alt);
+    --ink: var(--color-on-surface-dark-strong);
+    --muted: var(--color-on-surface-dark);
     --subtle: #b9c5d6;
-    --outline: #526981;
-    --outline-soft: #364d67;
-    --primary: #c7ff4a;
-    --primary-hover: #a8dc27;
-    --on-primary: #07111f;
-    --signal: #c7ff4a;
-    --success: #79d59b;
+    --outline: var(--color-outline-dark);
+    --outline-soft: color-mix(in srgb, var(--color-outline-dark) 65%, var(--color-surface-dark) 35%);
+    --primary: var(--color-primary-dark);
+    --primary-hover: var(--color-secondary-dark);
+    --on-primary: var(--color-on-primary-dark);
+    --signal: var(--araihu-logo-signal);
+    --success: var(--color-success);
     --night: #020812;
     --on-night: #f7f8f3;
     --night-muted: #d5ddeb;
@@ -370,12 +370,24 @@ a:focus-visible {
     padding: 5rem 0;
   }
 
+  .hero-copy,
+  .run {
+    min-width: 0;
+  }
+
   .hero h1 {
-    font-size: clamp(3.25rem, 15vw, 5rem);
+    font-size: clamp(2.75rem, 12vw, 3.5rem);
+    overflow-wrap: anywhere;
   }
 
   .actions {
-    align-items: stretch;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .actions .quiet-link {
+    width: 100%;
   }
 
   .run {
