@@ -65,8 +65,22 @@ custom domain:
 ```bash
 wrangler login
 npm run build
-wrangler deploy
+npm run deploy
 ```
 
 The deployment configuration binds the Worker to `paje.araihu.com` as a
 Cloudflare custom domain.
+
+Production deployment is automated by
+`.github/workflows/deploy-site.yml`. Pull requests that touch the site run its
+lint and test gates. A push to `main` after those gates deploys with Wrangler;
+the workflow can also be started manually.
+
+The repository must provide:
+
+- Actions variable `CLOUDFLARE_ACCOUNT_ID` with the target account ID.
+- Actions secret `CLOUDFLARE_API_TOKEN` with `Workers Scripts: Edit` and, for
+  the configured custom domain, `Workers Routes: Edit` on the relevant zone.
+
+The token is passed only to the deploy job. Pull-request validation does not
+receive Cloudflare credentials.

@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite dev",
     "build": "cd generator && GOTOOLCHAIN=auto go run . --out ../public && cd .. && WRANGLER_LOG_PATH=.wrangler/wrangler.log vite build && node build/package-static.mjs",
+    "deploy": "wrangler deploy",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite preview",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
