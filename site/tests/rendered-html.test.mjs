@@ -138,9 +138,9 @@ async function runThemeScript({ saved, systemDark }) {
 
 test("serves static localized documents", async () => {
   const expectations = {
-    en: ["lang=\"en\"", "From request to pull request", "A run is a record", "Execution boundary", "Beta scope"],
-    "pt-br": ["lang=\"pt-BR\"", "Do pedido ao pull request", "Um run é um registro", "Limite de execução", "Escopo do beta"],
-    es: ["lang=\"es\"", "De la solicitud al pull request", "Una ejecución es un registro", "Límite de ejecución", "Alcance de la beta"],
+    en: ["lang=\"en\"", "Make agent code changes durable", "Each run keeps an auditable record", "Execution boundary", "Beta scope"],
+    "pt-br": ["lang=\"pt-BR\"", "Torne duráveis as mudanças de código", "Cada run mantém um registro auditável", "Limite de execução", "Escopo do beta"],
+    es: ["lang=\"es\"", "Haz duraderos los cambios de código", "Cada ejecución mantiene un registro auditable", "Límite de ejecución", "Alcance de la beta"],
   };
   for (const [locale, landmarks] of Object.entries(expectations)) {
     const response = await fetchSite(`/${locale}`, "fr");
@@ -150,8 +150,8 @@ test("serves static localized documents", async () => {
     assert.match(html, /\/assets\/styles\.css/);
     assert.match(html, /<html[^>]*data-theme="araihu"[^>]*data-theme-source="default"/);
     assert.match(html, /\/araihu\.css/);
-    assert.match(html, /<title>[^<]+ · Pajé<\/title>/);
-    assert.match(html, new RegExp(`src="${pajeLogoFallback.replaceAll("/", "\\/")}"[^>]*width="166"[^>]*height="41"[^>]*data-asset-brand="logo"[^>]*crossorigin="anonymous"`));
+		assert.match(html, /<title>[^<]+ \| Pajé<\/title>/);
+		assert.match(html, new RegExp(`src="${pajeLogoFallback.replaceAll("/", "\\/")}"[^>]*width="166"[^>]*height="41"[^>]*data-asset-brand="logo"[^>]*crossorigin="anonymous"`));
     assert.match(html, /paje-icon-background\.svg/);
     assert.match(html, /<link rel="icon" href="\/paje-icon-background\.svg">/);
     assert.equal((html.match(/data-asset-brand="logo"/g) ?? []).length, 1);
