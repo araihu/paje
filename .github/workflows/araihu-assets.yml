@@ -110,4 +110,8 @@ jobs:
           git commit -m "chore(assets): update fallbacks for ${RELEASE}"
           git push origin "$branch"
           pr=$(gh pr create --base main --head "$branch" --title "chore(assets): update fallbacks for ${RELEASE}" --body "Verified immutable Arai Hu Assets fallback update.")
-          for label in assets automation dependencies; do gh label list --limit 100 --json name --jq '.[].name' | grep -Fx "$label" >/dev/null && gh pr edit "$pr" --add-label "$label"; done
+          for label in assets automation dependencies; do
+            if gh label list --limit 100 --json name --jq '.[].name' | grep -Fx "$label" >/dev/null; then
+              gh pr edit "$pr" --add-label "$label" || echo "warning: could not add optional label $label"
+            fi
+          done
