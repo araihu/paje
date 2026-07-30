@@ -441,10 +441,10 @@ footer > div a { color: var(--ink); display: inline-flex; gap: 7px; }
 
 @media (max-width: 720px) {
   .topbar, .hero, .proof-bar, footer { width: min(100% - 36px, 1440px); }
-  .topbar { height: 70px; }
+  .topbar { height: auto; min-height: 70px; grid-template-columns: 1fr; padding: 10px 0; row-gap: 8px; }
   .brand { font-size: 17px; }
   .brand-logo { width: 128px; }
-  .topbar-actions { gap: 7px; }
+  .topbar-actions { width: 100%; min-width: 0; grid-column: 1 / -1; justify-self: stretch; justify-content: space-between; gap: 7px; }
   .language-switcher { font-size: 8px; }
   .language-switcher a { padding: 7px 6px; }
   .github-button { padding: 9px 9px; gap: 6px; }

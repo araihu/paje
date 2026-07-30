@@ -6,6 +6,7 @@ import {
   localeFromRequestHeader,
   type Locale,
 } from "./i18n/catalogs";
+import { SeasonalScripts, seasonalRootAttributes } from "./seasonal-contract.mjs";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -17,10 +18,6 @@ const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
-
-const seasonalRuntimeURL = "https://araihu.com/assets/campaign/v1.js";
-const seasonalChannelURL = "https://araihu.com/assets/releases/current";
-const seasonalRuntimeSRI = "sha384-oPH7l1vK9vKP1Dn+18sO3yEXlz4ts6KzPEQl0SW4Y/+im05gOaamNNaQAf6bGH/n";
 
 async function metadataBase() {
   const incoming = await headers();
@@ -92,16 +89,9 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
   const locale = await requestLocale();
 
   return (
-    <html data-theme="araihu" data-theme-source="default" lang={catalogs[locale].htmlLang}>
+    <html {...seasonalRootAttributes} lang={catalogs[locale].htmlLang}>
       <head>
-        <script defer src="/theme-toggle.js" />
-        <script
-          crossOrigin="anonymous"
-          data-channel={seasonalChannelURL}
-          defer
-          integrity={seasonalRuntimeSRI}
-          src={seasonalRuntimeURL}
-        />
+        <SeasonalScripts />
       </head>
       <body className={`${geistSans.variable} ${geistMono.variable}`}>{children}</body>
     </html>

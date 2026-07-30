@@ -1,25 +1,8 @@
-/* eslint-disable @next/next/no-img-element -- campaign runtime mutates managed image URLs directly. */
-
 type BrandProps = {
   className?: string;
 };
 
-export const pajeLogoFallback =
-  "https://araihu.com/assets/releases/v0.1.1/brand/paje/logo/adaptive-plate-optical.svg";
-
-export function ManagedPajeLogo({ className }: BrandProps) {
-  return (
-    <img
-      alt=""
-      className={className}
-      crossOrigin="anonymous"
-      data-asset-brand="logo"
-      height="41"
-      src={pajeLogoFallback}
-      width="166"
-    />
-  );
-}
+export { ManagedPajeLogo, pajeLogoFallback } from "./seasonal-contract.mjs";
 
 // Geometry comes unchanged from araihu/assets concepts/v11 at a8a9647.
 // Inline rendering keeps the semantic surface/ink/signal contract controllable

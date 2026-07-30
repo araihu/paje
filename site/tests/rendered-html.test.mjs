@@ -1,6 +1,19 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import {
+  CampaignToggle,
+  ManagedPajeLogo,
+  SeasonalScripts,
+  ThemeToggle,
+  seasonalChannelURL as vinextChannelURL,
+  seasonalRootAttributes,
+  seasonalRuntimeSRI as vinextRuntimeSRI,
+  seasonalRuntimeURL as vinextRuntimeURL,
+} from "../app/seasonal-contract.mjs";
 
 const seasonalRuntimeURL = "https://araihu.com/assets/campaign/v1.js";
 const seasonalChannelURL = "https://araihu.com/assets/releases/current";
@@ -28,6 +41,94 @@ const runtime = {
 async function fetchSite(path, acceptLanguage) {
   const worker = await workerPromise;
   return worker.fetch(new Request(`https://paje.araihu.com${path}`, { headers: acceptLanguage ? { "accept-language": acceptLanguage } : {} }), runtime);
+}
+
+function escapePattern(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function tagWith(html, attribute) {
+  const match = html.match(new RegExp(`<[^>]+\\s${escapePattern(attribute)}(?:=(?:"[^"]*"|'[^']*'|[^\\s>]+))?[^>]*>`));
+  assert.ok(match, `missing rendered ${attribute}`);
+  return match[0];
+}
+
+function attribute(tag, name) {
+  const match = tag.match(new RegExp(`(?:^|\\s)${escapePattern(name)}(?:="([^"]*)"|='([^']*)'|=([^\\s>]+))?(?=\\s|/?>)`));
+  return match ? (match[1] ?? match[2] ?? match[3] ?? "") : null;
+}
+
+function seasonalContract(html) {
+  const root = html.match(/<html\b[^>]*>/)?.[0];
+  assert.ok(root, "missing rendered html root");
+  const logo = tagWith(html, "data-asset-brand");
+  const theme = tagWith(html, "data-theme-toggle");
+  const campaign = tagWith(html, "data-campaign-toggle");
+  const runtime = tagWith(html, "data-channel");
+  const baseline = html.match(/<script\b[^>]*src="\/theme-toggle\.js"[^>]*>/)?.[0];
+  assert.ok(baseline, "missing rendered baseline script");
+  return {
+    root: [attribute(root, "data-theme"), attribute(root, "data-theme-source")],
+    baseline: [attribute(baseline, "src"), attribute(baseline, "defer") !== null],
+    runtime: [attribute(runtime, "src"), attribute(runtime, "data-channel"), attribute(runtime, "integrity"), attribute(runtime, "crossorigin"), attribute(runtime, "defer") !== null],
+    logo: [attribute(logo, "src"), attribute(logo, "width"), attribute(logo, "height"), attribute(logo, "data-asset-brand"), attribute(logo, "crossorigin")],
+    theme: [attribute(theme, "type"), attribute(theme, "data-theme-toggle") !== null],
+    campaign: [attribute(campaign, "type"), attribute(campaign, "hidden") !== null, attribute(campaign, "aria-pressed"), attribute(campaign, "data-campaign-toggle") !== null, html.includes("data-campaign-toggle-icon")],
+  };
+}
+
+async function runThemeScript({ saved, systemDark }) {
+  const script = await readFile(new URL("../dist/client/theme-toggle.js", import.meta.url), "utf8");
+  const attributes = new Map([["data-theme-source", "default"]]);
+  const classes = new Set();
+  const stored = new Map(saved ? [["paje-theme", saved]] : []);
+  const documentListeners = new Map();
+  const buttonListeners = new Map();
+  const button = {
+    textContent: "Dark",
+    attributes: new Map([["aria-label", "Switch to dark mode"]]),
+    addEventListener(name, listener) { buttonListeners.set(name, listener); },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+  };
+  const root = {
+    classList: {
+      contains(name) { return classes.has(name); },
+      toggle(name, force) {
+        if (force) classes.add(name);
+        else classes.delete(name);
+      },
+    },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    setAttribute(name, value) { attributes.set(name, value); },
+  };
+  const document = {
+    documentElement: root,
+    addEventListener(name, listener) { documentListeners.set(name, listener); },
+    querySelectorAll(selector) { return selector === "[data-theme-toggle]" ? [button] : []; },
+  };
+  const window = {
+    localStorage: {
+      getItem(name) { return stored.get(name) ?? null; },
+      setItem(name, value) { stored.set(name, value); },
+    },
+    matchMedia(query) {
+      assert.equal(query, "(prefers-color-scheme: dark)");
+      return { matches: systemDark };
+    },
+  };
+  vm.runInNewContext(script, { document, window });
+  const snapshot = () => ({
+    button: button.textContent,
+    label: button.attributes.get("aria-label"),
+    darkClass: classes.has("dark"),
+    scheme: attributes.get("data-color-scheme") ?? null,
+    source: attributes.get("data-theme-source"),
+    saved: stored.get("paje-theme") ?? null,
+  });
+  const initial = snapshot();
+  documentListeners.get("DOMContentLoaded")();
+  buttonListeners.get("click")();
+  return { initial, clicked: snapshot() };
 }
 
 test("serves static localized documents", async () => {
@@ -75,26 +176,56 @@ test("keeps theme preference separate from campaign opt-out", async () => {
   assert.doesNotMatch(script, /data-campaign-toggle|campaign\.v1\.optout/);
 });
 
-test("keeps generator and Vinext enrollment sources aligned", async () => {
-  const [layout, brand, page, toggle] = await Promise.all([
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/brand.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/theme-toggle.tsx", import.meta.url), "utf8"),
-  ]);
-  for (const value of [seasonalRuntimeURL, seasonalChannelURL, seasonalRuntimeSRI]) assert.match(layout, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(layout, /data-theme-source="default"/);
-  assert.match(brand, new RegExp(pajeLogoFallback.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(brand, /data-asset-brand="logo"/);
-  assert.equal((page.match(/<ManagedPajeLogo/g) ?? []).length, 1);
-  assert.equal((page.match(/<CampaignToggle/g) ?? []).length, 1);
-  assert.match(toggle, /data-theme-toggle/);
-  assert.match(toggle, /data-campaign-toggle/);
+test("renders the same seasonal contract from generator and Vinext", async () => {
+  assert.equal(vinextRuntimeURL, seasonalRuntimeURL);
+  assert.equal(vinextChannelURL, seasonalChannelURL);
+  assert.equal(vinextRuntimeSRI, seasonalRuntimeSRI);
+  const response = await fetchSite("/en", "en");
+  const generated = await response.text();
+  const vinext = renderToStaticMarkup(
+    createElement(
+      "html",
+      seasonalRootAttributes,
+      createElement("head", null, createElement(SeasonalScripts)),
+      createElement("body", null,
+        createElement(ManagedPajeLogo, { className: "brand-logo" }),
+        createElement(ThemeToggle),
+        createElement(CampaignToggle),
+      ),
+    ),
+  );
+  assert.deepEqual(seasonalContract(vinext), seasonalContract(generated));
+});
+
+test("toggles from effective system theme and honors saved preferences", async () => {
+  const systemDark = await runThemeScript({ saved: null, systemDark: true });
+  assert.deepEqual(systemDark.initial, {
+    button: "Light", label: "Switch to light mode", darkClass: false,
+    scheme: null, source: "default", saved: null,
+  });
+  assert.deepEqual(systemDark.clicked, {
+    button: "Dark", label: "Switch to dark mode", darkClass: false,
+    scheme: "light", source: "preference", saved: "light",
+  });
+
+  for (const saved of ["dark", "light"]) {
+    const result = await runThemeScript({ saved, systemDark: saved === "light" });
+    const dark = saved === "dark";
+    assert.deepEqual(result.initial, {
+      button: dark ? "Light" : "Dark",
+      label: dark ? "Switch to light mode" : "Switch to dark mode",
+      darkClass: dark,
+      scheme: saved,
+      source: "preference",
+      saved,
+    });
+  }
 });
 
 test("keeps static navigation accessible across themes and viewports", async () => {
   const css = await readFile(new URL("../dist/client/site.css", import.meta.url), "utf8");
   const theme = await readFile(new URL("../dist/client/araihu.css", import.meta.url), "utf8");
+  const vinextCSS = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(theme, /\[data-theme="araihu"\]/);
   assert.match(theme, /--color-primary: #173b72/);
   assert.match(theme, /--color-primary-dark: #c7ff4a/);
@@ -109,6 +240,8 @@ test("keeps static navigation accessible across themes and viewports", async () 
   assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*?\.actions\s*\{[^}]*flex-direction:\s*column/s);
   assert.match(css, /a:focus-visible\s*\{/);
   assert.match(css, /prefers-reduced-motion:\s*no-preference/);
+  assert.match(vinextCSS, /@media \(max-width:\s*720px\)[\s\S]*?\.topbar\s*\{[^}]*height:\s*auto[^}]*grid-template-columns:\s*1fr/s);
+  assert.match(vinextCSS, /@media \(max-width:\s*720px\)[\s\S]*?\.topbar-actions\s*\{[^}]*width:\s*100%[^}]*grid-column:\s*1\s*\/\s*-1[^}]*justify-content:\s*space-between/s);
 });
 
 test("omits unused third-party runtime from the static artifact", async () => {
