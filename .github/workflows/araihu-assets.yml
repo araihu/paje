@@ -1,7 +1,7 @@
 name: Update Arai Hu fallback assets
 on:
   repository_dispatch:
-    types: [araihu-assets-release]
+    types: [araihu-assets-released]
   workflow_dispatch:
     inputs:
       assets_repository: {required: true, default: araihu/assets, type: string}
@@ -10,43 +10,79 @@ on:
       release_url: {required: true, type: string}
       release_sha256: {required: true, type: string}
       release_json_sha256: {required: true, type: string}
-permissions: {contents: read, pull-requests: write, issues: write}
+permissions:
+  contents: read
+
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.ARAIHU_ASSETS_APP_ID }}
-          private-key: ${{ secrets.ARAIHU_ASSETS_PRIVATE_KEY }}
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-      - uses: actions/setup-go@v6
-        with: {go-version-file: go.mod}
-      - name: Read exact provenance payload
+      - name: Read and validate exact provenance payload
         id: event
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
           EVENT_NAME: ${{ github.event_name }}
           INPUTS: ${{ toJSON(inputs) }}
         run: |
-          python3 - <<'PY' > "$GITHUB_OUTPUT"
-          import json, os
-          v=json.loads(os.environ['PAYLOAD']) if os.environ['EVENT_NAME']=='repository_dispatch' else json.loads(os.environ['INPUTS'])
-          keys={'assets_repository','assets_revision','release','release_url','release_sha256','release_json_sha256'}
-          if set(v) != keys: raise SystemExit('payload must contain exactly six provenance keys')
-          for k in sorted(keys): print(f'{k}={v[k]}')
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+
+          values = json.loads(os.environ["PAYLOAD"] if os.environ["EVENT_NAME"] == "repository_dispatch" else os.environ["INPUTS"])
+          keys = {"assets_repository", "assets_revision", "release", "release_url", "release_sha256", "release_json_sha256"}
+          if not isinstance(values, dict) or set(values) != keys:
+              raise SystemExit("payload must contain exactly six provenance keys")
+          if not all(isinstance(values[key], str) for key in keys):
+              raise SystemExit("all provenance values must be strings")
+          if values["assets_repository"] != "araihu/assets":
+              raise SystemExit("assets repository must be araihu/assets")
+          if re.fullmatch(r"[0-9a-f]{40}", values["assets_revision"]) is None:
+              raise SystemExit("assets revision must be a full commit SHA")
+          if re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", values["release"]) is None:
+              raise SystemExit("release must be a stable SemVer tag")
+          expected_url = f"https://github.com/araihu/assets/releases/download/{values['release']}/araihu-assets-{values['release']}.tar.gz"
+          if values["release_url"] != expected_url:
+              raise SystemExit("release URL differs from immutable archive URL")
+          for key in ("release_sha256", "release_json_sha256"):
+              if re.fullmatch(r"[0-9a-f]{64}", values[key]) is None:
+                  raise SystemExit(f"{key} must be a SHA-256 digest")
+          for key in sorted(keys):
+              print(f"{key}={values[key]}")
           PY
-      - name: Enforce provenance
+      - name: Verify tag resolves to dispatched revision
+        env:
+          ASSETS_REVISION: ${{ steps.event.outputs.assets_revision }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.event.outputs.release }}
         run: |
-          test '${{ steps.event.outputs.assets_repository }}' = araihu/assets
-          test '${{ steps.event.outputs.assets_revision }}' =~ ^[0-9a-f]{40}$
-          test '${{ steps.event.outputs.release }}' =~ ^v[0-9]+\.[0-9]+\.[0-9]+$
-          test '${{ steps.event.outputs.release_url }}' = "https://github.com/araihu/assets/releases/download/${{ steps.event.outputs.release }}/araihu-assets-${{ steps.event.outputs.release }}.tar.gz"
-          test '${{ steps.event.outputs.release_sha256 }}' =~ ^[0-9a-f]{64}$
-          test '${{ steps.event.outputs.release_json_sha256 }}' =~ ^[0-9a-f]{64}$
+          set -euo pipefail
+          object=$(gh api "repos/araihu/assets/git/ref/tags/${RELEASE}" --jq '.object.type + " " + .object.sha')
+          read -r object_type object_sha <<< "$object"
+          if test "$object_type" = tag; then
+            object=$(gh api "repos/araihu/assets/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')
+            read -r object_type object_sha <<< "$object"
+          fi
+          test "$object_type" = commit
+          test "$object_sha" = "$ASSETS_REVISION"
+      - name: Create selected-repository App token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.ARAIHU_ASSETS_APP_ID }}
+          private-key: ${{ secrets.ARAIHU_ASSETS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: paje
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: read
+      - name: Check out Pajé
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version-file: go.mod}
       - name: Download immutable release once
         run: curl --fail --location --proto '=https' --tlsv1.2 '${{ steps.event.outputs.release_url }}' --output /tmp/araihu-assets.tar.gz
       - name: Apply and regenerate
@@ -69,6 +105,8 @@ jobs:
           branch="automation/araihu-assets-${RELEASE}"
           git switch -c "$branch"
           git add araihu-assets.json site/generator/araihu.css site/public
+          git config user.name "araihu-assets-release-bot[bot]"
+          git config user.email "araihu-assets-release-bot[bot]@users.noreply.github.com"
           git commit -m "chore(assets): update fallbacks for ${RELEASE}"
           git push origin "$branch"
           pr=$(gh pr create --base main --head "$branch" --title "chore(assets): update fallbacks for ${RELEASE}" --body "Verified immutable Arai Hu Assets fallback update.")
