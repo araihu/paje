@@ -1,7 +1,7 @@
 import { catalogs, type Locale } from "./i18n/catalogs";
-import { PajeIcon, PajeLogo } from "./brand";
+import { ManagedPajeLogo, PajeIcon, PajeLogo } from "./brand";
 import { LanguageSwitcher } from "./i18n/language-switcher";
-import { ThemeToggle } from "./theme-toggle";
+import { CampaignToggle, ThemeToggle } from "./theme-toggle";
 
 const githubUrl = "https://github.com/araihu/paje";
 
@@ -88,7 +88,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
     <div className="site-shell">
       <header className="topbar">
         <a className="brand" href="#inicio" aria-label={copy.navigation.brandLabel}>
-          <PajeLogo className="brand-logo" />
+          <ManagedPajeLogo className="brand-logo" />
         </a>
         <nav className="desktop-nav" aria-label={copy.navigation.primaryLabel}>
           <a href="#produto">{copy.navigation.product}</a>
@@ -107,6 +107,7 @@ export function LocalizedHome({ locale }: { locale: Locale }) {
             }}
           />
           <ThemeToggle />
+          <CampaignToggle />
           <a className="github-button" href={githubUrl} target="_blank" rel="noreferrer">
             GitHub <Arrow />
           </a>

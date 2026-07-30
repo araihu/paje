@@ -2,6 +2,8 @@ module github.com/araihu/paje
 
 go 1.26.1
 
+toolchain go1.26.5
+
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/google/uuid v1.6.0

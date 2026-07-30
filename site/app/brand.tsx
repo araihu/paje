@@ -2,6 +2,8 @@ type BrandProps = {
   className?: string;
 };
 
+export { ManagedPajeLogo, pajeLogoFallback } from "./seasonal-contract.mjs";
+
 // Geometry comes unchanged from araihu/assets concepts/v11 at a8a9647.
 // Inline rendering keeps the semantic surface/ink/signal contract controllable
 // by the product's `.dark` class, matching Goshtoso theme behavior.

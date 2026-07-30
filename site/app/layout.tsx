@@ -6,6 +6,7 @@ import {
   localeFromRequestHeader,
   type Locale,
 } from "./i18n/catalogs";
+import { SeasonalScripts, seasonalRootAttributes } from "./seasonal-contract.mjs";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -88,7 +89,10 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
   const locale = await requestLocale();
 
   return (
-    <html lang={catalogs[locale].htmlLang}>
+    <html {...seasonalRootAttributes} lang={catalogs[locale].htmlLang}>
+      <head>
+        <SeasonalScripts />
+      </head>
       <body className={`${geistSans.variable} ${geistMono.variable}`}>{children}</body>
     </html>
   );
