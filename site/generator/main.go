@@ -134,9 +134,19 @@ var siteCSS []byte
 //go:embed araihu.css
 var araiHuTheme []byte
 
+//go:embed theme-toggle.js
+var themeToggle []byte
+
+const (
+	seasonalRuntimeURL = "https://araihu.com/assets/campaign/v1.js"
+	seasonalChannelURL = "https://araihu.com/assets/releases/current"
+	seasonalRuntimeSRI = "sha384-oPH7l1vK9vKP1Dn+18sO3yEXlz4ts6KzPEQl0SW4Y/+im05gOaamNNaQAf6bGH/n"
+	pajeLogoFallback   = "https://araihu.com/assets/releases/v0.1.1/brand/paje/logo/adaptive-plate-optical.svg"
+)
+
 var documentTemplate = template.Must(template.New("document").Parse(`<!doctype html>
-<html lang="{{.Lang}}" data-theme="araihu"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}} · Pajé</title><meta name="description" content="{{.Description}}"><meta property="og:title" content="{{.Title}}"><meta property="og:description" content="{{.Description}}"><meta property="og:image" content="https://paje.araihu.com/og.png"><meta name="twitter:card" content="summary_large_image"><link rel="canonical" href="https://paje.araihu.com/{{.Locale}}"><link rel="alternate" hreflang="en" href="https://paje.araihu.com/en"><link rel="alternate" hreflang="pt-BR" href="https://paje.araihu.com/pt-br"><link rel="alternate" hreflang="es" href="https://paje.araihu.com/es"><link rel="alternate" hreflang="x-default" href="https://paje.araihu.com/en"><link rel="icon" href="/paje-icon-background.svg">{{.Dependencies}}<link rel="stylesheet" href="/araihu.css"><link rel="stylesheet" href="/site.css"></head>
-<body><a class="skip" href="#main">{{.SkipLabel}}</a><header class="mast"><a class="brand" href="/{{.Locale}}" aria-label="{{.HomeLabel}}"><img src="/paje-logo-transparent.svg" alt="" width="166" height="41"></a><nav aria-label="{{.PrimaryLabel}}"><a href="#protocol">{{.ProtocolLabel}}</a><a href="#boundary">{{.BoundaryLabel}}</a><a href="https://github.com/araihu/paje">GitHub</a></nav><div class="languages" aria-label="{{.LanguageLabel}}"><a href="/en"{{if eq .Locale "en"}} aria-current="page"{{end}}>EN</a><a href="/pt-br"{{if eq .Locale "pt-br"}} aria-current="page"{{end}}>PT</a><a href="/es"{{if eq .Locale "es"}} aria-current="page"{{end}}>ES</a></div></header>
+<html lang="{{.Lang}}" data-theme="araihu" data-theme-source="default"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}} · Pajé</title><meta name="description" content="{{.Description}}"><meta property="og:title" content="{{.Title}}"><meta property="og:description" content="{{.Description}}"><meta property="og:image" content="https://paje.araihu.com/og.png"><meta name="twitter:card" content="summary_large_image"><link rel="canonical" href="https://paje.araihu.com/{{.Locale}}"><link rel="alternate" hreflang="en" href="https://paje.araihu.com/en"><link rel="alternate" hreflang="pt-BR" href="https://paje.araihu.com/pt-br"><link rel="alternate" hreflang="es" href="https://paje.araihu.com/es"><link rel="alternate" hreflang="x-default" href="https://paje.araihu.com/en"><link rel="icon" href="/paje-icon-background.svg">{{.Dependencies}}<link rel="stylesheet" href="/araihu.css"><link rel="stylesheet" href="/site.css"><script src="/theme-toggle.js" defer></script><script src="` + seasonalRuntimeURL + `" data-channel="` + seasonalChannelURL + `" defer integrity="` + seasonalRuntimeSRI + `" crossorigin="anonymous"></script></head>
+<body><a class="skip" href="#main">{{.SkipLabel}}</a><header class="mast"><a class="brand" href="/{{.Locale}}" aria-label="{{.HomeLabel}}"><img src="` + pajeLogoFallback + `" alt="" width="166" height="41" data-asset-brand="logo" crossorigin="anonymous"></a><nav aria-label="{{.PrimaryLabel}}"><a href="#protocol">{{.ProtocolLabel}}</a><a href="#boundary">{{.BoundaryLabel}}</a><a href="https://github.com/araihu/paje">GitHub</a></nav><div class="mast-actions"><div class="languages" aria-label="{{.LanguageLabel}}"><a href="/en"{{if eq .Locale "en"}} aria-current="page"{{end}}>EN</a><a href="/pt-br"{{if eq .Locale "pt-br"}} aria-current="page"{{end}}>PT</a><a href="/es"{{if eq .Locale "es"}} aria-current="page"{{end}}>ES</a></div><button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode">Dark</button><button class="campaign-toggle" type="button" hidden data-campaign-toggle aria-pressed="false" aria-label="Toggle seasonal appearance"><span data-campaign-toggle-icon aria-hidden="true"></span></button></div></header>
 <main id="main"><section class="hero"><div class="hero-copy"><div class="status">{{.Status}}</div><p class="eyebrow">{{.Eyebrow}}</p><h1>{{.Hero}}</h1><p class="lead">{{.Lead}}</p><div class="actions"><a class="action" href="#protocol">{{.Guide}} <span aria-hidden="true">↘</span></a><a class="quiet-link" href="https://github.com/araihu/paje">{{.GitHub}}</a></div></div><aside class="run" aria-label="{{.RunLabel}}"><div class="run-head"><span>code-change@v1</span><span>persisted</span></div><ol><li class="done"><b>resolve</b><span>revision + context</span></li><li class="done"><b>execute</b><span>isolated evidence</span></li><li class="active"><b>approval</b><span>artifact bound</span></li><li><b>publish</b><span>idempotent</span></li><li><b>finalize</b><span>durable outcome</span></li></ol><footer><span>artifact mode</span><span>read-only example</span></footer></aside></section>
 <section id="protocol" class="story"><p class="section-label">{{.ProtocolLabel}}</p><h2>{{.Protocol}}</h2><p>{{.ProtocolBody}}</p></section>
 <section id="boundary" class="split"><article><p class="section-label">{{.BoundarySectionLabel}}</p><h2>{{.Boundary}}</h2><p>{{.BoundaryBody}}</p></article><article><p class="section-label">{{.BetaSectionLabel}}</p><h2>{{.Current}}</h2><p>{{.CurrentBody}}</p></article></section>
@@ -152,7 +162,7 @@ func main() {
 }
 
 func generate(out string) error {
-	for _, name := range []string{"en", "pt-br", "es", "assets", "araihu.css", "site.css"} {
+	for _, name := range []string{"en", "pt-br", "es", "assets", "araihu.css", "site.css", "theme-toggle.js"} {
 		if err := os.RemoveAll(filepath.Join(out, name)); err != nil {
 			return err
 		}
@@ -172,6 +182,9 @@ func generate(out string) error {
 		return err
 	}
 	if err := write(filepath.Join(out, "site.css"), siteCSS); err != nil {
+		return err
+	}
+	if err := write(filepath.Join(out, "theme-toggle.js"), themeToggle); err != nil {
 		return err
 	}
 	for _, page := range catalog {

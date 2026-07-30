@@ -1,15 +1,18 @@
-"use client";
-
-import { useState } from "react";
-
 export function ThemeToggle() {
-  const [dark, setDark] = useState(false);
+  return <button className="theme-toggle" type="button" aria-label="Switch to dark mode" data-theme-toggle>Dark</button>;
+}
 
-  function toggle() {
-    const next = !dark;
-    document.documentElement.classList.toggle("dark", next);
-    setDark(next);
-  }
-
-  return <button className="theme-toggle" type="button" aria-label={dark ? "Switch to light mode" : "Switch to dark mode"} onClick={toggle}>{dark ? "Light" : "Dark"}</button>;
+export function CampaignToggle() {
+  return (
+    <button
+      aria-label="Toggle seasonal appearance"
+      aria-pressed="false"
+      className="campaign-toggle"
+      data-campaign-toggle
+      hidden
+      type="button"
+    >
+      <span aria-hidden="true" data-campaign-toggle-icon />
+    </button>
+  );
 }

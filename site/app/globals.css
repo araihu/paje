@@ -150,6 +150,20 @@ code, pre, .mono-label { font-family: var(--font-geist-mono), monospace; }
 }
 .theme-toggle:hover { border-color: var(--blue); color: var(--blue); }
 
+.campaign-toggle {
+  min-width: 38px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+.campaign-toggle[hidden] { display: none; }
+.campaign-toggle:hover { border-color: var(--blue); color: var(--blue); }
+.campaign-toggle [data-campaign-toggle-icon],
+.campaign-toggle [data-campaign-toggle-icon] > * { width: 16px; height: 16px; display: block; }
+
 .hero {
   width: min(1440px, calc(100% - 64px));
   min-height: 760px;

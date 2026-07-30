@@ -23,7 +23,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-color-scheme="light"]) {
     color-scheme: dark;
     --surface: var(--color-surface-dark);
     --surface-raised: var(--color-surface-dark-alt);
@@ -46,6 +46,30 @@
     --focus: #d9ff83;
     --action-shadow: rgb(199 255 74 / 22%);
   }
+}
+
+:root.dark {
+  color-scheme: dark;
+  --surface: var(--color-surface-dark);
+  --surface-raised: var(--color-surface-dark-alt);
+  --surface-offset: var(--color-surface-dark-alt);
+  --ink: var(--color-on-surface-dark-strong);
+  --muted: var(--color-on-surface-dark);
+  --subtle: #b9c5d6;
+  --outline: var(--color-outline-dark);
+  --outline-soft: color-mix(in srgb, var(--color-outline-dark) 65%, var(--color-surface-dark) 35%);
+  --primary: var(--color-primary-dark);
+  --primary-hover: var(--color-secondary-dark);
+  --on-primary: var(--color-on-primary-dark);
+  --signal: var(--araihu-logo-signal);
+  --success: var(--color-success);
+  --night: #020812;
+  --on-night: #f7f8f3;
+  --night-muted: #d5ddeb;
+  --night-accent: #c7ff4a;
+  --run-muted: #d5ddeb;
+  --focus: #d9ff83;
+  --action-shadow: rgb(199 255 74 / 22%);
 }
 
 * {
@@ -139,12 +163,46 @@ a:focus-visible {
 }
 
 .languages {
-  justify-self: end;
   display: flex;
   border: 1px solid var(--outline);
   font-size: 0.72rem;
   font-weight: 750;
   letter-spacing: 0.08em;
+}
+
+.mast-actions {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.theme-toggle,
+.campaign-toggle {
+  min-width: 44px;
+  min-height: 44px;
+  border: 1px solid var(--outline);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+}
+
+.theme-toggle:hover,
+.campaign-toggle:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.campaign-toggle[hidden] {
+  display: none;
+}
+
+.campaign-toggle [data-campaign-toggle-icon],
+.campaign-toggle [data-campaign-toggle-icon] > * {
+  width: 1rem;
+  height: 1rem;
+  display: block;
 }
 
 .languages a {
@@ -353,6 +411,12 @@ a:focus-visible {
     width: calc(100% - 2rem);
     grid-template-columns: 1fr max-content;
     min-height: 72px;
+  }
+
+  .mast-actions {
+    grid-column: 1 / -1;
+    justify-self: stretch;
+    justify-content: space-between;
   }
 
   .mast nav {

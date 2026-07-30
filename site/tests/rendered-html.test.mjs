@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+const seasonalRuntimeURL = "https://araihu.com/assets/campaign/v1.js";
+const seasonalChannelURL = "https://araihu.com/assets/releases/current";
+const seasonalRuntimeSRI = "sha384-oPH7l1vK9vKP1Dn+18sO3yEXlz4ts6KzPEQl0SW4Y/+im05gOaamNNaQAf6bGH/n";
+const pajeLogoFallback = "https://araihu.com/assets/releases/v0.1.1/brand/paje/logo/adaptive-plate-optical.svg";
+
 const workerURL = new URL("../dist/server/index.js", import.meta.url);
 workerURL.searchParams.set("test", `${process.pid}-${Date.now()}`);
 const workerPromise = import(workerURL.href).then(({ default: worker }) => worker);
@@ -37,11 +42,22 @@ test("serves static localized documents", async () => {
     assert.equal(response.headers.get("content-language"), locale === "pt-br" ? "pt-BR" : locale);
     const html = await response.text();
     assert.match(html, /\/assets\/styles\.css/);
-    assert.match(html, /<html[^>]*data-theme="araihu"/);
+    assert.match(html, /<html[^>]*data-theme="araihu"[^>]*data-theme-source="default"/);
     assert.match(html, /\/araihu\.css/);
     assert.match(html, /<title>[^<]+ · Pajé<\/title>/);
-    assert.match(html, /paje-logo-transparent\.svg/);
+    assert.match(html, new RegExp(`src="${pajeLogoFallback.replaceAll("/", "\\/")}"[^>]*width="166"[^>]*height="41"[^>]*data-asset-brand="logo"[^>]*crossorigin="anonymous"`));
     assert.match(html, /paje-icon-background\.svg/);
+    assert.match(html, /<link rel="icon" href="\/paje-icon-background\.svg">/);
+    assert.equal((html.match(/data-asset-brand="logo"/g) ?? []).length, 1);
+    assert.equal((html.match(/data-campaign-toggle(?:\s|>)/g) ?? []).length, 1);
+    assert.match(html, /<button[^>]*hidden[^>]*data-campaign-toggle[^>]*aria-pressed="false"/);
+    assert.match(html, /data-campaign-toggle-icon/);
+
+    const baselineScript = html.indexOf('src="/theme-toggle.js"');
+    const runtimeScript = html.indexOf(`src="${seasonalRuntimeURL}"`);
+    assert.ok(baselineScript > 0 && runtimeScript > baselineScript, "baseline theme code must precede campaign runtime");
+    assert.match(html, new RegExp(`src="${seasonalRuntimeURL.replaceAll("/", "\\/")}"[^>]*data-channel="${seasonalChannelURL.replaceAll("/", "\\/")}"[^>]*defer[^>]*integrity="${seasonalRuntimeSRI.replaceAll("/", "\\/").replaceAll("+", "\\+")}"[^>]*crossorigin="anonymous"`));
+    assert.doesNotMatch(html, /data-campaign=/);
     assert.equal((html.match(/rel="alternate" hreflang=/g) ?? []).length, 4);
     assert.match(html, new RegExp(`rel="canonical" href="https://paje\\.araihu\\.com/${locale}"`));
     assert.doesNotMatch(html, /alpine(?:js)?|htmx/i);
@@ -49,6 +65,31 @@ test("serves static localized documents", async () => {
     assert.doesNotMatch(html, /paje-(favicon|mark|mark-reverse)\.svg/);
     for (const landmark of landmarks) assert.match(html, new RegExp(landmark));
   }
+});
+
+test("keeps theme preference separate from campaign opt-out", async () => {
+  const script = await readFile(new URL("../dist/client/theme-toggle.js", import.meta.url), "utf8");
+  assert.match(script, /var key = "paje-theme"/);
+  assert.match(script, /setAttribute\("data-theme-source", "preference"\)/);
+  assert.match(script, /setAttribute\("data-color-scheme", theme\)/);
+  assert.doesNotMatch(script, /data-campaign-toggle|campaign\.v1\.optout/);
+});
+
+test("keeps generator and Vinext enrollment sources aligned", async () => {
+  const [layout, brand, page, toggle] = await Promise.all([
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/brand.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/theme-toggle.tsx", import.meta.url), "utf8"),
+  ]);
+  for (const value of [seasonalRuntimeURL, seasonalChannelURL, seasonalRuntimeSRI]) assert.match(layout, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(layout, /data-theme-source="default"/);
+  assert.match(brand, new RegExp(pajeLogoFallback.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(brand, /data-asset-brand="logo"/);
+  assert.equal((page.match(/<ManagedPajeLogo/g) ?? []).length, 1);
+  assert.equal((page.match(/<CampaignToggle/g) ?? []).length, 1);
+  assert.match(toggle, /data-theme-toggle/);
+  assert.match(toggle, /data-campaign-toggle/);
 });
 
 test("keeps static navigation accessible across themes and viewports", async () => {
@@ -61,6 +102,8 @@ test("keeps static navigation accessible across themes and viewports", async () 
   assert.match(css, /--on-primary:\s*var\(--color-on-primary\)/);
   assert.match(css, /--surface:\s*var\(--color-surface-dark\)/);
   assert.match(css, /--run-muted:\s*#d5ddeb/);
+  assert.match(css, /:root\.dark\s*\{[^}]*--surface:\s*var\(--color-surface-dark\)/s);
+  assert.match(css, /:root:not\(\[data-color-scheme="light"\]\)/);
   assert.match(css, /\.languages a\s*\{[^}]*min-height:\s*44px/s);
   assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*?\.hero h1\s*\{[^}]*font-size:\s*clamp\(2\.75rem, 12vw, 3\.5rem\)[^}]*overflow-wrap:\s*anywhere/s);
   assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*?\.actions\s*\{[^}]*flex-direction:\s*column/s);
