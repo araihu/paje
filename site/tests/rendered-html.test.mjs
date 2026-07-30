@@ -67,6 +67,9 @@ function seasonalContract(html) {
   const runtime = tagWith(html, "data-channel");
   const baseline = html.match(/<script\b[^>]*src="\/theme-toggle\.js"[^>]*>/)?.[0];
   assert.ok(baseline, "missing rendered baseline script");
+  const scriptSequence = [...html.matchAll(/<script\b[^>]*>/g)]
+    .map(([tag]) => attribute(tag, "src"))
+    .filter((src) => src === "/theme-toggle.js" || src === seasonalRuntimeURL);
   return {
     root: [attribute(root, "data-theme"), attribute(root, "data-theme-source")],
     baseline: [attribute(baseline, "src"), attribute(baseline, "defer") !== null],
@@ -74,6 +77,8 @@ function seasonalContract(html) {
     logo: [attribute(logo, "src"), attribute(logo, "width"), attribute(logo, "height"), attribute(logo, "data-asset-brand"), attribute(logo, "crossorigin")],
     theme: [attribute(theme, "type"), attribute(theme, "data-theme-toggle") !== null],
     campaign: [attribute(campaign, "type"), attribute(campaign, "hidden") !== null, attribute(campaign, "aria-pressed"), attribute(campaign, "data-campaign-toggle") !== null, html.includes("data-campaign-toggle-icon")],
+    scriptSequence,
+    baselineBeforeRuntime: scriptSequence.indexOf("/theme-toggle.js") < scriptSequence.indexOf(seasonalRuntimeURL),
   };
 }
 
@@ -194,7 +199,11 @@ test("renders the same seasonal contract from generator and Vinext", async () =>
       ),
     ),
   );
-  assert.deepEqual(seasonalContract(vinext), seasonalContract(generated));
+  const vinextContract = seasonalContract(vinext);
+  const generatedContract = seasonalContract(generated);
+  assert.equal(vinextContract.baselineBeforeRuntime, true);
+  assert.equal(generatedContract.baselineBeforeRuntime, true);
+  assert.deepEqual(vinextContract, generatedContract);
 });
 
 test("toggles from effective system theme and honors saved preferences", async () => {
