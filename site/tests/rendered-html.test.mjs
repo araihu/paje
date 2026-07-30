@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -264,15 +265,15 @@ test("omits unused third-party runtime from the static artifact", async () => {
   assert.ok(combobox.length > 0);
 });
 
-test("packages the approved Pajé v11 brand assets", async () => {
-  for (const name of [
-    "paje-icon-background.svg",
-    "paje-icon-transparent.svg",
-    "paje-logo-background.svg",
-    "paje-logo-transparent.svg",
+test("packages the approved immutable Pajé brand assets", async () => {
+  for (const [name, digest] of [
+    ["paje-icon-background.svg", "9c1b2003c15828e10311c56211f389daf4a837322b8758b9ae8d8c7e6950e9f4"],
+    ["paje-icon-transparent.svg", "54863bc1aea56d54b5b64d22b8783b836b18616b6c70216fff5f18baadce85ca"],
+    ["paje-logo-background.svg", "daa90226fbf996cd12a6a65728e3539e73fe6a9cd7fee1fbd78441a526d637c7"],
+    ["paje-logo-transparent.svg", "09010e092c6550a3b9fa95c0fdcc7e3108aa32215291d8f4e456ff92ce4bf310"],
   ]) {
     const contents = await readFile(new URL(`../dist/client/${name}`, import.meta.url), "utf8");
-    assert.match(contents, /araihu-brand-v11/);
+    assert.equal(createHash("sha256").update(contents).digest("hex"), digest);
   }
 });
 
