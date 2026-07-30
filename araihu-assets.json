@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "assetsRepository": "araihu/assets",
+  "assetsRevision": "74c36ed038ad127cab72d10ac6c5a8ca79646244",
+  "release": "v0.1.1",
+  "releaseUrl": "https://github.com/araihu/assets/releases/download/v0.1.1/araihu-assets-v0.1.1.tar.gz",
+  "releaseSha256": "4f9549a5975a284921fa7eb263cbd1a92c065d323ab395e82c3eac1d0a46886b",
+  "releaseJsonSha256": "eb2f556224ce1bcab979e3f1c8c8f05813dc0c3381b30ae757df32216027ebb9",
+  "mappings": [
+    {
+      "source": "themes/araihu.css",
+      "destination": "site/generator/araihu.css",
+      "canonicalName": "",
+      "namespace": "",
+      "product": "",
+      "artwork": "",
+      "appearance": "",
+      "surface": "",
+      "framing": "",
+      "format": ""
+    },
+    {
+      "source": "brand/paje/logo/adaptive-plate-optical.svg",
+      "destination": "site/public/paje-logo-background.svg",
+      "canonicalName": "paje-logo-adaptive-plate-optical",
+      "namespace": "brand",
+      "product": "paje",
+      "artwork": "logo",
+      "appearance": "adaptive",
+      "surface": "plate",
+      "framing": "optical",
+      "format": "svg"
+    },
+    {
+      "source": "brand/paje/logo/adaptive-transparent-optical.svg",
+      "destination": "site/public/paje-logo-transparent.svg",
+      "canonicalName": "paje-logo-adaptive-transparent-optical",
+      "namespace": "brand",
+      "product": "paje",
+      "artwork": "logo",
+      "appearance": "adaptive",
+      "surface": "transparent",
+      "framing": "optical",
+      "format": "svg"
+    },
+    {
+      "source": "icons/brand/paje-icon-adaptive-plate-optical.svg",
+      "destination": "site/public/paje-icon-background.svg",
+      "canonicalName": "paje-icon-adaptive-plate-optical",
+      "namespace": "brand",
+      "product": "paje",
+      "artwork": "icon",
+      "appearance": "adaptive",
+      "surface": "plate",
+      "framing": "optical",
+      "format": "svg"
+    },
+    {
+      "source": "icons/brand/paje-icon-adaptive-transparent-optical.svg",
+      "destination": "site/public/paje-icon-transparent.svg",
+      "canonicalName": "paje-icon-adaptive-transparent-optical",
+      "namespace": "brand",
+      "product": "paje",
+      "artwork": "icon",
+      "appearance": "adaptive",
+      "surface": "transparent",
+      "framing": "optical",
+      "format": "svg"
+    }
+  ]
+}

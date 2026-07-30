@@ -1,0 +1,75 @@
+name: Update Arai Hu fallback assets
+on:
+  repository_dispatch:
+    types: [araihu-assets-release]
+  workflow_dispatch:
+    inputs:
+      assets_repository: {required: true, default: araihu/assets, type: string}
+      assets_revision: {required: true, type: string}
+      release: {required: true, type: string}
+      release_url: {required: true, type: string}
+      release_sha256: {required: true, type: string}
+      release_json_sha256: {required: true, type: string}
+permissions: {contents: read, pull-requests: write, issues: write}
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.ARAIHU_ASSETS_APP_ID }}
+          private-key: ${{ secrets.ARAIHU_ASSETS_PRIVATE_KEY }}
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/setup-go@v6
+        with: {go-version-file: go.mod}
+      - name: Read exact provenance payload
+        id: event
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY' > "$GITHUB_OUTPUT"
+          import json, os
+          v=json.loads(os.environ['PAYLOAD']) if os.environ['EVENT_NAME']=='repository_dispatch' else json.loads(os.environ['INPUTS'])
+          keys={'assets_repository','assets_revision','release','release_url','release_sha256','release_json_sha256'}
+          if set(v) != keys: raise SystemExit('payload must contain exactly six provenance keys')
+          for k in sorted(keys): print(f'{k}={v[k]}')
+          PY
+      - name: Enforce provenance
+        run: |
+          test '${{ steps.event.outputs.assets_repository }}' = araihu/assets
+          test '${{ steps.event.outputs.assets_revision }}' =~ ^[0-9a-f]{40}$
+          test '${{ steps.event.outputs.release }}' =~ ^v[0-9]+\.[0-9]+\.[0-9]+$
+          test '${{ steps.event.outputs.release_url }}' = "https://github.com/araihu/assets/releases/download/${{ steps.event.outputs.release }}/araihu-assets-${{ steps.event.outputs.release }}.tar.gz"
+          test '${{ steps.event.outputs.release_sha256 }}' =~ ^[0-9a-f]{64}$
+          test '${{ steps.event.outputs.release_json_sha256 }}' =~ ^[0-9a-f]{64}$
+      - name: Download immutable release once
+        run: curl --fail --location --proto '=https' --tlsv1.2 '${{ steps.event.outputs.release_url }}' --output /tmp/araihu-assets.tar.gz
+      - name: Apply and regenerate
+        run: |
+          go run ./cmd/araihu-assets-update -repo . -archive /tmp/araihu-assets.tar.gz \
+            -assets-repository '${{ steps.event.outputs.assets_repository }}' \
+            -assets-revision '${{ steps.event.outputs.assets_revision }}' \
+            -release '${{ steps.event.outputs.release }}' \
+            -release-url '${{ steps.event.outputs.release_url }}' \
+            -release-sha256 '${{ steps.event.outputs.release_sha256 }}' \
+            -release-json-sha256 '${{ steps.event.outputs.release_json_sha256 }}'
+          cd site/generator && GOTOOLCHAIN=auto go run . --out ../public
+          git diff --check
+      - name: Create versioned pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE: ${{ steps.event.outputs.release }}
+        run: |
+          git diff --quiet && exit 0
+          branch="automation/araihu-assets-${RELEASE}"
+          git switch -c "$branch"
+          git add araihu-assets.json site/generator/araihu.css site/public
+          git commit -m "chore(assets): update fallbacks for ${RELEASE}"
+          git push origin "$branch"
+          pr=$(gh pr create --base main --head "$branch" --title "chore(assets): update fallbacks for ${RELEASE}" --body "Verified immutable Arai Hu Assets fallback update.")
+          for label in assets automation dependencies; do gh label list --limit 100 --json name --jq '.[].name' | grep -Fx "$label" >/dev/null && gh pr edit "$pr" --add-label "$label"; done
