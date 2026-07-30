@@ -207,13 +207,15 @@ func Update(o Options) (Result, error) {
 	if !bytes.Equal(mb, next) {
 		writes = append(writes, write{path: manifestPath, next: next, old: mb, existed: true})
 	}
-	sort.Slice(writes, func(i, j int) bool { return writes[i].path < writes[j].path })
-	for i := range writes {
+	sort.Slice(writes, func(i, j int) bool {
 		if writes[i].path == manifestPath {
-			writes = append(append(writes[:i], writes[i+1:]...), writes[i])
-			break
+			return false
 		}
-	}
+		if writes[j].path == manifestPath {
+			return true
+		}
+		return writes[i].path < writes[j].path
+	})
 	for i := range writes {
 		if err := stage(o.RepoRoot, &writes[i]); err != nil {
 			return Result{}, err
