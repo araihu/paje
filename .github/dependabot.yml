@@ -1,0 +1,47 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/site/generator"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      go-major:
+        patterns: ["*"]
+        update-types: ["major"]
+
+  - package-ecosystem: "npm"
+    directory: "/site"
+    schedule:
+      interval: "weekly"
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      npm-major:
+        patterns: ["*"]
+        update-types: ["major"]
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      container-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      container-major:
+        patterns: ["*"]
+        update-types: ["major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
