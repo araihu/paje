@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26.1-alpine AS revision
+FROM golang:1.26.5-alpine AS revision
 
 ARG PAJE_COMMIT
 RUN printf '%s\n' "${PAJE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
@@ -24,7 +24,7 @@ RUN CGO_ENABLED=0 go build \
     -o /out/paje-leaf-gateway \
     ./cmd/paje-leaf-gateway
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 ARG CA_CERTIFICATES_PACKAGE_VERSION=20260611-r0
 ARG GIT_PACKAGE_VERSION=2.49.1-r0
