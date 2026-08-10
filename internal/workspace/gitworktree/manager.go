@@ -771,6 +771,11 @@ func (w *gitWorkspace) finishCleanupExchange(ctx context.Context, parentDescript
 		return errors.New("cleanup git workspace: exchanged placeholder identity was rebound")
 	}
 	if err := unix.Unlinkat(parentDescriptor, targetName, unix.AT_REMOVEDIR); err != nil {
+		if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+			w.cleanup = nil
+			w.cleaned = true
+			return errors.Join(errors.New("cleanup git workspace: exchanged placeholder identity was rebound"), err)
+		}
 		return fmt.Errorf("cleanup git workspace: remove exchanged placeholder: %w", err)
 	}
 	w.cleanup = nil
