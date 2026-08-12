@@ -13,6 +13,10 @@ const GO_IMAGE =
   "golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd"
 const NODE_IMAGE =
   "node:22.13.0-bookworm-slim@sha256:f5a0871ab03b035c58bdb3007c3d177b001c2145c18e81817b71624dcf7d8bff"
+const HELM_IMAGE =
+  "alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9"
+const DOCKER_CLI_IMAGE =
+  "docker:28.5.2-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d"
 const WRANGLER_VERSION = "4.120.0"
 
 const SOURCE_EXCLUDES = [
@@ -202,8 +206,15 @@ export class Paje {
 
   private goProject(source: Directory, cacheScope: string): Container {
     const scope = this.validateCacheScope(cacheScope)
+    // PR providers run on a host-owned isolated Engine. Input cannot select
+    // that boundary: all fork/internal/untrusted scopes collapse to "pr".
+    const cacheNamespace = this.isUntrustedScope(scope) ? "pr" : scope
+    const helm = dag.container().from(HELM_IMAGE).file("/usr/bin/helm")
+    const docker = dag.container().from(DOCKER_CLI_IMAGE).file("/usr/local/bin/docker")
     let container = dag.container()
       .from(GO_IMAGE)
+      .withFile("/usr/local/bin/helm", helm, { permissions: 0o755 })
+      .withFile("/usr/local/bin/docker", docker, { permissions: 0o755 })
       .withDirectory("/work", source)
       .withWorkdir("/work")
       .withEnvVariable("GOWORK", "off")
@@ -211,21 +222,20 @@ export class Paje {
       .withEnvVariable("GOMODCACHE", "/go/pkg/mod")
       .withEnvVariable("GOCACHE", "/root/.cache/go-build")
       .withEnvVariable("PAJE_CACHE_SCOPE", scope)
-    if (this.isUntrustedScope(scope)) return container
     container = container
-      .withMountedCache("/go/pkg/mod", dag.cacheVolume(`paje-${scope}-go-mod-v1`))
-      .withMountedCache("/root/.cache/go-build", dag.cacheVolume(`paje-${scope}-go-build-v1`))
+      .withMountedCache("/go/pkg/mod", dag.cacheVolume(`paje-${cacheNamespace}-go-mod-v1`))
+      .withMountedCache("/root/.cache/go-build", dag.cacheVolume(`paje-${cacheNamespace}-go-build-v1`))
     return container
   }
 
   private siteProject(source: Directory, cacheScope: string): Container {
     const scope = this.validateCacheScope(cacheScope)
+    const cacheNamespace = this.isUntrustedScope(scope) ? "pr" : scope
     let container = this.siteBase(source).withEnvVariable("PAJE_CACHE_SCOPE", scope)
-    if (this.isUntrustedScope(scope)) return container
     container = container
-      .withMountedCache("/root/.npm", dag.cacheVolume(`paje-${scope}-npm-v1`))
-      .withMountedCache("/go/pkg/mod", dag.cacheVolume(`paje-${scope}-site-go-mod-v1`))
-      .withMountedCache("/root/.cache/go-build", dag.cacheVolume(`paje-${scope}-site-go-build-v1`))
+      .withMountedCache("/root/.npm", dag.cacheVolume(`paje-${cacheNamespace}-npm-v1`))
+      .withMountedCache("/go/pkg/mod", dag.cacheVolume(`paje-${cacheNamespace}-site-go-mod-v1`))
+      .withMountedCache("/root/.cache/go-build", dag.cacheVolume(`paje-${cacheNamespace}-site-go-build-v1`))
     return container
   }
 

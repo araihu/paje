@@ -23,13 +23,15 @@ func TestDaggerModulePinsRuntimeAndSeparatesCachesFromFreshEffects(t *testing.T)
 	for _, want := range []string{
 		`golang:1.26.5-bookworm@sha256:`,
 		`node:22.13.0-bookworm-slim@sha256:`,
+		`alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9`,
+		`docker:28.5.2-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d`,
 		`const WRANGLER_VERSION = "4.120.0"`,
 		`@func({ cache: "never" })`,
 		`siteAudit(`,
 		`deploySite(`,
 		`updateAraihuAssets(`,
 		`run nonce must be github.run_id-github.run_attempt`,
-		`if (this.isUntrustedScope(scope)) return container`,
+		`const cacheNamespace = this.isUntrustedScope(scope) ? "pr" : scope`,
 		`return /^(untrusted|fork|internal)$/.test(value)`,
 		`dag.cacheVolume(`,
 	} {
@@ -50,10 +52,10 @@ func TestDaggerModulePinsRuntimeAndSeparatesCachesFromFreshEffects(t *testing.T)
 	}
 	for _, name := range []string{"goProject", "siteProject"} {
 		body := privateFunctionSource(t, module, name)
-		guard := strings.Index(body, "if (this.isUntrustedScope(scope)) return container")
+		guard := strings.Index(body, `const cacheNamespace = this.isUntrustedScope(scope) ? "pr" : scope`)
 		mount := strings.Index(body, ".withMountedCache(")
 		if guard < 0 || mount < 0 || guard > mount {
-			t.Errorf("%s mounts persistent cache before rejecting untrusted/fork/internal scope", name)
+			t.Errorf("%s does not map every PR to stable namespace pr before mounting caches", name)
 		}
 	}
 }
@@ -106,13 +108,9 @@ func TestDaggerTypeScriptRuntimePackageContract(t *testing.T) {
 	if !strings.Contains(readFile(t, ".gitignore"), "/.dagger/sdk/") {
 		t.Fatal("generated Dagger SDK is not ignored")
 	}
-	tracked := exec.Command("git", "ls-files", "--", ".dagger/sdk")
-	output, err := tracked.Output()
-	if err != nil {
-		t.Fatalf("inspect tracked generated SDK: %v", err)
-	}
-	if strings.TrimSpace(string(output)) != "" {
-		t.Fatalf("generated Dagger SDK bytes are tracked: %s", output)
+	provider := readFile(t, filepath.Join(".github", "workflows", "ci.yml"))
+	if !strings.Contains(provider, `test -z "$(git ls-files -- .dagger/sdk)"`) {
+		t.Fatal("provider does not prove generated SDK bytes are untracked before Dagger snapshots source")
 	}
 }
 
@@ -214,12 +212,16 @@ func TestWorkflowTrustAndArtifactContracts(t *testing.T) {
 	site := readFile(t, filepath.Join(".github", "workflows", "site-ci.yml"))
 	for _, want := range []string{
 		`CACHE_SCOPE: untrusted`,
+		`"hostinger-vps-pr"`,
 		`RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}`,
 		`actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`,
 	} {
 		if !strings.Contains(site, want) {
 			t.Errorf("site CI misses %q", want)
 		}
+	}
+	if strings.Contains(site, `"hostinger-vps"`) {
+		t.Fatal("legacy shared Hostinger runner label remains")
 	}
 	for _, workflow := range []string{root, site} {
 		if strings.Contains(workflow, "format('pr-") || strings.Contains(workflow, "cache-scope=pr-") {
@@ -253,6 +255,19 @@ func TestWorkflowTrustAndArtifactContracts(t *testing.T) {
 	} {
 		if !strings.Contains(assets, want) {
 			t.Errorf("assets workflow misses %q", want)
+		}
+	}
+}
+
+func TestDaggerRootRuntimeProvidesRun31562878247Prerequisites(t *testing.T) {
+	module := readFile(t, filepath.Join(".dagger", "src", "index.ts"))
+	root := privateFunctionSource(t, module, "goProject")
+	for _, want := range []string{
+		`.withFile("/usr/local/bin/helm", helm, { permissions: 0o755 })`,
+		`.withFile("/usr/local/bin/docker", docker, { permissions: 0o755 })`,
+	} {
+		if !strings.Contains(root, want) {
+			t.Errorf("run 31562878247 prerequisite regression missing %q", want)
 		}
 	}
 }

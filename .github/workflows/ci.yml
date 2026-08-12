@@ -28,6 +28,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prove generated Dagger SDK is not committed
+        run: test -z "$(git ls-files -- .dagger/sdk)"
+
       - name: Require exact Dagger CLI
         env:
           RUNNER_ARCH: ${{ runner.arch }}
