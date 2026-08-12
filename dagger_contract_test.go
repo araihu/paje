@@ -23,6 +23,8 @@ func TestDaggerModulePinsRuntimeAndSeparatesCachesFromFreshEffects(t *testing.T)
 	for _, want := range []string{
 		`golang:1.26.5-bookworm@sha256:`,
 		`node:22.13.0-bookworm-slim@sha256:`,
+		`const caCertificates = goImage.file("/etc/ssl/certs/ca-certificates.crt")`,
+		`.withFile("/etc/ssl/certs/ca-certificates.crt", caCertificates)`,
 		`alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9`,
 		`docker:28.5.2-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d`,
 		`const WRANGLER_VERSION = "4.120.0"`,

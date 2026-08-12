@@ -240,10 +240,13 @@ export class Paje {
   }
 
   private siteBase(source: Directory): Container {
-    const goDistribution = dag.container().from(GO_IMAGE).directory("/usr/local/go")
+    const goImage = dag.container().from(GO_IMAGE)
+    const goDistribution = goImage.directory("/usr/local/go")
+    const caCertificates = goImage.file("/etc/ssl/certs/ca-certificates.crt")
     return dag.container()
       .from(NODE_IMAGE)
       .withDirectory("/usr/local/go", goDistribution)
+      .withFile("/etc/ssl/certs/ca-certificates.crt", caCertificates)
       .withDirectory("/work", source)
       .withWorkdir("/work/site")
       .withEnvVariable("PATH", "/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
