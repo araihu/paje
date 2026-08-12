@@ -42,6 +42,23 @@ on a trusted host when enabling portable worker execution. See
 - an authenticated Codex auth directory when using `codex-go@1`
 - Mem0 and GitHub credentials only when those adapters are selected
 
+## Portable CI
+
+Dagger v0.21.8 owns root and site validation, static-site artifacts, immutable
+Arai Hu fallback regeneration, and Cloudflare deployment. Same functions run
+locally and in GitHub Actions:
+
+```sh
+dagger call root-ci --source=. --cache-scope=local
+dagger call site-audit --source=. --run-nonce="$(date +%s)-1"
+dagger call site-build --source=. --cache-scope=local export --path=/tmp/paje-site-dist
+```
+
+`root-ci` and `site-build` are deterministic and cacheable. Fresh advisory,
+network, and deployment functions require a unique `run-nonce`; deployment
+also requires explicit Dagger secrets. All PR adapters pass `cache-scope=untrusted`,
+so PR-controlled source receives no persistent `CacheVolume`.
+
 ## Workflow input
 
 Start Hatchet workflow `paje-code-change-v1` with a thin outer envelope. Generate

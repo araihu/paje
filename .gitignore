@@ -34,3 +34,7 @@ go.work.sum
 
 # Local development worktrees
 .worktrees/
+
+# Dagger TypeScript runtime dependencies
+/.dagger/node_modules/
+/.dagger/sdk/
