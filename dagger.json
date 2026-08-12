@@ -1,0 +1,8 @@
+{
+  "name": "paje",
+  "engineVersion": "v0.21.8",
+  "sdk": {
+    "source": "typescript"
+  },
+  "source": ".dagger"
+}

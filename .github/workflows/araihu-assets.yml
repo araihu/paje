@@ -14,58 +14,63 @@ permissions:
   contents: read
 
 jobs:
-  update:
+  validate:
+    name: Validate immutable Assets handoff
     runs-on: ubuntu-24.04
+    env:
+      RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - name: Read and validate exact provenance payload
-        id: event
-        env:
-          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
-          EVENT_NAME: ${{ github.event_name }}
-          INPUTS: ${{ toJSON(inputs) }}
-        run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          import re
+      - name: Check out Pajé read-only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-          values = json.loads(os.environ["PAYLOAD"] if os.environ["EVENT_NAME"] == "repository_dispatch" else os.environ["INPUTS"])
-          keys = {"assets_repository", "assets_revision", "release", "release_url", "release_sha256", "release_json_sha256"}
-          if not isinstance(values, dict) or set(values) != keys:
-              raise SystemExit("payload must contain exactly six provenance keys")
-          if not all(isinstance(values[key], str) for key in keys):
-              raise SystemExit("all provenance values must be strings")
-          if values["assets_repository"] != "araihu/assets":
-              raise SystemExit("assets repository must be araihu/assets")
-          if re.fullmatch(r"[0-9a-f]{40}", values["assets_revision"]) is None:
-              raise SystemExit("assets revision must be a full commit SHA")
-          if re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", values["release"]) is None:
-              raise SystemExit("release must be a stable SemVer tag")
-          expected_url = f"https://github.com/araihu/assets/releases/download/{values['release']}/araihu-assets-{values['release']}.tar.gz"
-          if values["release_url"] != expected_url:
-              raise SystemExit("release URL differs from immutable archive URL")
-          for key in ("release_sha256", "release_json_sha256"):
-              if re.fullmatch(r"[0-9a-f]{64}", values[key]) is None:
-                  raise SystemExit(f"{key} must be a SHA-256 digest")
-          for key in sorted(keys):
-              print(f"{key}={values[key]}")
-          PY
-      - name: Verify tag resolves to dispatched revision
+      - name: Materialize exact provenance payload
         env:
-          ASSETS_REVISION: ${{ steps.event.outputs.assets_revision }}
-          GH_TOKEN: ${{ github.token }}
-          RELEASE: ${{ steps.event.outputs.release }}
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_INPUTS: ${{ toJSON(inputs) }}
         run: |
           set -euo pipefail
-          object=$(gh api "repos/araihu/assets/git/ref/tags/${RELEASE}" --jq '.object.type + " " + .object.sha')
-          read -r object_type object_sha <<< "$object"
-          if test "$object_type" = tag; then
-            object=$(gh api "repos/araihu/assets/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')
-            read -r object_type object_sha <<< "$object"
+          mkdir -p .dagger-inputs
+          if [[ "$EVENT_NAME" == repository_dispatch ]]; then
+            printf '%s' "$DISPATCH_PAYLOAD" > .dagger-inputs/assets.json
+          else
+            printf '%s' "$MANUAL_INPUTS" > .dagger-inputs/assets.json
           fi
-          test "$object_type" = commit
-          test "$object_sha" = "$ASSETS_REVISION"
-      - name: Create selected-repository App token
+
+      - name: Require exact Dagger CLI
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+        run: bash .github/scripts/setup-dagger.sh
+
+      - name: Validate payload, resolve tag read-only, and regenerate fallbacks
+        env:
+          ASSETS_GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          dagger call update-araihu-assets
+          --source=.
+          --payload=.dagger-inputs/assets.json
+          --github-token=env://ASSETS_GITHUB_TOKEN
+          --cache-scope=assets
+          --run-nonce="$RUN_NONCE"
+          export --path="${{ runner.temp }}/paje-assets-validated"
+
+      - name: Upload validated allowlisted handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: paje-assets-validated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paje-assets-validated
+          if-no-files-found: error
+
+  publish:
+    name: Publish validated fallback update
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create selected-repository App token after validation
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         id: app-token
         with:
@@ -76,31 +81,36 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           permission-issues: read
-      - name: Check out Pajé
+
+      - name: Check out Pajé for the validated write
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with: {go-version-file: go.mod}
-      - name: Download immutable release once
-        run: curl --fail --location --proto '=https' --tlsv1.2 '${{ steps.event.outputs.release_url }}' --output /tmp/araihu-assets.tar.gz
-      - name: Apply and regenerate
+
+      - name: Download validated allowlisted handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: paje-assets-validated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paje-assets-validated
+
+      - name: Materialize validated fallback update
+        env:
+          VALIDATED_ROOT: ${{ runner.temp }}/paje-assets-validated
         run: |
-          go run ./cmd/araihu-assets-update -repo . -archive /tmp/araihu-assets.tar.gz \
-            -assets-repository '${{ steps.event.outputs.assets_repository }}' \
-            -assets-revision '${{ steps.event.outputs.assets_revision }}' \
-            -release '${{ steps.event.outputs.release }}' \
-            -release-url '${{ steps.event.outputs.release_url }}' \
-            -release-sha256 '${{ steps.event.outputs.release_sha256 }}' \
-            -release-json-sha256 '${{ steps.event.outputs.release_json_sha256 }}'
-          cd site/generator && GOTOOLCHAIN=auto go run . --out ../public
-          git diff --check
+          set -euo pipefail
+          handoff="$VALIDATED_ROOT/assets-handoff.json"
+          jq -e 'type == "object" and keys == ["assets_repository","assets_revision","release","release_json_sha256","release_sha256","release_url"]' "$handoff" >/dev/null
+          release=$(jq -er '.release | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))' "$handoff")
+          install -Dm0644 "$VALIDATED_ROOT/araihu-assets.json" araihu-assets.json
+          install -Dm0644 "$VALIDATED_ROOT/site/generator/araihu.css" site/generator/araihu.css
+          rsync -a --delete "$VALIDATED_ROOT/site/public/" site/public/
+          printf 'RELEASE=%s\n' "$release" >> "$GITHUB_ENV"
+
       - name: Create versioned pull request
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          RELEASE: ${{ steps.event.outputs.release }}
         run: |
+          set -euo pipefail
           git diff --quiet && exit 0
           branch="automation/araihu-assets-${RELEASE}"
           git switch -c "$branch"

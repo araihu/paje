@@ -17,23 +17,26 @@ jobs:
     name: Verify root module
     runs-on: ubuntu-24.04
     env:
-      GOWORK: "off"
-      GOFLAGS: "-mod=readonly"
+      CACHE_SCOPE: >-
+        ${{
+          github.event_name == 'pull_request' && 'untrusted' ||
+          'main'
+        }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          check-latest: false
+      - name: Prove generated Dagger SDK is not committed
+        run: test -z "$(git ls-files -- .dagger/sdk)"
 
-      - name: Verify module and source
-        run: |
-          go mod verify
-          go vet ./...
-          go test ./... -count=1
-          git diff --exit-code
+      - name: Require exact Dagger CLI
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+        run: bash .github/scripts/setup-dagger.sh
+
+      - name: Verify root module with Dagger
+        run: dagger call root-ci --source=. --cache-scope="$CACHE_SCOPE"

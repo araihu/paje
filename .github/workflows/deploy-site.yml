@@ -5,7 +5,11 @@ on:
     branches:
       - main
     paths:
+      - ".dagger/**"
+      - ".github/scripts/setup-dagger.sh"
       - ".github/workflows/deploy-site.yml"
+      - "dagger.json"
+      - "dagger_contract_test.go"
       - "site/**"
   workflow_dispatch:
 
@@ -16,47 +20,42 @@ concurrency:
   group: paje-site-production
   cancel-in-progress: false
 
+env:
+  CACHE_SCOPE: ${{ github.event_name == 'push' && 'main' || 'manual' }}
+  RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+
 jobs:
   validate:
     name: Validate static site
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: site
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version-file: site/generator/go.mod
-          cache-dependency-path: site/generator/go.sum
+          persist-credentials: false
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22.13.0
-          cache: npm
-          cache-dependency-path: site/package-lock.json
+      - name: Require exact Dagger CLI
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+        run: bash .github/scripts/setup-dagger.sh
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Audit dependencies freshly
+        run: dagger call site-audit --source=. --run-nonce="$RUN_NONCE"
 
-      - name: Audit dependencies
-        run: npm audit --audit-level=high
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Test generated site
-        run: npm test
+      - name: Build, lint, and test site
+        run: >-
+          dagger call site-build
+          --source=.
+          --cache-scope="$CACHE_SCOPE"
+          export --path="${{ runner.temp }}/paje-site-dist"
 
       - name: Upload static site
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: paje-site-dist
-          path: site/dist
+          path: ${{ runner.temp }}/paje-site-dist
           if-no-files-found: error
 
   deploy:
@@ -68,38 +67,39 @@ jobs:
       url: https://paje.araihu.com
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 22.13.0
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-
-      - name: Install dependencies
-        working-directory: site
-        run: npm ci
+          persist-credentials: false
 
       - name: Download validated site
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: paje-site-dist
-          path: site/dist
+          path: ${{ runner.temp }}/paje-site-dist
+
+      - name: Require exact Dagger CLI
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+        run: bash .github/scripts/setup-dagger.sh
 
       - name: Require Cloudflare credentials
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           test -n "$CLOUDFLARE_API_TOKEN" || { echo "Missing CLOUDFLARE_API_TOKEN Actions secret" >&2; exit 1; }
           test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "Missing CLOUDFLARE_ACCOUNT_ID Actions variable" >&2; exit 1; }
 
-      - name: Deploy with Wrangler
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: site
-          wranglerVersion: "4.92.0"
-          command: deploy
+      - name: Deploy validated site with Dagger
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: >-
+          dagger call deploy-site
+          --source=.
+          --dist="${{ runner.temp }}/paje-site-dist"
+          --cloudflare-api-token=env://CLOUDFLARE_API_TOKEN
+          --cloudflare-account-id="$CLOUDFLARE_ACCOUNT_ID"
+          --run-nonce="$RUN_NONCE"
