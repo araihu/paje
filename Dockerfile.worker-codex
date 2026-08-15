@@ -39,7 +39,7 @@ LABEL org.opencontainers.image.revision="${PAJE_COMMIT}" \
     org.opencontainers.image.source="https://github.com/araihu/paje" \
     io.araihu.paje.codex.version="${CODEX_VERSION}" \
     io.araihu.paje.git.version="2.49.1" \
-    io.araihu.paje.go.version="1.26.1" \
+    io.araihu.paje.go.version="1.26.5" \
     io.araihu.paje.node.version="24.4.1"
 
 RUN addgroup -S -g 65532 paje \

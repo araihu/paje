@@ -27,8 +27,8 @@ RUN CGO_ENABLED=0 go build \
 FROM alpine:3.24
 
 ARG CA_CERTIFICATES_PACKAGE_VERSION=20260611-r0
-ARG GIT_PACKAGE_VERSION=2.49.1-r0
-ARG OPENSSH_PACKAGE_VERSION=10.0_p1-r10
+ARG GIT_PACKAGE_VERSION=2.54.0-r0
+ARG OPENSSH_PACKAGE_VERSION=10.3_p1-r0
 RUN apk add --no-cache \
     "ca-certificates=${CA_CERTIFICATES_PACKAGE_VERSION}" \
     "git=${GIT_PACKAGE_VERSION}" \
@@ -37,8 +37,8 @@ RUN apk add --no-cache \
 ARG PAJE_COMMIT
 LABEL org.opencontainers.image.revision="${PAJE_COMMIT}" \
     org.opencontainers.image.source="https://github.com/araihu/paje" \
-    io.araihu.paje.git.version="2.49.1" \
-    io.araihu.paje.openssh.version="10.0_p1-r10"
+    io.araihu.paje.git.version="2.54.0" \
+    io.araihu.paje.openssh.version="10.3_p1-r0"
 
 RUN addgroup -S -g 65532 paje \
     && adduser -S -D -H -u 65532 -G paje paje \
