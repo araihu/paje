@@ -40,3 +40,58 @@ jobs:
 
       - name: Verify root module with Dagger
         run: dagger call root-ci --source=. --cache-scope="$CACHE_SCOPE"
+
+  containers:
+    name: Verify container images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build coordinator image
+        env:
+          PAJE_COMMIT: ${{ github.sha }}
+        run: >-
+          docker build --pull
+          --build-arg "PAJE_COMMIT=$PAJE_COMMIT"
+          --tag "paje-coordinator-ci:$PAJE_COMMIT"
+          --file Dockerfile .
+
+      - name: Build worker image
+        env:
+          PAJE_COMMIT: ${{ github.sha }}
+        run: >-
+          docker build --pull
+          --build-arg "PAJE_COMMIT=$PAJE_COMMIT"
+          --tag "paje-worker-ci:$PAJE_COMMIT"
+          --file Dockerfile.worker-codex .
+
+      - name: Smoke-check coordinator image
+        env:
+          PAJE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image="paje-coordinator-ci:$PAJE_COMMIT"
+          test "$(docker run --rm --entrypoint git "$image" --version)" = "git version 2.54.0"
+          ssh_version="$(docker run --rm --entrypoint /bin/sh "$image" -c 'ssh -V 2>&1')"
+          case "$ssh_version" in
+            "OpenSSH_10.3p1, "*) ;;
+            *) printf 'unexpected ssh version: %s\n' "$ssh_version" >&2; exit 1 ;;
+          esac
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PAJE_COMMIT"
+          test "$(docker image inspect --format '{{index .Config.Labels "io.araihu.paje.git.version"}}' "$image")" = "2.54.0"
+          test "$(docker image inspect --format '{{index .Config.Labels "io.araihu.paje.openssh.version"}}' "$image")" = "10.3_p1-r0"
+
+      - name: Smoke-check worker image
+        env:
+          PAJE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image="paje-worker-ci:$PAJE_COMMIT"
+          test "$(docker run --rm --entrypoint git "$image" --version)" = "git version 2.49.1"
+          test "$(docker run --rm --entrypoint go "$image" version | awk '{print $3}')" = "go1.26.5"
+          test "$(docker run --rm --entrypoint codex "$image" --version 2>&1 | tail -n 1)" = "codex-cli 0.144.5"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PAJE_COMMIT"
+          test "$(docker image inspect --format '{{index .Config.Labels "io.araihu.paje.go.version"}}' "$image")" = "1.26.5"
