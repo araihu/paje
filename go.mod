@@ -7,11 +7,11 @@ toolchain go1.26.5
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/google/uuid v1.6.0
-	github.com/hatchet-dev/hatchet v0.101.9
+	github.com/hatchet-dev/hatchet v0.101.19
 	github.com/moby/moby/api v1.55.0
-	github.com/moby/moby/client v0.5.0
+	github.com/moby/moby/client v0.5.1
 	github.com/opencontainers/image-spec v1.1.1
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
