@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 go build \
     -o /out/paje-sandbox-init \
     ./cmd/paje-sandbox-init
 
-FROM node:24.4.1-alpine3.22
+FROM node:26.3.0-alpine3.22
 
 ARG CA_CERTIFICATES_PACKAGE_VERSION=20260611-r0
 ARG CODEX_VERSION=0.144.5
