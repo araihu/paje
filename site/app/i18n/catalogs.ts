@@ -327,7 +327,7 @@ const portuguese = {
       eyebrow: "Pré-requisitos",
       title: "Prepare o terreno",
       text:
-        "Go 1.26+ é necessário apenas para desenvolver o Pajé, que é implementado em Go. O repositório atendido pode usar qualquer linguagem; inclua o toolchain correspondente na imagem do worker. No beta, prepare Docker, Helm 3, Hatchet e autenticação do Codex.",
+        "Go 1.27+ é necessário apenas para desenvolver o Pajé, que é implementado em Go. O repositório atendido pode usar qualquer linguagem; inclua o toolchain correspondente na imagem do worker. No beta, prepare Docker, Helm 3, Hatchet e autenticação do Codex.",
       requirements: [
         "Qualquer stack",
         "Docker",
@@ -594,7 +594,7 @@ const english = {
       eyebrow: "Prerequisites",
       title: "Prepare the ground",
       text:
-        "Go 1.26+ is required only to develop Pajé, which happens to be implemented in Go; Go-native positioning is inconsequential. The target repository can use any language: include its toolchain in the worker image. For the beta, prepare Docker, Helm 3, Hatchet, and Codex authentication.",
+        "Go 1.27+ is required only to develop Pajé, which happens to be implemented in Go; Go-native positioning is inconsequential. The target repository can use any language: include its toolchain in the worker image. For the beta, prepare Docker, Helm 3, Hatchet, and Codex authentication.",
       requirements: [
         "Any stack",
         "Docker",
@@ -862,7 +862,7 @@ const spanish = {
       eyebrow: "Requisitos previos",
       title: "Prepara el terreno",
       text:
-        "Go 1.26+ solo es necesario para desarrollar Pajé, que está implementado en Go; posicionarlo como Go-native es irrelevante. El repositorio atendido puede usar cualquier lenguaje: incluye su toolchain en la imagen del worker. Para la beta, prepara Docker, Helm 3, Hatchet y la autenticación de Codex.",
+        "Go 1.27+ solo es necesario para desarrollar Pajé, que está implementado en Go; posicionarlo como Go-native es irrelevante. El repositorio atendido puede usar cualquier lenguaje: incluye su toolchain en la imagen del worker. Para la beta, prepara Docker, Helm 3, Hatchet y la autenticación de Codex.",
       requirements: [
         "Cualquier stack",
         "Docker",
