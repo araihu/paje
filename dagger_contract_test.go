@@ -21,7 +21,7 @@ func TestDaggerModulePinsRuntimeAndSeparatesCachesFromFreshEffects(t *testing.T)
 
 	module := readFile(t, filepath.Join(".dagger", "src", "index.ts"))
 	for _, want := range []string{
-		`golang:1.26.5-bookworm@sha256:`,
+		`golang:1.27.0-bookworm@sha256:`,
 		`node:22.13.0-bookworm-slim@sha256:`,
 		`const caCertificates = goImage.file("/etc/ssl/certs/ca-certificates.crt")`,
 		`.withFile("/etc/ssl/certs/ca-certificates.crt", caCertificates)`,

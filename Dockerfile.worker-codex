@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26.5-alpine AS revision
+FROM golang:1.27.0-alpine AS revision
 
 ARG PAJE_COMMIT
 RUN printf '%s\n' "${PAJE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
@@ -39,7 +39,7 @@ LABEL org.opencontainers.image.revision="${PAJE_COMMIT}" \
     org.opencontainers.image.source="https://github.com/araihu/paje" \
     io.araihu.paje.codex.version="${CODEX_VERSION}" \
     io.araihu.paje.git.version="2.49.1" \
-    io.araihu.paje.go.version="1.26.5" \
+    io.araihu.paje.go.version="1.27.0" \
     io.araihu.paje.node.version="24.4.1"
 
 RUN addgroup -S -g 65532 paje \

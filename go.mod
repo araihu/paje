@@ -1,8 +1,6 @@
 module github.com/araihu/paje
 
-go 1.26.1
-
-toolchain go1.26.5
+go 1.27.0
 
 require (
 	github.com/containerd/errdefs v1.0.0

@@ -24,7 +24,7 @@ import (
 
 const (
 	acceptanceCodexVersion  = "0.144.5"
-	acceptanceGoVersion     = "1.26.5"
+	acceptanceGoVersion     = "1.27.0"
 	acceptanceGitVersion    = "2.49.1"
 	acceptanceNodeVersion   = "24.4.1"
 	acceptanceTaskLabel     = "com.araihu.paje.acceptance.task"
