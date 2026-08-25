@@ -7,7 +7,7 @@ files. Published with OpenAI Sites.
 
 ## Local development
 
-Go 1.26.5 or newer and Node.js 22.13 or newer are required.
+Go 1.27.0 or newer and Node.js 22.13 or newer are required.
 
 ```bash
 npm install

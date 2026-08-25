@@ -91,7 +91,7 @@ jobs:
           set -euo pipefail
           image="paje-worker-ci:$PAJE_COMMIT"
           test "$(docker run --rm --entrypoint git "$image" --version)" = "git version 2.49.1"
-          test "$(docker run --rm --entrypoint go "$image" version | awk '{print $3}')" = "go1.26.5"
+          test "$(docker run --rm --entrypoint go "$image" version | awk '{print $3}')" = "go1.27.0"
           test "$(docker run --rm --entrypoint codex "$image" --version 2>&1 | tail -n 1)" = "codex-cli 0.144.5"
           test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$PAJE_COMMIT"
-          test "$(docker image inspect --format '{{index .Config.Labels "io.araihu.paje.go.version"}}' "$image")" = "1.26.5"
+          test "$(docker image inspect --format '{{index .Config.Labels "io.araihu.paje.go.version"}}' "$image")" = "1.27.0"

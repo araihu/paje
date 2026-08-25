@@ -21,7 +21,7 @@ func TestDaggerModulePinsRuntimeAndSeparatesCachesFromFreshEffects(t *testing.T)
 
 	module := readFile(t, filepath.Join(".dagger", "src", "index.ts"))
 	for _, want := range []string{
-		`golang:1.26.5-bookworm@sha256:`,
+		`golang:1.27.0-bookworm@sha256:`,
 		`node:22.13.0-bookworm-slim@sha256:`,
 		`const caCertificates = goImage.file("/etc/ssl/certs/ca-certificates.crt")`,
 		`.withFile("/etc/ssl/certs/ca-certificates.crt", caCertificates)`,
@@ -248,7 +248,7 @@ func TestWorkflowTrustAndArtifactContracts(t *testing.T) {
 	for _, want := range []string{
 		`repository_dispatch:`,
 		`types: [araihu-assets-released]`,
-		`actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349`,
+		`actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1`,
 		`--payload=.dagger-inputs/assets.json`,
 		`--github-token=env://ASSETS_GITHUB_TOKEN`,
 		`needs: validate`,

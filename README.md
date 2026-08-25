@@ -35,7 +35,7 @@ on a trusted host when enabling portable worker execution. See
 
 ## Requirements
 
-- Go 1.26 or newer for development
+- Go 1.27.0 or newer for development
 - Docker and Helm 3 for packaging
 - an existing Hatchet installation
 - Git for the real workspace and publisher adapters
