@@ -248,7 +248,7 @@ func TestWorkflowTrustAndArtifactContracts(t *testing.T) {
 	for _, want := range []string{
 		`repository_dispatch:`,
 		`types: [araihu-assets-released]`,
-		`actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349`,
+		`actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1`,
 		`--payload=.dagger-inputs/assets.json`,
 		`--github-token=env://ASSETS_GITHUB_TOKEN`,
 		`needs: validate`,
