@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "assetsRepository": "araihu/assets",
-  "assetsRevision": "fdfb1c2aad8fa61779e7b8c6f208e52a6cf825ce",
-  "release": "v0.2.1",
-  "releaseUrl": "https://github.com/araihu/assets/releases/download/v0.2.1/araihu-assets-v0.2.1.tar.gz",
-  "releaseSha256": "818a32246c040871c8f28bb085269b6b9f21c579b18dc4c3c1f20d70716eaf70",
-  "releaseJsonSha256": "1e071ba6d88efa862b6166820bdc759c7edb917c8566ce7111358c5c3dc2714e",
+  "assetsRevision": "d091b07b26fae0caee02dc8943e1d3b6339cbe3d",
+  "release": "v0.2.3",
+  "releaseUrl": "https://github.com/araihu/assets/releases/download/v0.2.3/araihu-assets-v0.2.3.tar.gz",
+  "releaseSha256": "34375219d9682488ac6e1c5660c455fe7cfec1b8bc8c7c9a8384e3c2589fa7a3",
+  "releaseJsonSha256": "6621f536f905f55c67c34eb40ef36c3197630fcd49dbdda527a39297155008cc",
   "mappings": [
     {
       "source": "themes/araihu.css",
