@@ -168,7 +168,7 @@ test("serves static localized documents", async () => {
     assert.equal((html.match(/rel="alternate" hreflang=/g) ?? []).length, 4);
     assert.match(html, new RegExp(`rel="canonical" href="https://paje\\.araihu\\.com/${locale}"`));
     assert.doesNotMatch(html, /alpine(?:js)?|htmx/i);
-    assert.match(html, /\/assets\/js\/combobox\.js/);
+    assert.doesNotMatch(html, /\/assets\/js\//);
     assert.doesNotMatch(html, /paje-(favicon|mark|mark-reverse)\.svg/);
     for (const landmark of landmarks) assert.match(html, new RegExp(landmark));
   }
@@ -256,13 +256,12 @@ test("keeps static navigation accessible across themes and viewports", async () 
 
 test("omits unused third-party runtime from the static artifact", async () => {
   for (const path of [
+    "../dist/client/assets/js/goshtoso.min.js",
     "../dist/client/assets/js/runtime/alpinejs/3.14.9/alpine.min.js",
     "../dist/client/assets/js/runtime/htmx.org/2.0.8/htmx.min.js",
   ]) {
     await assert.rejects(readFile(new URL(path, import.meta.url)));
   }
-  const combobox = await readFile(new URL("../dist/client/assets/js/combobox.js", import.meta.url), "utf8");
-  assert.ok(combobox.length > 0);
 });
 
 test("packages the approved immutable Pajé brand assets", async () => {

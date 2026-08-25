@@ -169,8 +169,7 @@ func generate(out string) error {
 	}
 	dependencies, err := render(head.DependenciesMinimal(
 		head.WithLocalRuntime(),
-		head.WithoutDependency(head.DependencyAlpineJS),
-		head.WithoutDependency(head.DependencyHTMX),
+		head.WithStylesheetOnly(),
 	))
 	if err != nil {
 		return err
