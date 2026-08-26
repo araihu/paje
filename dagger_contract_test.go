@@ -27,7 +27,7 @@ func TestDaggerModulePinsRuntimeAndSeparatesCachesFromFreshEffects(t *testing.T)
 		`.withFile("/etc/ssl/certs/ca-certificates.crt", caCertificates)`,
 		`alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9`,
 		`docker:28.5.2-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d`,
-		`const WRANGLER_VERSION = "4.120.0"`,
+		`const WRANGLER_VERSION = "4.125.0"`,
 		`@func({ cache: "never" })`,
 		`siteAudit(`,
 		`deploySite(`,
@@ -142,8 +142,8 @@ func TestDaggerSupplyChainAuditAndDeploySecretBoundary(t *testing.T) {
 	packageJSON := readFile(t, filepath.Join("site", "package.json"))
 	packageLock := readFile(t, filepath.Join("site", "package-lock.json"))
 	for path, content := range map[string]string{"site/package.json": packageJSON, "site/package-lock.json": packageLock} {
-		if !strings.Contains(content, `"wrangler": "4.120.0"`) {
-			t.Errorf("%s does not lock Wrangler 4.120.0", path)
+		if !strings.Contains(content, `"wrangler": "4.125.0"`) {
+			t.Errorf("%s does not lock Wrangler 4.125.0", path)
 		}
 	}
 }
