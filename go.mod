@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/google/uuid v1.6.0
-	github.com/hatchet-dev/hatchet v0.104.5
+	github.com/hatchet-dev/hatchet v0.105.8
 	github.com/moby/moby/api v1.55.0
 	github.com/moby/moby/client v0.5.1
 	github.com/opencontainers/image-spec v1.1.1
